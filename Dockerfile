@@ -7,15 +7,16 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 WORKDIR /app
 
 # 复制 Cargo 文件
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml ./
 
 # 创建虚拟 src 以缓存依赖
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release || true
+RUN cargo build --release 2>/dev/null || true
 RUN rm -rf src
 
 # 复制源代码
 COPY src ./src
+COPY examples ./examples
 
 # 构建
 RUN cargo build --release
@@ -24,7 +25,7 @@ RUN cargo build --release
 FROM alpine:3.19
 
 # 安装运行时依赖
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 
 WORKDIR /app
 
