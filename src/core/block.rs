@@ -1,0 +1,195 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+
+use super::merkle::build_merkle_root;
+
+/// 元数据条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataEntry {
+    pub data_id: String,
+    pub data_size: i64,
+    pub created_at: DateTime<Utc>,
+    pub modified_at: DateTime<Utc>,
+    pub owner: String,
+    pub hashes: HashMap<String, String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// 汇总信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationInfo {
+    pub summary_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<TimeRange>,
+    pub statistics: HashMap<String, serde_json::Value>,
+    pub merkle_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_range: Option<(i64, i64)>,
+}
+
+/// 时间范围
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeRange {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// 版本信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub version_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub files: Vec<FileVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_version: Option<String>,
+}
+
+/// 文件版本
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileVersion {
+    pub path: String,
+    pub hash: String,
+    pub size: i64,
+    pub content_hash: String,
+}
+
+/// 区块
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub index: i64,
+    pub timestamp: DateTime<Utc>,
+    pub previous_hash: String,
+    pub merkle_root: String,
+    pub nonce: u64,
+    pub difficulty: u32,
+    pub hash: String,
+    #[serde(default)]
+    pub metadata_list: Vec<MetadataEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<AggregationInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_info: Option<VersionInfo>,
+}
+
+impl Block {
+    /// 创建新区块
+    pub fn new(index: i64, previous_hash: String, difficulty: u32) -> Self {
+        Self {
+            index,
+            timestamp: Utc::now(),
+            previous_hash,
+            merkle_root: String::new(),
+            nonce: 0,
+            difficulty,
+            hash: String::new(),
+            metadata_list: Vec::new(),
+            aggregation: None,
+            version_info: None,
+        }
+    }
+
+    /// 添加元数据
+    pub fn add_metadata(&mut self, entry: MetadataEntry) {
+        self.metadata_list.push(entry);
+    }
+
+    /// 计算区块哈希
+    pub fn calculate_hash(&self) -> String {
+        let data = format!(
+            "{}{}{}{}{}{}",
+            self.index,
+            self.timestamp.timestamp(),
+            self.previous_hash,
+            self.merkle_root,
+            self.nonce,
+            self.difficulty
+        );
+        
+        let mut hasher = Sha256::new();
+        hasher.update(data.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// 计算 Merkle 根
+    pub fn calculate_merkle_root(&self) -> String {
+        if self.metadata_list.is_empty() {
+            return String::new();
+        }
+
+        let hashes: Vec<String> = self.metadata_list
+            .iter()
+            .map(|entry| {
+                let data = serde_json::to_string(entry).unwrap_or_default();
+                let mut hasher = Sha256::new();
+                hasher.update(data.as_bytes());
+                hex::encode(hasher.finalize())
+            })
+            .collect();
+
+        build_merkle_root(&hashes)
+    }
+
+    /// 挖矿（工作量证明）
+    pub fn mine(&mut self) {
+        self.merkle_root = self.calculate_merkle_root();
+        let target = "0".repeat(self.difficulty as usize);
+
+        loop {
+            self.hash = self.calculate_hash();
+            if self.hash.starts_with(&target) {
+                break;
+            }
+            self.nonce += 1;
+        }
+    }
+
+    /// 验证区块
+    pub fn is_valid(&self) -> bool {
+        let target = "0".repeat(self.difficulty as usize);
+        self.hash == self.calculate_hash() && self.hash.starts_with(&target)
+    }
+
+    /// 序列化为 JSON
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 从 JSON 反序列化
+    pub fn from_json(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_block() {
+        let block = Block::new(0, "0".to_string(), 2);
+        assert_eq!(block.index, 0);
+        assert_eq!(block.previous_hash, "0");
+        assert_eq!(block.difficulty, 2);
+    }
+
+    #[test]
+    fn test_mine_block() {
+        let mut block = Block::new(0, "0".to_string(), 2);
+        block.mine();
+        assert!(block.hash.starts_with("00"));
+    }
+
+    #[test]
+    fn test_block_validation() {
+        let mut block = Block::new(0, "0".to_string(), 2);
+        block.mine();
+        assert!(block.is_valid());
+    }
+}
