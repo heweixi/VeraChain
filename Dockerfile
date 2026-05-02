@@ -1,31 +1,34 @@
-# 构建阶段
-FROM rust:1.75-alpine AS builder
+# 构建阶段 - 使用最新稳定版 Rust
+FROM rust:latest AS builder
 
 # 安装构建依赖
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 复制 Cargo 文件
-COPY Cargo.toml ./
+# 复制所有源代码
+COPY . .
 
-# 创建虚拟 src 以缓存依赖
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -rf src
+# 构建（不使用缓存技巧，直接完整构建）
+RUN cargo build --release 2>&1 | tee /tmp/build.log
 
-# 复制源代码
-COPY src ./src
-COPY examples ./examples
-
-# 构建
-RUN cargo build --release
+# 验证构建结果
+RUN ls -la /app/target/release/datachain && \
+    file /app/target/release/datachain && \
+    /app/target/release/datachain --help
 
 # 运行阶段
-FROM alpine:3.19
+FROM debian:bookworm-slim
 
 # 安装运行时依赖
-RUN apk add --no-cache ca-certificates tzdata wget
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    wget \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -36,11 +39,12 @@ COPY --from=builder /app/target/release/datachain /app/datachain
 RUN mkdir -p /app/data /app/config
 
 # 复制默认配置
-COPY config.toml /app/config/config.toml
+COPY config/config.toml /app/config/config.toml
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
-ENV RUST_LOG=info
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=1
 
 # 暴露端口
 EXPOSE 8080
@@ -51,4 +55,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # 启动命令
 ENTRYPOINT ["/app/datachain"]
-CMD ["serve", "--port", "8080", "--config", "/app/config/config.toml"]
+CMD ["--config", "/app/config/config.toml", "serve", "--port", "8080"]

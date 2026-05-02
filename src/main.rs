@@ -77,21 +77,45 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 强制行缓冲
+    use std::io::Write;
+    
     // 初始化日志
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".into()),
         ))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .init();
+
+    eprintln!("DataChain 启动中...");
+    std::io::stderr().flush().ok();
+    
+    tracing::info!("DataChain 启动中...");
 
     let cli = Cli::parse();
 
+    eprintln!("加载配置文件: {}", cli.config);
+    tracing::info!("加载配置文件: {}", cli.config);
+
     // 加载配置
-    let config = AppConfig::load(&cli.config)?;
+    let config = match AppConfig::load(&cli.config) {
+        Ok(c) => {
+            eprintln!("配置加载成功");
+            tracing::info!("配置加载成功");
+            c
+        }
+        Err(e) => {
+            eprintln!("配置加载失败: {}", e);
+            tracing::error!("配置加载失败: {}", e);
+            return Err(e);
+        }
+    };
 
     match cli.command {
         Commands::Serve { port } => {
+            eprintln!("启动服务器，端口: {}", port);
+            tracing::info!("启动服务器，端口: {}", port);
             cli::server::run_server(config, port).await?;
         }
         Commands::Init => {

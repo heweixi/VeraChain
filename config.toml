@@ -3,9 +3,9 @@
 [server]
 host = "0.0.0.0"
 port = 8080
-mode = "release"
 
 [database]
+driver = "sqlite"
 dsn = "./data/datachain.db"
 
 [blockchain]
@@ -20,6 +20,5 @@ expire_hours = 24
 time_interval_secs = 3600
 count_threshold = 100
 
-[logging]
+[log]
 level = "info"
-format = "json"
