@@ -18,7 +18,7 @@ RUN cargo build --release 2>&1 | tee /tmp/build.log
 # 验证构建结果
 RUN ls -la /app/target/release/datachain && \
     file /app/target/release/datachain && \
-    /app/target/release/datachain --help
+    /app/target/release/datachain version
 
 # 运行阶段
 FROM debian:bookworm-slim
