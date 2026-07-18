@@ -19,7 +19,7 @@ RUN cargo build --release 2>&1 | tail -5; \
         echo "Full build succeeded"; \
     else \
         echo "Full build failed, building minimal health server"; \
-        echo 'use std::io::Write; use std::net::TcpListener; fn main() { let l = TcpListener::bind("0.0.0.0:8080").unwrap(); println!("DataChain Rust (minimal) on :8080"); for s in l.incoming() { let mut s = s.unwrap(); let r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"healthy\",\"service\":\"datachain-rust\",\"version\":\"1.0.0\"}"; s.write_all(r.as_bytes()).ok(); } }' > /tmp/health.rs; \
+        echo 'use std::io::Write; use std::net::TcpListener; fn main() { let l = TcpListener::bind("0.0.0.0:8000").unwrap(); println!("DataChain Rust (minimal) on :8080"); for s in l.incoming() { let mut s = s.unwrap(); let r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"healthy\",\"service\":\"datachain-rust\",\"version\":\"1.0.0\"}"; s.write_all(r.as_bytes()).ok(); } }' > /tmp/health.rs; \
         rustc -o /app/target/release/datachain /tmp/health.rs; \
     fi
 
@@ -48,10 +48,10 @@ COPY config/config.toml /app/config/config.toml
 ENV TZ=Asia/Shanghai
 ENV RUST_LOG=info
 
-EXPOSE 8080
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health || exit 1
+    CMD wget -q --spider http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/app/datachain"]
-CMD ["--config", "/app/config/config.toml", "serve", "--port", "8080"]
+CMD ["--config", "/app/config/config.toml", "serve", "--port", "8000"]
