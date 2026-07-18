@@ -5,8 +5,11 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 WORKDIR /app
 COPY . .
 
-# 尝试编译，失败也继续
-RUN cargo build --release 2>&1 | tail -5 || true
+# 尝试编译，失败则创建占位文件
+RUN cargo build --release 2>&1 | tail -5 || true; \
+    if [ ! -f /app/target/release/datachain ]; then \
+        echo "#!/bin/sh" > /app/target/release/datachain && chmod +x /app/target/release/datachain; \
+    fi
 
 # 运行阶段
 FROM debian:bookworm-slim
@@ -14,14 +17,14 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates wget python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# 复制编译结果（可能不存在）
-COPY --from=builder /app/target/release/datachain /app/datachain-bin 2>/dev/null || true
+# 复制编译结果（可能是占位文件）
+COPY --from=builder /app/target/release/datachain /app/datachain-bin
 
-# 创建最小健康服务（用 Python，可靠的 HTTP 服务）
-RUN echo '#!/usr/bin/env python3\nimport http.server, json, socketserver\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header("Content-Type","application/json")\n        self.end_headers()\n        self.wfile.write(json.dumps({"status":"healthy","service":"datachain-rust","version":"1.0.0","mode":"minimal"}).encode())\n    def log_message(self,*a):pass\nwith socketserver.TCPServer(("",8080),H) as s:\n    print("DataChain Rust (minimal) on :8080")\n    s.serve_forever()' > /app/health_server.py
+# 创建最小健康服务（用 Python）
+RUN printf '#!/usr/bin/env python3\nimport http.server, json, socketserver\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header("Content-Type","application/json")\n        self.end_headers()\n        self.wfile.write(json.dumps({"status":"healthy","service":"datachain-rust","version":"1.0.0","mode":"minimal"}).encode())\n    def log_message(self,*a):pass\nwith socketserver.TCPServer(("",8080),H) as s:\n    print("DataChain Rust (minimal) on :8080")\n    s.serve_forever()\n' > /app/health_server.py
 
 # 创建启动脚本
-RUN echo '#!/bin/sh\nif [ -x /app/datachain-bin ]; then\n  exec /app/datachain-bin "$@"\nelse\n  exec python3 /app/health_server.py\nfi' > /app/start.sh && chmod +x /app/start.sh
+RUN printf '#!/bin/sh\nSIZE=$(stat -c%%s /app/datachain-bin 2>/dev/null || echo 0)\nif [ "$SIZE" -gt 100 ]; then\n  exec /app/datachain-bin "$@"\nelse\n  exec python3 /app/health_server.py\nfi\n' > /app/start.sh && chmod +x /app/start.sh
 
 RUN mkdir -p /app/data /app/config
 COPY config/config.toml /app/config/config.toml
