@@ -230,6 +230,38 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
+async fn get_block_by_hash(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Result<Json<Block>, StatusCode> {
+    let chain = state.chain.lock().unwrap();
+    chain.iter().find(|b| b.hash == hash).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn get_proof(State(state): State<Arc<AppState>>, Path(sha256): Path<String>) -> Json<serde_json::Value> {
+    let chain = state.chain.lock().unwrap();
+
+    // 在所有区块中搜索包含此 data_id 或 owner 匹配的元数据
+    for block in chain.iter() {
+        for (idx, meta) in block.metadata_list.iter().enumerate() {
+            if meta.data_id == sha256 || meta.owner == sha256 {
+                // 简单 proof: 返回区块索引和元数据位置
+                return Json(serde_json::json!({
+                    "found": true,
+                    "block_index": block.index,
+                    "block_hash": block.hash,
+                    "metadata_index": idx,
+                    "metadata": meta,
+                    "proof_type": "inclusion",
+                    "merkle_root": block.hash  // 简化：用 block hash 代替真正的 merkle root
+                }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "found": false,
+        "reason": "content hash not found in any block"
+    }))
+}
+
 // ====== 主函数 ======
 
 #[tokio::main]
@@ -251,10 +283,12 @@ async fn main() {
         .route("/chain/info", get(chain_info))
         .route("/blocks", get(get_blocks))
         .route("/blocks/{index}", get(get_block))
+        .route("/blocks/by-hash/{hash}", get(get_block_by_hash))
         .route("/metadata", get(get_metadata))
         .route("/metadata", post(create_metadata))
         .route("/mine", post(mine_block))
         .route("/chain/validate", post(validate_chain))
+        .route("/proof/{sha256}", get(get_proof))
         .route("/stats", get(stats))
         .layer(cors)
         .with_state(state);
