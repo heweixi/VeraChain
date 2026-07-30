@@ -27,6 +27,12 @@ struct Block {
     nonce: u64,
     difficulty: u32,
     metadata_list: Vec<MetadataEntry>,
+    #[serde(default)]
+    key_transactions: Vec<KeyTransaction>,
+    #[serde(default)]
+    identity_snapshot_hash: String,
+    #[serde(default)]
+    merkle_root: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +42,31 @@ struct MetadataEntry {
     owner: String,
     tags: Vec<String>,
     created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeyTransaction {
+    #[serde(rename = "type")]
+    tx_type: String,
+    target_key: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    signed_by: String,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SignedAttestation {
+    sha256: String,
+    submitter_key: String,
+    signature: String,
+    timestamp: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +83,7 @@ struct ChainInfo {
 struct AppState {
     chain: Mutex<Vec<Block>>,
     pending: Mutex<Vec<MetadataEntry>>,
+    pending_key_txs: Mutex<Vec<KeyTransaction>>,
     difficulty: u32,
 }
 
@@ -65,10 +97,14 @@ impl AppState {
             nonce: 0,
             difficulty,
             metadata_list: vec![],
+            key_transactions: vec![],
+            identity_snapshot_hash: String::new(),
+            merkle_root: String::new(),
         };
         Self {
             chain: Mutex::new(vec![genesis]),
             pending: Mutex::new(vec![]),
+            pending_key_txs: Mutex::new(vec![]),
             difficulty,
         }
     }
@@ -174,15 +210,31 @@ async fn get_metadata(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 
 async fn mine_block(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut pending = state.pending.lock().unwrap();
-    if pending.is_empty() {
+    let mut pending_keys = state.pending_key_txs.lock().unwrap();
+
+    if pending.is_empty() && pending_keys.is_empty() {
         return Json(serde_json::json!({"error": "No pending data to mine"}));
     }
 
     let metadata_list: Vec<MetadataEntry> = pending.drain(..).collect();
+    let key_transactions: Vec<KeyTransaction> = pending_keys.drain(..).collect();
     drop(pending);
+    drop(pending_keys);
 
     let mut chain = state.chain.lock().unwrap();
     let prev = chain.last().unwrap().clone();
+
+    // 计算 merkle_root（从 attestation tags 中提取，或从 metadata data_id 列表生成）
+    let merkle_root = if !metadata_list.is_empty() {
+        // 使用第一个 metadata 的 tags 中的 merkle: 值
+        metadata_list.iter()
+            .flat_map(|m| m.tags.iter())
+            .find(|t| t.starts_with("merkle:"))
+            .map(|t| t[7..].to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let data = format!("{}:{}:{}", prev.index + 1, prev.hash, now());
     let hash = simple_hash(&data);
@@ -195,6 +247,9 @@ async fn mine_block(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         nonce: 42,
         difficulty: state.difficulty,
         metadata_list,
+        key_transactions,
+        identity_snapshot_hash: String::new(),
+        merkle_root,
     };
 
     let block_clone = block.clone();
@@ -222,11 +277,41 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let chain = state.chain.lock().unwrap();
     let pending = state.pending.lock().unwrap();
     let total_metadata: usize = chain.iter().map(|b| b.metadata_list.len()).sum();
+    let total_key_txs: usize = chain.iter().map(|b| b.key_transactions.len()).sum();
     Json(serde_json::json!({
         "chain_length": chain.len(),
         "total_metadata": total_metadata,
+        "total_key_transactions": total_key_txs,
         "pending_count": pending.len(),
         "difficulty": state.difficulty
+    }))
+}
+
+// POST /key-transactions — 提交密钥交易到 pending
+async fn submit_key_transaction(State(state): State<Arc<AppState>>, axum::extract::Json(tx): axum::extract::Json<KeyTransaction>) -> Json<serde_json::Value> {
+    state.pending_key_txs.lock().unwrap().push(tx.clone());
+    Json(serde_json::json!({
+        "success": true,
+        "type": tx.tx_type,
+        "target_key": tx.target_key
+    }))
+}
+
+// GET /key-transactions — 获取链上所有密钥交易
+async fn get_key_transactions(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let chain = state.chain.lock().unwrap();
+    let mut all_txs = Vec::new();
+    for block in chain.iter() {
+        for tx in &block.key_transactions {
+            all_txs.push(serde_json::json!({
+                "block_index": block.index,
+                "transaction": tx
+            }));
+        }
+    }
+    Json(serde_json::json!({
+        "total": all_txs.len(),
+        "transactions": all_txs
     }))
 }
 
@@ -289,6 +374,8 @@ async fn main() {
         .route("/mine", post(mine_block))
         .route("/chain/validate", post(validate_chain))
         .route("/proof/{sha256}", get(get_proof))
+        .route("/key-transactions", get(get_key_transactions))
+        .route("/key-transactions", post(submit_key_transaction))
         .route("/stats", get(stats))
         .layer(cors)
         .with_state(state);
