@@ -365,3 +365,86 @@ pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsR
         versions,
     }))
 }
+
+// ==================== Attestation 处理器 (Task 19) ====================
+
+/// 按哈希查询区块
+pub async fn get_block_by_hash(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let blocks = state.chain.get_all_blocks();
+    for block in blocks {
+        if block.hash == hash {
+            return Ok(Json(ApiResponse::success(block)));
+        }
+    }
+    Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(format!("block not found with hash: {}", hash)))))
+}
+
+/// 获取内容的 Merkle 证明
+#[derive(Serialize)]
+pub struct ProofResponse {
+    pub found: bool,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_index: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merkle_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitter_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub async fn get_proof(
+    State(state): State<AppState>,
+    Path(sha256): Path<String>,
+) -> Json<ProofResponse> {
+    let blocks = state.chain.get_all_blocks();
+    
+    for block in &blocks {
+        // Check attestations array
+        for att in &block.attestations {
+            if let Some(hash_val) = att.hash_bundle.get("sha256") {
+                if hash_val.as_str() == Some(&sha256) {
+                    return Json(ProofResponse {
+                        found: true,
+                        sha256: sha256.clone(),
+                        block_index: Some(block.index),
+                        block_hash: Some(block.hash.clone()),
+                        merkle_root: Some(block.merkle_root.clone()),
+                        submitter_key: Some(att.submitter_key.clone()),
+                        reason: None,
+                    });
+                }
+            }
+        }
+        // Check metadata tags
+        for meta in &block.metadata_list {
+            if meta.tags.contains(&sha256) {
+                return Json(ProofResponse {
+                    found: true,
+                    sha256: sha256.clone(),
+                    block_index: Some(block.index),
+                    block_hash: Some(block.hash.clone()),
+                    merkle_root: Some(block.merkle_root.clone()),
+                    submitter_key: None,
+                    reason: None,
+                });
+            }
+        }
+    }
+
+    Json(ProofResponse {
+        found: false,
+        sha256,
+        block_index: None,
+        block_hash: None,
+        merkle_root: None,
+        submitter_key: None,
+        reason: Some("content hash not found in any block attestation".to_string()),
+    })
+}

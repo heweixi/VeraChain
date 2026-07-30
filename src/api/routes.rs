@@ -41,6 +41,8 @@ pub fn create_router(state: AppState) -> Router {
         // 区块链
         .route("/api/v1/blocks", get(handlers::get_blocks))
         .route("/api/v1/blocks/:index", get(handlers::get_block))
+        .route("/api/v1/blocks/by-hash/:hash", get(handlers::get_block_by_hash))
+        .route("/api/v1/blocks/proof/:sha256", get(handlers::get_proof))
         .route("/api/v1/chain/info", get(handlers::get_chain_info))
         .route("/api/v1/chain/mine", post(handlers::mine_block))
         .route("/api/v1/chain/validate", post(handlers::validate_chain))

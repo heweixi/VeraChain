@@ -76,6 +76,42 @@ pub struct Block {
     pub aggregation: Option<AggregationInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_info: Option<VersionInfo>,
+    // === Attestation fields (Requirement 9) ===
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<SignedAttestation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_transactions: Vec<KeyTransactionEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_registry: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity_snapshot_hash: String,
+}
+
+/// 带签名的认证记录 (Requirement 9.2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedAttestation {
+    pub hash_bundle: HashMap<String, serde_json::Value>,
+    pub submitter_key: String,
+    pub signature: String,
+    pub timestamp: i64,
+}
+
+/// 密钥管理交易 (Requirement 9.1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyTransactionEntry {
+    #[serde(rename = "type")]
+    pub tx_type: String,
+    pub target_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    pub signed_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+    pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 impl Block {
@@ -92,6 +128,10 @@ impl Block {
             metadata_list: Vec::new(),
             aggregation: None,
             version_info: None,
+            attestations: Vec::new(),
+            key_transactions: Vec::new(),
+            identity_registry: None,
+            identity_snapshot_hash: String::new(),
         }
     }
 
