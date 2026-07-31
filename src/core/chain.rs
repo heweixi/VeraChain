@@ -35,6 +35,18 @@ impl Chain {
         genesis
     }
 
+    /// 使用身份注册创建创世区块 (Requirement 8.1)
+    pub fn init_with_registry(&self, registry: serde_json::Value) -> Block {
+        let mut genesis = Block::new(0, "0".to_string(), self.difficulty);
+        genesis.timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        genesis.identity_registry = Some(registry);
+        genesis.mine();
+
+        let mut blocks = self.blocks.write();
+        blocks.push(genesis.clone());
+        genesis
+    }
+
     /// 获取最新区块
     pub fn get_latest_block(&self) -> Option<Block> {
         let blocks = self.blocks.read();
