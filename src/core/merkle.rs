@@ -169,6 +169,23 @@ mod tests {
         assert!(!root.is_empty());
     }
 
+    // BLOCK_HASH_SPEC.md 第 10 节 Merkle 黄金向量(三语言一致)
+    #[test]
+    fn test_build_merkle_root_golden() {
+        assert_eq!(build_merkle_root(&[]), "");
+        assert_eq!(build_merkle_root(&["x".to_string()]), "x");
+        assert_eq!(
+            build_merkle_root(&["aa".to_string(), "bb".to_string(), "cc".to_string()]),
+            "0cbe39bd48cba9a69ee1e0cf4c002a3a80810e37b63b0b8b30f948cc3d660641"
+        );
+        assert_eq!(
+            build_merkle_root(&[
+                "a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()
+            ]),
+            "12a40550c10c6339bf6f271445270e49b844d6c9e8abc36b9b642be532befe94"
+        );
+    }
+
     #[test]
     fn test_merkle_tree() {
         let data = vec!["a", "b", "c", "d"];
