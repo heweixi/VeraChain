@@ -16,7 +16,9 @@ use datachain::cli::status::run_status;
 use datachain::cli::user::{run_user, UserAction};
 use datachain::cli::version::{run_version, VersionAction};
 use datachain::config::AppConfig;
-use datachain::utils::init_logger; // utils::logger 是私有模块,经 utils 的 re-export 访问
+// utils::logger 是私有模块,经 utils 的 re-export 访问。
+// 注意 utils::LogConfig 与 config::LogConfig 是两套类型,需转换。
+use datachain::utils::{init_logger, LogConfig};
 
 #[derive(Parser)]
 #[command(name = "datachain", version, about = "DataChain - 数据追溯区块链系统 (Rust)")]
@@ -84,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = AppConfig::load(&cli.config)?;
-    init_logger(&config.log);
+    // config::LogConfig 仅含 level;转成 logger 的 LogConfig(其余取默认)
+    init_logger(&LogConfig {
+        level: config.log.level.clone(),
+        ..LogConfig::default()
+    });
 
     match cli.command {
         Commands::Serve { port } => {
