@@ -14,11 +14,31 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# core 模块所需(此前 Cargo.toml 遗漏,导致项目无法编译):
-# canonical.rs/block.rs 的哈希与时间处理
+# 以下依赖此前 Cargo.toml 全部遗漏,导致项目从未编译成功。按源码实际用法补齐:
+# 哈希(core/crypto)
 sha2 = "0.10"
+sha3 = "0.10"
+md-5 = "0.10"    # RustCrypto md-5(lib 名 md5,Digest 风格:Md5::new/update/finalize)
 hex = "0.4"
+# 时间(core/aggregation/api 等)
 chrono = { version = "0.4", features = ["serde"] }
+# 数据库(storage,SQLite + tokio 运行时)
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+# 认证(auth/jwt)
+jsonwebtoken = "9"
+# 错误处理(error.rs 的 thiserror 派生)
+thiserror = "1"
+# 全局单例(auth/permissions、utils/performance)
+lazy_static = "1"
+# CLI(cli/* 用 clap derive)
+clap = { version = "4", features = ["derive"] }
+# 并发锁(chain/websocket)
+parking_lot = "0.12"
+# 异步流(api/websocket)
+futures-util = "0.3"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = "s"
