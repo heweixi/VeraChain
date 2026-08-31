@@ -1,6 +1,6 @@
 # Rust
 /target/
-Cargo.lock
+# Cargo.lock 应提交(datachain-rust 是可执行应用,需锁定依赖以可复现构建)
 
 # IDE
 .idea/
