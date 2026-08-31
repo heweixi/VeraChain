@@ -1,6 +1,6 @@
 use axum::{
-    extract::State,
-    http::{header, Request, StatusCode},
+    extract::{Request, State},
+    http::{header, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -8,11 +8,14 @@ use axum::{
 use super::AppState;
 use crate::auth::Claims;
 
+// axum 0.7 变更:Next 不再有泛型参数,Request 默认具体化为 Request<Body>。
+// 原代码沿用 0.6 的 Next<B>/Request<B> 泛型写法,已不兼容,故去除泛型。
+
 /// 认证中间件
-pub async fn auth_middleware<B>(
+pub async fn auth_middleware(
     State(state): State<AppState>,
-    mut request: Request<B>,
-    next: Next<B>,
+    mut request: Request,
+    next: Next,
 ) -> Result<Response, StatusCode> {
     // 获取 Authorization header
     let auth_header = request
@@ -38,15 +41,15 @@ pub async fn auth_middleware<B>(
 }
 
 /// 从请求中提取用户信息
-pub fn extract_claims<B>(request: &Request<B>) -> Option<&Claims> {
+pub fn extract_claims(request: &Request) -> Option<&Claims> {
     request.extensions().get::<Claims>()
 }
 
 /// 可选认证中间件（不强制要求认证）
-pub async fn optional_auth_middleware<B>(
+pub async fn optional_auth_middleware(
     State(state): State<AppState>,
-    mut request: Request<B>,
-    next: Next<B>,
+    mut request: Request,
+    next: Next,
 ) -> Response {
     // 尝试获取 Authorization header
     if let Some(auth_header) = request

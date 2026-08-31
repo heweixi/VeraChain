@@ -30,7 +30,11 @@ impl<T: Serialize> ApiResponse<T> {
             error: None,
         }
     }
+}
 
+impl ApiResponse<()> {
+    // 放在 impl ApiResponse<()> 而非 impl<T>:返回类型不含 T,置于泛型 impl 中会
+    // 导致调用处 T 无法推断(E0283)。固定为 () 后 `ApiResponse::error(..)` 可直接推断。
     pub fn error(msg: impl Into<String>) -> ApiResponse<()> {
         ApiResponse {
             success: false,
