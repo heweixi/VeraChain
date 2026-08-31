@@ -21,9 +21,12 @@ WORKDIR /app
 COPY --from=builder /app/target/release/datachain /app/datachain
 COPY config/config.toml /app/config/config.toml
 
-RUN mkdir -p /app/data /app/config
+RUN useradd -u 10001 -m appuser \
+    && mkdir -p /app/data /app/config \
+    && chown -R appuser:appuser /app
 
 ENV TZ=Asia/Shanghai
+USER appuser
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
