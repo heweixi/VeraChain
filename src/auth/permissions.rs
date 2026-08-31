@@ -97,6 +97,7 @@ impl PermissionManager {
         self.role_permissions.insert(Role::Admin, admin_perms);
 
         // User - 基本权限
+        // 注:对齐 Python/Go 基准,user 不含 block:mine(普通用户不应有出块/挖矿权)
         let user_perms: HashSet<Permission> = [
             Permission::UserRead,
             Permission::MetadataCreate,
@@ -104,7 +105,6 @@ impl PermissionManager {
             Permission::MetadataUpdate,
             Permission::MetadataDelete,
             Permission::BlockRead,
-            Permission::BlockMine,
             Permission::AggregationRead,
         ]
         .into_iter()
@@ -186,7 +186,10 @@ mod tests {
     fn test_user_permissions() {
         let manager = PermissionManager::new();
         assert!(manager.has_permission(Role::User, Permission::MetadataCreate));
+        assert!(manager.has_permission(Role::User, Permission::BlockRead));
         assert!(!manager.has_permission(Role::User, Permission::SystemAdmin));
+        // 对齐 Python/Go:普通 user 不应有出块/挖矿权
+        assert!(!manager.has_permission(Role::User, Permission::BlockMine));
     }
 
     #[test]
