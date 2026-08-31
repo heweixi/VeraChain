@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{AggregationStrategy, CountBasedStrategy, StrategyType, TimeBasedStrategy};
-use crate::core::{build_merkle_root, AggregationInfo, Chain, MetadataEntry, TimeRange};
+use crate::core::{build_merkle_root, Chain, MetadataEntry, TimeRange};
 
 /// 汇总引擎
 pub struct AggregationEngine {

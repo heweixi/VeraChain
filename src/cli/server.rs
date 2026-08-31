@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use tracing::info;
 
 use crate::aggregation::create_aggregation_engine;

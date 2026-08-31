@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{CreateMetadataRequest, DataMetadata, QueryMetadataRequest};
+use super::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::core::{Chain, MetadataEntry};
 use crate::crypto::HashEngine;
 use crate::error::Result;
