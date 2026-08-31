@@ -26,6 +26,13 @@ chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 # 认证(auth/jwt)
 jsonwebtoken = "9"
+# 密码哈希(crypto/hash.rs)
+bcrypt = "0.15"
+argon2 = "0.5"
+pbkdf2 = "0.12"
+scrypt = "0.11"
+# UUID(多模块用 Uuid::new_v4)
+uuid = { version = "1", features = ["v4"] }
 # 错误处理(error.rs 的 thiserror 派生)
 thiserror = "1"
 # 全局单例(auth/permissions、utils/performance)
