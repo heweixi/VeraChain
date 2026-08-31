@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{AggregationStrategy, CountBasedStrategy, StrategyType, TimeBasedStrategy};
-use crate::core::{build_merkle_root, Chain, MetadataEntry, TimeRange};
+use crate::core::{build_merkle_root, metadata_leaf_hash, Chain, MetadataEntry, TimeRange};
 
 /// 汇总引擎
 pub struct AggregationEngine {
@@ -81,8 +81,12 @@ impl AggregationEngine {
         // 计算统计信息
         let statistics = self.compute_statistics(&all_metadata);
 
-        // 计算 Merkle 根
-        let hashes: Vec<String> = blocks.iter().map(|b| b.hash.clone()).collect();
+        // 计算 Merkle 根:基于所聚合的元数据 data_id,叶子 = SHA256(data_id)
+        // (与 Python/Go 的元数据聚合及区块 merkle 统一,BLOCK_HASH_SPEC 第10节)
+        let hashes: Vec<String> = all_metadata
+            .iter()
+            .map(|m| metadata_leaf_hash(&m.data_id))
+            .collect();
         let merkle_root = build_merkle_root(&hashes);
 
         // 创建汇总
