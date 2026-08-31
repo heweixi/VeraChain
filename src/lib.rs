@@ -8,6 +8,14 @@
 //! 黄金向量、auth 的权限模型)。模块按依赖关系分批接入。
 
 pub mod error;
+pub mod config;
 pub mod core;
 pub mod crypto;
 pub mod auth;
+pub mod utils;
+pub mod metadata;
+pub mod storage;
+pub mod versioning;
+pub mod aggregation;
+pub mod api;
+pub mod cli;
