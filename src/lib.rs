@@ -9,3 +9,5 @@
 
 pub mod error;
 pub mod core;
+pub mod crypto;
+pub mod auth;
