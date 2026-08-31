@@ -52,6 +52,9 @@ toml = "0.8"
 glob = "0.3"
 rustc_version_runtime = "0.3"
 
+[dev-dependencies]
+tempfile = "3"    # versioning storage 测试用临时目录
+
 [profile.release]
 opt-level = "s"
 lto = true
