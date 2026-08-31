@@ -140,21 +140,19 @@ impl Block {
         self.metadata_list.push(entry);
     }
 
-    /// 计算区块哈希
+    /// 计算区块哈希(遵循统一规范 BLOCK_HASH_SPEC.md v1)。
+    ///
+    /// 统一算法只哈希区块头字段 + merkle_root(负载完整性由 merkle_root 承载),
+    /// timestamp 归一化为 Unix 秒,确保与 Python/Go 实现字节级一致。
     pub fn calculate_hash(&self) -> String {
-        let data = format!(
-            "{}{}{}{}{}{}",
+        super::canonical_block_hash(
             self.index,
             self.timestamp.timestamp(),
-            self.previous_hash,
-            self.merkle_root,
+            &self.previous_hash,
+            &self.merkle_root,
             self.nonce,
-            self.difficulty
-        );
-        
-        let mut hasher = Sha256::new();
-        hasher.update(data.as_bytes());
-        hex::encode(hasher.finalize())
+            self.difficulty,
+        )
     }
 
     /// 计算 Merkle 根
