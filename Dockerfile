@@ -1,38 +1,33 @@
-# 构建阶段 - 尝试完整编译 Rust
+# 构建阶段 —— 真实编译 Rust(失败即中断,不再用 || true 掩盖)
 FROM rust:latest AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
 
-# 尝试编译，失败则创建占位文件
-RUN cargo build --release 2>&1 | tail -5 || true; \
-    if [ ! -f /app/target/release/datachain ]; then \
-        echo "#!/bin/sh" > /app/target/release/datachain && chmod +x /app/target/release/datachain; \
-    fi
+# 真实编译 release 二进制。编译失败会使镜像构建失败(此前用 'cargo build || true'
+# 掩盖失败并回退占位文件,导致镜像跑的是假的 python health server)。
+RUN cargo build --release --bin datachain
 
 # 运行阶段
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates wget python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y ca-certificates wget libsqlite3-0 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-# 复制编译结果（可能是占位文件）
-COPY --from=builder /app/target/release/datachain /app/datachain-bin
-
-# 创建最小健康服务（用 Python）
-RUN printf '#!/usr/bin/env python3\nimport http.server, json, socketserver\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header("Content-Type","application/json")\n        self.end_headers()\n        self.wfile.write(json.dumps({"status":"healthy","service":"datachain-rust","version":"1.0.0","mode":"minimal"}).encode())\n    def log_message(self,*a):pass\nwith socketserver.TCPServer(("",8080),H) as s:\n    print("DataChain Rust (minimal) on :8080")\n    s.serve_forever()\n' > /app/health_server.py
-
-# 创建启动脚本
-RUN printf '#!/bin/sh\nSIZE=$(stat -c%%s /app/datachain-bin 2>/dev/null || echo 0)\nif [ "$SIZE" -gt 100 ]; then\n  exec /app/datachain-bin "$@"\nelse\n  exec python3 /app/health_server.py\nfi\n' > /app/start.sh && chmod +x /app/start.sh
+# 复制真实编译产物
+COPY --from=builder /app/target/release/datachain /app/datachain
+COPY config/config.toml /app/config/config.toml
 
 RUN mkdir -p /app/data /app/config
-COPY config/config.toml /app/config/config.toml
 
 ENV TZ=Asia/Shanghai
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD wget -q --spider http://localhost:8080/health || exit 1
 
-CMD ["/app/start.sh"]
+# 启动真实服务(api::run_server 提供 /health 与 /ws)
+CMD ["/app/datachain", "serve", "--config", "/app/config/config.toml"]

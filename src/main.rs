@@ -16,7 +16,7 @@ use datachain::cli::status::run_status;
 use datachain::cli::user::{run_user, UserAction};
 use datachain::cli::version::{run_version, VersionAction};
 use datachain::config::AppConfig;
-use datachain::utils::logger::init_logger;
+use datachain::utils::init_logger; // utils::logger 是私有模块,经 utils 的 re-export 访问
 
 #[derive(Parser)]
 #[command(name = "datachain", version, about = "DataChain - 数据追溯区块链系统 (Rust)")]
