@@ -50,6 +50,14 @@ pub fn canonical_block_hash(
     hex::encode(hasher.finalize())
 }
 
+/// 元数据条目的 Merkle 叶子哈希(BLOCK_HASH_SPEC.md 第 10 节 v1)。
+/// 叶子 = SHA256(data_id) 小写 hex,以 data_id 为条目身份,跨语言绝对一致。
+pub fn metadata_leaf_hash(data_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +99,27 @@ mod tests {
         let h2 = canonical_block_hash(5, 123, "aa", "bb", 1, 1);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    // 元数据叶子(SHA256(data_id)) + merkle 黄金向量(BLOCK_HASH_SPEC 第10节 v1)
+    #[test]
+    fn test_metadata_leaf_merkle_golden() {
+        const LEAF_M1: &str =
+            "ca0df2c95aa144c1d0ff2ff3c8f967fdc1de9ef0c4120b3726416701b519d619";
+        assert_eq!(metadata_leaf_hash("m1"), LEAF_M1);
+
+        let root = |ids: &[&str]| -> String {
+            let leaves: Vec<String> = ids.iter().map(|id| metadata_leaf_hash(id)).collect();
+            crate::core::build_merkle_root(&leaves)
+        };
+        assert_eq!(root(&["m1"]), LEAF_M1);
+        assert_eq!(
+            root(&["m1", "m2"]),
+            "51d9c2e35a60bdab27c3861e044b7bd5b352eaa01ac6deec719f338f8283e637"
+        );
+        assert_eq!(
+            root(&["m1", "m2", "m3"]),
+            "0aeb61df09972a07a9928365ff0b6f0d03c4a60ee0999ea2e12eabbebf7db4f1"
+        );
     }
 }

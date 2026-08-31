@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
 use super::merkle::build_merkle_root;
@@ -161,14 +160,10 @@ impl Block {
             return String::new();
         }
 
+        // 叶子 = SHA256(data_id)(BLOCK_HASH_SPEC 第10节 v1,三版本一致)
         let hashes: Vec<String> = self.metadata_list
             .iter()
-            .map(|entry| {
-                let data = serde_json::to_string(entry).unwrap_or_default();
-                let mut hasher = Sha256::new();
-                hasher.update(data.as_bytes());
-                hex::encode(hasher.finalize())
-            })
+            .map(|entry| super::metadata_leaf_hash(&entry.data_id))
             .collect();
 
         build_merkle_root(&hashes)
