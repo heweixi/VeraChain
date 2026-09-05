@@ -1,5 +1,7 @@
 # DataChain Rust
 
+> 项目级实现状态与已知差异见仓库根 `PROJECT_STATUS_OVERVIEW.md`。
+
 数据追溯区块链系统 - Rust 实现
 
 ## 功能特性
