@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use tracing::info;
 
-use crate::aggregation::create_aggregation_engine;
+use crate::aggregation::{create_aggregation_engine, create_scheduler};
 use crate::api;
+use crate::api::{Event, EventBus, EventType, NotificationService};
 use crate::auth::create_auth_service;
 use crate::config::AppConfig;
 use crate::core::create_chain;
@@ -82,6 +84,34 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         aggregation_engine.load_aggregation(summary);
     }
 
+    // 创建 WebSocket Hub、通知服务和事件总线
+    let ws_hub = api::websocket::WsHub::new();
+    let notification = Arc::new(NotificationService::new(ws_hub.clone()));
+    let event_bus = Arc::new(EventBus::new(notification));
+
+    // 启动聚合调度器;自动聚合结果异步持久化并发布事件。
+    let scheduler = create_scheduler(
+        aggregation_engine.clone(),
+        config.aggregation.time_interval_secs,
+    );
+    let callback_storage = storage.clone();
+    let callback_events = event_bus.clone();
+    scheduler.set_callback(Box::new(move |summary| {
+        let summary = summary.clone();
+        let storage = callback_storage.clone();
+        let events = callback_events.clone();
+        events.publish(Event::new(
+            EventType::AggregationDone,
+            serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({})),
+        ));
+        tokio::spawn(async move {
+            if let Err(e) = storage.save_aggregation(&summary).await {
+                tracing::error!("自动聚合结果持久化失败: {}", e);
+            }
+        });
+    }));
+    scheduler.start();
+
     // 创建应用状态
     let app_state = api::AppState {
         chain,
@@ -90,7 +120,9 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         version_tracker,
         aggregation_engine,
         storage,
-        ws_hub: api::websocket::WsHub::new(),
+        ws_hub,
+        event_bus,
+        scheduler,
     };
 
     // 启动服务

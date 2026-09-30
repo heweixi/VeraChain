@@ -62,6 +62,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/versions/history/:file_path", get(handlers::get_version_history))
         // 汇总
         .route("/api/v1/aggregations", get(handlers::get_aggregations))
+        .route("/api/v1/aggregations/status", get(handlers::aggregation_status))
         .route("/api/v1/aggregations/trigger", post(handlers::trigger_aggregation))
         // 统计
         .route("/api/v1/stats", get(handlers::get_stats))

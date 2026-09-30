@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use crate::aggregation::AggregationEngine;
+use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
 use crate::core::Chain;
 use crate::metadata::MetadataManager;
 use crate::storage::Storage;
 use crate::versioning::VersionTracker;
-use super::websocket::WsHub;
+use super::{notification::EventBus, websocket::WsHub};
 
 /// 应用状态
 #[derive(Clone)]
@@ -18,6 +18,8 @@ pub struct AppState {
     pub aggregation_engine: Arc<AggregationEngine>,
     pub storage: Arc<Storage>,
     pub ws_hub: Arc<WsHub>,
+    pub event_bus: Arc<EventBus>,
+    pub scheduler: Arc<Scheduler>,
 }
 
 impl AppState {
@@ -30,6 +32,8 @@ impl AppState {
         aggregation_engine: Arc<AggregationEngine>,
         storage: Arc<Storage>,
         ws_hub: Arc<WsHub>,
+        event_bus: Arc<EventBus>,
+        scheduler: Arc<Scheduler>,
     ) -> Self {
         Self {
             chain,
@@ -39,6 +43,8 @@ impl AppState {
             aggregation_engine,
             storage,
             ws_hub,
+            event_bus,
+            scheduler,
         }
     }
 }

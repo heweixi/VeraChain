@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
+use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
 use crate::auth::{Claims, LoginRequest, RegisterRequest};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
@@ -81,6 +81,10 @@ pub async fn register(
                 tracing::error!("保存用户失败: {}", e);
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
+            state.event_bus.publish(Event::new(
+                EventType::UserRegistered,
+                serde_json::to_value(user.to_public()).unwrap_or_else(|_| serde_json::json!({})),
+            ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(user.to_public()))))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(e.to_string())))),
@@ -136,6 +140,10 @@ pub async fn create_metadata(
                 tracing::error!("保存待打包元数据失败: {}", e);
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
+            state.event_bus.publish(Event::new(
+                EventType::MetadataCreated,
+                serde_json::to_value(&entry).unwrap_or_else(|_| serde_json::json!({})),
+            ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(entry))))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string())))),
@@ -241,6 +249,10 @@ pub async fn mine_block(
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
                 }
             }
+            state.event_bus.publish(Event::new(
+                EventType::BlockMined,
+                serde_json::to_value(&block).unwrap_or_else(|_| serde_json::json!({})),
+            ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(block))))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(e.to_string())))),
@@ -257,6 +269,10 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
     let valid = state.chain.validate_chain();
     let block_count = state.chain.get_block_count();
 
+    state.event_bus.publish(Event::new(
+        EventType::ChainValidated,
+        serde_json::json!({ "valid": valid, "block_count": block_count }),
+    ));
     Json(ApiResponse::success(ValidateResponse { valid, block_count }))
 }
 
@@ -313,6 +329,10 @@ pub async fn track_version(
                 tracing::error!("保存版本失败: {}", e);
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
+            state.event_bus.publish(Event::new(
+                EventType::VersionTracked,
+                serde_json::to_value(&version).unwrap_or_else(|_| serde_json::json!({})),
+            ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(version))))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string())))),
@@ -350,6 +370,10 @@ pub async fn get_aggregations(
     })
 }
 
+pub async fn aggregation_status(State(state): State<AppState>) -> Json<ApiResponse<crate::aggregation::SchedulerStatus>> {
+    Json(ApiResponse::success(state.scheduler.get_status()))
+}
+
 #[derive(Deserialize)]
 pub struct TriggerAggregationRequest {
     #[serde(default = "default_strategy")]
@@ -378,6 +402,10 @@ pub async fn trigger_aggregation(
                 tracing::error!("保存聚合结果失败: {}", e);
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
+            state.event_bus.publish(Event::new(
+                EventType::AggregationDone,
+                serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({})),
+            ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(summary))))
         }
         None => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("aggregation failed or no data")))),
