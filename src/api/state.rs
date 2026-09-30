@@ -6,6 +6,7 @@ use crate::core::Chain;
 use crate::metadata::MetadataManager;
 use crate::storage::Storage;
 use crate::versioning::VersionTracker;
+use super::websocket::WsHub;
 
 /// 应用状态
 #[derive(Clone)]
@@ -16,6 +17,7 @@ pub struct AppState {
     pub version_tracker: Arc<VersionTracker>,
     pub aggregation_engine: Arc<AggregationEngine>,
     pub storage: Arc<Storage>,
+    pub ws_hub: Arc<WsHub>,
 }
 
 impl AppState {
@@ -27,6 +29,7 @@ impl AppState {
         version_tracker: Arc<VersionTracker>,
         aggregation_engine: Arc<AggregationEngine>,
         storage: Arc<Storage>,
+        ws_hub: Arc<WsHub>,
     ) -> Self {
         Self {
             chain,
@@ -35,6 +38,7 @@ impl AppState {
             version_tracker,
             aggregation_engine,
             storage,
+            ws_hub,
         }
     }
 }

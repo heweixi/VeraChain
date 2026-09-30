@@ -25,8 +25,13 @@ impl AuthService {
         }
     }
 
-    /// 用户注册
+    /// 公开注册:始终创建普通用户,不接受客户端指定高权限角色。
     pub fn register(&self, req: &RegisterRequest) -> Result<User> {
+        self.register_with_role(req, Role::User)
+    }
+
+    /// 管理/CLI 注册:由受信调用方显式指定角色。
+    pub fn register_with_role(&self, req: &RegisterRequest, role: Role) -> Result<User> {
         // 检查用户名唯一性
         {
             let username_index = self.username_index.read();
@@ -48,7 +53,6 @@ impl AuthService {
             .map_err(|e| DataChainError::Internal(e.to_string()))?;
 
         // 创建用户
-        let role = req.role.unwrap_or(Role::User);
         let user = User::new(
             req.username.clone(),
             password_hash,

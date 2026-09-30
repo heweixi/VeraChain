@@ -26,6 +26,13 @@ pub enum Permission {
     AggregationCreate,
     AggregationTrigger,
 
+    // 版本权限
+    VersionRead,
+    VersionTrack,
+
+    // 统计权限
+    StatsRead,
+
     // 系统权限
     SystemConfig,
     SystemMonitor,
@@ -48,6 +55,9 @@ impl std::fmt::Display for Permission {
             Permission::AggregationRead => "aggregation:read",
             Permission::AggregationCreate => "aggregation:create",
             Permission::AggregationTrigger => "aggregation:trigger",
+            Permission::VersionRead => "version:read",
+            Permission::VersionTrack => "version:track",
+            Permission::StatsRead => "stats:read",
             Permission::SystemConfig => "system:config",
             Permission::SystemMonitor => "system:monitor",
             Permission::SystemAdmin => "system:admin",
@@ -88,6 +98,9 @@ impl PermissionManager {
             Permission::AggregationRead,
             Permission::AggregationCreate,
             Permission::AggregationTrigger,
+            Permission::VersionRead,
+            Permission::VersionTrack,
+            Permission::StatsRead,
             Permission::SystemConfig,
             Permission::SystemMonitor,
             Permission::SystemAdmin,
@@ -106,6 +119,9 @@ impl PermissionManager {
             Permission::MetadataDelete,
             Permission::BlockRead,
             Permission::AggregationRead,
+            Permission::VersionRead,
+            Permission::VersionTrack,
+            Permission::StatsRead,
         ]
         .into_iter()
         .collect();
@@ -117,6 +133,8 @@ impl PermissionManager {
             Permission::MetadataRead,
             Permission::BlockRead,
             Permission::AggregationRead,
+            Permission::VersionRead,
+            Permission::StatsRead,
             Permission::SystemMonitor,
         ]
         .into_iter()

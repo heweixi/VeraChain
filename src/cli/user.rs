@@ -61,7 +61,7 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 role: Some(role),
             };
 
-            match auth_service.register(&req) {
+            match auth_service.register_with_role(&req, role) {
                 Ok(user) => {
                     storage.save_user(&user).await?;
                     println!("✓ 用户已创建");

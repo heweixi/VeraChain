@@ -1,20 +1,27 @@
 use axum::{
+    http::{header, HeaderValue, Method},
     middleware,
     routing::{get, post},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use super::{handlers, middleware::auth_middleware, websocket, AppState};
 
 /// 创建路由
 pub fn create_router(state: AppState) -> Router {
-    // CORS 配置
+    // CORS 仅允许显式配置的来源；未配置时只允许本地开发来源。
+    let configured_origins = std::env::var("DATACHAIN_CORS_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5173".to_string());
+    let origins: Vec<HeaderValue> = configured_origins
+        .split(',')
+        .filter_map(|origin| HeaderValue::from_str(origin.trim()).ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     // 公开路由（无需认证）
     let public_routes = Router::new()
@@ -28,7 +35,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ws", get(websocket::ws_handler))
         .route("/ws/chain", get(websocket::chain_ws_handler))
         .route("/ws/metadata", get(websocket::metadata_ws_handler))
-        .route("/ws/aggregation", get(websocket::aggregation_ws_handler));
+        .route("/ws/aggregation", get(websocket::aggregation_ws_handler))
+        // WebSocket 握手也必须携带 Bearer JWT。
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // 需要认证的路由
     let protected_routes = Router::new()

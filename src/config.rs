@@ -102,13 +102,54 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        if Path::new(path).exists() {
+        let mut config = if Path::new(path).exists() {
             let content = std::fs::read_to_string(path)?;
-            let config: AppConfig = toml::from_str(&content)?;
-            Ok(config)
+            toml::from_str::<AppConfig>(&content)?
         } else {
-            Ok(Self::default())
+            Self::default()
+        };
+
+        config.apply_environment();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 应用部署环境覆盖，避免把生产密钥写入配置文件。
+    fn apply_environment(&mut self) {
+        if let Ok(secret) = std::env::var("DATACHAIN_JWT_SECRET") {
+            self.jwt.secret = secret;
+        } else if let Ok(secret) = std::env::var("JWT_SECRET") {
+            self.jwt.secret = secret;
         }
+        if let Ok(dsn) = std::env::var("DATACHAIN_DATABASE_DSN") {
+            self.database.dsn = dsn;
+        }
+        if let Ok(host) = std::env::var("DATACHAIN_SERVER_HOST") {
+            self.server.host = host;
+        }
+        if let Ok(port) = std::env::var("DATACHAIN_SERVER_PORT") {
+            if let Ok(port) = port.parse() {
+                self.server.port = port;
+            }
+        }
+    }
+
+    /// 校验生产安全前置条件。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let secret = self.jwt.secret.trim();
+        if secret.len() < 32
+            || secret == "your-secret-key-change-in-production"
+            || secret == "datachain-secret-key-change-in-production"
+        {
+            anyhow::bail!("JWT secret must be at least 32 characters and not a default placeholder; set DATACHAIN_JWT_SECRET");
+        }
+        if self.server.port == 0 {
+            anyhow::bail!("server port must be greater than zero");
+        }
+        if self.blockchain.block_size == 0 {
+            anyhow::bail!("blockchain block_size must be greater than zero");
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &str) -> anyhow::Result<()> {

@@ -64,6 +64,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         version_tracker,
         aggregation_engine,
         storage,
+        ws_hub: api::websocket::WsHub::new(),
     };
 
     // 启动服务

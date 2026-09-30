@@ -3,7 +3,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::IntoResponse,
+    response::{IntoResponse, Response},
+    http::StatusCode,
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
@@ -60,6 +61,11 @@ impl WsMessage {
     }
 }
 
+/// WebSocket 单条文本消息最大字节数。
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
+/// 单进程最大 WebSocket 连接数,防止无界连接耗尽资源。
+const MAX_WS_CLIENTS: usize = 256;
+
 /// WebSocket Hub - 管理所有连接
 pub struct WsHub {
     /// 广播发送器
@@ -113,10 +119,19 @@ impl WsHub {
         }
     }
 
-    /// 增加客户端计数
-    pub fn add_client(&self) {
+    /// 尝试增加客户端,达到上限时拒绝新连接。
+    pub fn try_add_client(&self) -> bool {
         let mut count = self.client_count.write();
+        if *count >= MAX_WS_CLIENTS {
+            return false;
+        }
         *count += 1;
+        true
+    }
+
+    /// 增加客户端计数(兼容内部调用;新握手应优先使用 try_add_client)。
+    pub fn add_client(&self) {
+        let _ = self.try_add_client();
     }
 
     /// 减少客户端计数
@@ -154,44 +169,69 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State(_state): State<AppState>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+    }
     let client_id = query
         .client_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let hub = state.ws_hub.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, client_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, client_id, hub)).into_response()
 }
 
 /// 区块链 WebSocket 处理器
 pub async fn chain_ws_handler(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+    }
     let client_id = uuid::Uuid::new_v4().to_string();
-    ws.on_upgrade(move |socket| handle_channel_socket(socket, client_id, "chain".to_string()))
+    let hub = state.ws_hub.clone();
+    ws.on_upgrade(move |socket| {
+        handle_channel_socket(socket, client_id, "chain".to_string(), hub)
+    })
+    .into_response()
 }
 
 /// 元数据 WebSocket 处理器
 pub async fn metadata_ws_handler(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+    }
     let client_id = uuid::Uuid::new_v4().to_string();
-    ws.on_upgrade(move |socket| handle_channel_socket(socket, client_id, "metadata".to_string()))
+    let hub = state.ws_hub.clone();
+    ws.on_upgrade(move |socket| {
+        handle_channel_socket(socket, client_id, "metadata".to_string(), hub)
+    })
+    .into_response()
 }
 
 /// 汇总 WebSocket 处理器
 pub async fn aggregation_ws_handler(
     ws: WebSocketUpgrade,
-    State(_state): State<AppState>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+    }
     let client_id = uuid::Uuid::new_v4().to_string();
-    ws.on_upgrade(move |socket| handle_channel_socket(socket, client_id, "aggregation".to_string()))
+    let hub = state.ws_hub.clone();
+    ws.on_upgrade(move |socket| {
+        handle_channel_socket(socket, client_id, "aggregation".to_string(), hub)
+    })
+    .into_response()
 }
 
 /// 处理 WebSocket 连接
-async fn handle_socket(socket: WebSocket, client_id: String) {
+async fn handle_socket(socket: WebSocket, client_id: String, hub: Arc<WsHub>) {
     let (mut sender, mut receiver) = socket.split();
 
     tracing::info!("WebSocket 客户端连接: {}", client_id);
@@ -212,6 +252,17 @@ async fn handle_socket(socket: WebSocket, client_id: String) {
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
+                if text.len() > MAX_WS_MESSAGE_BYTES {
+                    tracing::warn!("WebSocket message too large: {} bytes", text.len());
+                    let error = WsMessage::new(
+                        MessageType::Error,
+                        Some(serde_json::json!({ "error": "message too large" })),
+                    );
+                    if let Ok(json) = serde_json::to_string(&error) {
+                        let _ = sender.send(Message::Text(json)).await;
+                    }
+                    break;
+                }
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match ws_msg.msg_type {
                         MessageType::Ping => {
@@ -236,11 +287,17 @@ async fn handle_socket(socket: WebSocket, client_id: String) {
         }
     }
 
+    hub.remove_client();
     tracing::info!("WebSocket 客户端断开: {}", client_id);
 }
 
 /// 处理频道 WebSocket 连接
-async fn handle_channel_socket(socket: WebSocket, client_id: String, channel: String) {
+async fn handle_channel_socket(
+    socket: WebSocket,
+    client_id: String,
+    channel: String,
+    hub: Arc<WsHub>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     tracing::info!("WebSocket 客户端连接到频道 {}: {}", channel, client_id);
@@ -260,6 +317,12 @@ async fn handle_channel_socket(socket: WebSocket, client_id: String, channel: St
     // 处理消息
     while let Some(msg) = receiver.next().await {
         match msg {
+            Ok(Message::Text(text)) => {
+                if text.len() > MAX_WS_MESSAGE_BYTES {
+                    tracing::warn!("WebSocket channel message too large: {} bytes", text.len());
+                    break;
+                }
+            }
             Ok(Message::Ping(data)) => {
                 let _ = sender.send(Message::Pong(data)).await;
             }
@@ -272,5 +335,6 @@ async fn handle_channel_socket(socket: WebSocket, client_id: String, channel: St
         }
     }
 
+    hub.remove_client();
     tracing::info!("WebSocket 客户端断开频道 {}: {}", channel, client_id);
 }
