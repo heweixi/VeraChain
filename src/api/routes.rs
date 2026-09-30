@@ -9,11 +9,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use super::{
-    handlers,
-    middleware::auth_middleware,
-    rate_limit::rate_limit_middleware,
-    websocket,
-    AppState,
+    handlers, middleware::auth_middleware, rate_limit::rate_limit_middleware, websocket, AppState,
 };
 
 /// 创建路由
@@ -110,7 +106,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .with_state(state)
 }
 

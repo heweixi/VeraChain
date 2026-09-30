@@ -1,4 +1,10 @@
-use axum::{extract::Request, extract::State, http::StatusCode, middleware::Next, response::{IntoResponse, Response}};
+use axum::{
+    extract::Request,
+    extract::State,
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -20,14 +26,26 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(normal_limit: u32, auth_limit: u32, window: Duration) -> Self {
-        Self { windows: Mutex::new(HashMap::new()), window, normal_limit, auth_limit }
+        Self {
+            windows: Mutex::new(HashMap::new()),
+            window,
+            normal_limit,
+            auth_limit,
+        }
     }
 
     pub fn allow(&self, key: &str, is_auth: bool) -> bool {
-        let limit = if is_auth { self.auth_limit } else { self.normal_limit };
+        let limit = if is_auth {
+            self.auth_limit
+        } else {
+            self.normal_limit
+        };
         let now = Instant::now();
         let mut windows = self.windows.lock();
-        let entry = windows.entry(key.to_string()).or_insert(Window { started: now, count: 0 });
+        let entry = windows.entry(key.to_string()).or_insert(Window {
+            started: now,
+            count: 0,
+        });
         if now.duration_since(entry.started) >= self.window {
             entry.started = now;
             entry.count = 0;
@@ -66,7 +84,10 @@ pub async fn rate_limit_middleware(
         .unwrap_or("unknown")
         .trim();
     let is_auth = path.starts_with("/api/v1/auth/");
-    if !state.rate_limiter.allow(&format!("{}:{}", key, path), is_auth) {
+    if !state
+        .rate_limiter
+        .allow(&format!("{}:{}", key, path), is_auth)
+    {
         tracing::warn!("rate limit exceeded: key={} path={}", key, path);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
