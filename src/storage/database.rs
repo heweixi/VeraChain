@@ -267,22 +267,33 @@ impl Storage {
 
         let users: Vec<User> = rows
             .into_iter()
-            .filter_map(|(user_id, username, password_hash, email, role, public_key, created_at, last_login, is_active, metadata)| {
-                Some(User {
+            .map(|(user_id, username, password_hash, email, role, public_key, created_at, last_login, is_active, metadata)| {
+                let role = role.parse().map_err(|e| DataChainError::StorageError(format!("invalid user role: {}", e)))?;
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|e| DataChainError::StorageError(format!("invalid user created_at: {}", e)))?
+                    .with_timezone(&chrono::Utc);
+                let last_login = last_login
+                    .map(|t| chrono::DateTime::parse_from_rfc3339(&t)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| DataChainError::StorageError(format!("invalid user last_login: {}", e))))
+                    .transpose()?;
+                let metadata = serde_json::from_str(&metadata)
+                    .map_err(|e| DataChainError::StorageError(format!("invalid user metadata: {}", e)))?;
+                Ok(User {
                     id: 0,
                     user_id,
                     username,
                     password_hash,
                     email,
-                    role: role.parse().ok()?,
+                    role,
                     public_key,
-                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at).ok()?.with_timezone(&chrono::Utc),
-                    last_login: last_login.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok().map(|dt| dt.with_timezone(&chrono::Utc))),
+                    created_at,
+                    last_login,
                     is_active,
-                    metadata: serde_json::from_str(&metadata).unwrap_or_default(),
+                    metadata,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(users)
     }
@@ -322,11 +333,14 @@ impl Storage {
 
         let versions: Vec<Version> = rows
             .into_iter()
-            .filter_map(|(version_id, timestamp, file_path, content_hash, size, author, message, parent_version)| {
-                Some(Version {
+            .map(|(version_id, timestamp, file_path, content_hash, size, author, message, parent_version)| {
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                    .map_err(|e| DataChainError::StorageError(format!("invalid version timestamp: {}", e)))?
+                    .with_timezone(&chrono::Utc);
+                Ok(Version {
                     id: 0,
                     version_id,
-                    timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp).ok()?.with_timezone(&chrono::Utc),
+                    timestamp,
                     file_path,
                     content_hash,
                     size,
@@ -335,7 +349,7 @@ impl Storage {
                     parent_version,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(versions)
     }
