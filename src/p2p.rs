@@ -137,3 +137,35 @@ impl P2PService {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_peer_validates_url_and_hides_token() {
+        let service = P2PService::new();
+        let peer = service
+            .register_peer(PeerRegistration {
+                peer_id: "node-1".to_string(),
+                base_url: "http://127.0.0.1:8080/".to_string(),
+                auth_token: Some("secret".to_string()),
+            })
+            .unwrap();
+        assert_eq!(peer.base_url, "http://127.0.0.1:8080");
+        let json = serde_json::to_string(&peer).unwrap();
+        assert!(!json.contains("secret"));
+        assert_eq!(service.list_peers().len(), 1);
+    }
+
+    #[test]
+    fn register_peer_rejects_non_http_url() {
+        let service = P2PService::new();
+        let result = service.register_peer(PeerRegistration {
+            peer_id: "node-1".to_string(),
+            base_url: "file:///tmp/node".to_string(),
+            auth_token: None,
+        });
+        assert!(result.is_err());
+    }
+}

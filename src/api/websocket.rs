@@ -233,10 +233,10 @@ pub async fn aggregation_ws_handler(
 /// 处理 WebSocket 连接
 async fn handle_socket(socket: WebSocket, client_id: String, hub: Arc<WsHub>) {
     let (mut sender, mut receiver) = socket.split();
+    let mut events = hub.subscribe();
 
     tracing::info!("WebSocket 客户端连接: {}", client_id);
 
-    // 发送欢迎消息
     let welcome = WsMessage::new(
         MessageType::Pong,
         Some(serde_json::json!({
@@ -248,42 +248,55 @@ async fn handle_socket(socket: WebSocket, client_id: String, hub: Arc<WsHub>) {
         let _ = sender.send(Message::Text(json)).await;
     }
 
-    // 处理消息
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if text.len() > MAX_WS_MESSAGE_BYTES {
-                    tracing::warn!("WebSocket message too large: {} bytes", text.len());
-                    let error = WsMessage::new(
-                        MessageType::Error,
-                        Some(serde_json::json!({ "error": "message too large" })),
-                    );
-                    if let Ok(json) = serde_json::to_string(&error) {
-                        let _ = sender.send(Message::Text(json)).await;
-                    }
-                    break;
-                }
-                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                    match ws_msg.msg_type {
-                        MessageType::Ping => {
-                            let pong = WsMessage::new(MessageType::Pong, None);
-                            if let Ok(json) = serde_json::to_string(&pong) {
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_WS_MESSAGE_BYTES {
+                            tracing::warn!("WebSocket message too large: {} bytes", text.len());
+                            let error = WsMessage::new(
+                                MessageType::Error,
+                                Some(serde_json::json!({ "error": "message too large" })),
+                            );
+                            if let Ok(json) = serde_json::to_string(&error) {
                                 let _ = sender.send(Message::Text(json)).await;
                             }
+                            break;
                         }
-                        _ => {}
+                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                            if matches!(ws_msg.msg_type, MessageType::Ping) {
+                                let pong = WsMessage::new(MessageType::Pong, None);
+                                if let Ok(json) = serde_json::to_string(&pong) {
+                                    let _ = sender.send(Message::Text(json)).await;
+                                }
+                            }
+                        }
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = sender.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        tracing::error!("WebSocket 错误: {}", e);
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            Ok(Message::Ping(data)) => {
-                let _ = sender.send(Message::Pong(data)).await;
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!("WebSocket event receiver lagged by {} events", count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Ok(Message::Close(_)) => break,
-            Err(e) => {
-                tracing::error!("WebSocket 错误: {}", e);
-                break;
-            }
-            _ => {}
         }
     }
 
@@ -299,10 +312,10 @@ async fn handle_channel_socket(
     hub: Arc<WsHub>,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let mut events = hub.subscribe();
 
     tracing::info!("WebSocket 客户端连接到频道 {}: {}", channel, client_id);
 
-    // 发送订阅确认
     let subscribed = WsMessage::new(
         MessageType::Subscribe,
         Some(serde_json::json!({
@@ -314,24 +327,41 @@ async fn handle_channel_socket(
         let _ = sender.send(Message::Text(json)).await;
     }
 
-    // 处理消息
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if text.len() > MAX_WS_MESSAGE_BYTES {
-                    tracing::warn!("WebSocket channel message too large: {} bytes", text.len());
-                    break;
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > MAX_WS_MESSAGE_BYTES {
+                            tracing::warn!("WebSocket channel message too large: {} bytes", text.len());
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = sender.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        tracing::error!("WebSocket 错误: {}", e);
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            Ok(Message::Ping(data)) => {
-                let _ = sender.send(Message::Pong(data)).await;
+            event = events.recv() => {
+                match event {
+                    Ok(event) => {
+                        // 专用频道接收事件总线广播；事件可通过 payload/channel 再由客户端过滤。
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!("WebSocket channel receiver lagged by {} events", count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Ok(Message::Close(_)) => break,
-            Err(e) => {
-                tracing::error!("WebSocket 错误: {}", e);
-                break;
-            }
-            _ => {}
         }
     }
 
