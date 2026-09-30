@@ -1,6 +1,9 @@
 # DataChain Rust
 
-> 项目级实现状态与已知差异见仓库根 `PROJECT_STATUS_OVERVIEW.md`。
+> 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
+>
+> ⚠️ README 中“完整 REST、WebSocket、RBAC、递归汇总”等描述高于当前实现，
+> 具体限制以 `IMPLEMENTATION_STATUS.md` 为准。
 
 数据追溯区块链系统 - Rust 实现
 
