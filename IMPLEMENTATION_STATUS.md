@@ -1,6 +1,6 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-08-31。本文档是独立仓库的实现状态入口。
+> 核实日期:2026-08-31，代码进度更新至提交 `17e5e70`。本阶段源码已实现的内容尚未因 247 磁盘满而重新执行 cargo/Docker 运行验证；语言诊断和 diff 检查通过。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查；未在本次拆分操作中重新执行 cargo、Docker 或运行时 smoke test。
 
@@ -8,14 +8,15 @@
 
 DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、JWT 登录、区块/PoW/Merkle 核心、版本追踪、聚合策略、CLI 和 Docker 构建骨架。
 
-但 README 中“完整 REST、WebSocket、RBAC、递归汇总”等表述高于当前实现。当前已推进 P0-A 安全加固，代码提交为 `fe93939`；由于本机无 Rust 工具链且 247 磁盘已满，本阶段尚未完成编译/运行验证。当前仍有以下实质差异：
+但 README 中“完整 REST、WebSocket、RBAC、递归汇总”等表述高于当前实现。当前已完成 P0-A 安全代码接入、P0-B 数据可靠性基础、P1-A 事件/调度闭环基础、P1-B 版本化迁移基础、P1-C 版本快照安全基础，以及 P2 的最小认证 HTTP 区块同步；所有新代码仍待 Rust/Docker 验证。当前仍有以下实质差异：
 
-- ✅ P0-A（待验证）：公开注册已固定普通用户；认证中间件已接入账户状态、角色新鲜度和路由权限；JWT secret 支持环境变量并拒绝默认值；CORS 改为显式 allowlist；WebSocket 要求 JWT、限制连接数和消息大小。
-- P0：注册/挖矿/版本写库失败时部分 handler 仍返回成功；pending 元数据、聚合结果和事件没有完整持久化。
-- P1：WebSocket Hub/EventBus 已放入 AppState并具备连接管理，但业务 handler 尚未发布事件；Scheduler 已定义但 server 还没启动。
-- P1：没有 SQLx migrations；启动恢复不会完整验证链；没有区块同步/P2P。
-- P1：版本内容寻址存储没有接入 HTTP 主流程，文件路径存在越权读取风险。
-- P2：递归汇总目前只有单层 summary；API/数据库/调度/越权测试不足；Docker 和运行时行为需要重新验证。
+- ✅ P0-A 安全代码已接入：公开注册固定普通用户；认证中间件接入账户状态、角色新鲜度和路由权限；JWT secret 环境覆盖/默认拒绝；CORS allowlist；WebSocket JWT/连接数/消息大小保护。
+- ✅ P0-B 数据可靠性基础已接入：pending metadata/aggregation SQLite 持久化、写库错误传播、启动恢复和区块/Merkle 校验；区块保存与 pending 删除仍不是同一事务。
+- ✅ P1-A 运行闭环基础已接入：WsHub/EventBus/Scheduler 进入 AppState；业务 handler 发布事件；WebSocket 订阅广播；Scheduler 自动启动并异步持久化聚合。
+- ✅ P1-B 已有版本化 SQL migration 和坏记录显式报错；旧 init_tables 仍保留幂等建表兼容逻辑，尚未完全重构为纯 migration 驱动。
+- ✅ P1-C 已接入内容快照、基于快照 diff 和版本路径 allowlist/大小/符号链接校验。
+- ⚠️ P2 区块同步已实现最小认证 HTTP 方案(显式注册 peer、拉取/导入、逐块校验)，但没有自动发现、广播网络、共识/分叉选择。
+- P2：API/数据库/调度/越权测试不足；Cargo.lock 尚未生成 reqwest 新依赖的最终锁定变更；Docker 和运行时行为需要重新验证。
 
 ## 二、需求/设计与实现对照
 
@@ -29,8 +30,8 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿写库失败仍返回成功，链恢复/验证完整性不足 |
 | Merkle proof | 🔺 | `get_proof` 只返回命中区块、root 等信息，不返回 sibling/path，也没有真正调用 Merkle proof 验证流程；不能视为完整 Merkle proof |
 | 版本 API | ⚠️ | 元数据写入 SQLite，但文件内容快照未接入主流程；历史文件被覆盖或删除后不能可靠还原 |
-| WebSocket 实时事件 | ⚠️ | `AppState` 现在持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务 handler 仍未发布事件，当前主要是连接确认、Ping/Pong 和占位频道 |
-| EventBus/通知 | 🧩 | `src/api/notification.rs` 已定义 EventBus/NotificationService，但创建元数据、挖矿、聚合、版本追踪没有调用它 |
+| WebSocket 实时事件 | ⚠️代码已接线/待验证 | `AppState` 持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务事件现在可经 EventBus 广播，但频道过滤和运行时 smoke test仍待验证 |
+| EventBus/通知 | ✅代码已接线/待验证 | `src/api/notification.rs` 已由 server 创建并注入；注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件 |
 
 ### 2.2 认证、授权与安全
 
@@ -54,7 +55,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ⏳ | pending metadata 只在内存；进入 pending 后进程退出、尚未挖矿时数据会丢失 |
 | attestation/identity/key transactions | 🧩 | Block 字段存在，但签名验证、身份注册、密钥轮换、交易处理和持久化业务流程未接入 |
-| P2P/节点同步/冲突解决 | ⏳ | 未发现 peer、发现、连接、广播、同步协议或共识同步模块；WebSocket 不等同于 P2P 区块同步 |
+| P2P/节点同步/冲突解决 | ⚠️基础同步已实现/仍不完整 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks` 提供显式 peer 注册、拉取/导入和逐块校验；没有自动发现、广播网络、共识或分叉选择 |
 
 ### 2.4 存储、迁移与恢复
 
@@ -62,11 +63,11 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 |---|---|---|
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
 | 独立 metadata/aggregation/events 表 | ⏳ | 当前没有对应表；相关数据主要留在内存或 block JSON 中 |
-| SQLx 版本迁移 | ⏳ | 没有 `migrations/`、schema version 表、`sqlx::migrate!`、回滚或数据回填机制 |
-| 数据损坏处理 | ⚠️ | JSON 反序列化失败的记录会被 `filter_map` 静默丢弃，查询错误也有统一误映射为“未找到”的情况 |
+| SQLx 版本迁移 | ⚠️基础已实现/待验证 | `migrations/001_base.sql`、`002_pending_aggregations.sql` + `schema_migrations` 已接入；旧 `IF NOT EXISTS` 初始化仍保留为兼容兜底，尚无回滚/数据回填迁移 |
+| 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
 | 聚合持久化 | ⏳ | `AggregationEngine` 的 summaries 只在 `RwLock<Vec<_>>`，重启后列表和计数丢失 |
-| Scheduler 运行 | 🧩 | `src/aggregation/scheduler.rs` 已定义，但 `src/cli/server.rs` 没有创建/启动 Scheduler |
-| 配置环境变量 | ⏳ | 应用配置主要来自 TOML；JWT、数据库、聚合参数没有统一 env 覆盖和启动校验 |
+| Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
+| 配置环境变量 | ✅基础已实现/待验证 | JWT、数据库 DSN、host、port 支持环境变量覆盖；默认 JWT secret/短 secret 启动拒绝；聚合等配置仍主要来自 TOML |
 
 ### 2.5 聚合与版本控制
 

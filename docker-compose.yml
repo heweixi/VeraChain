@@ -13,6 +13,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - RUST_LOG=info
+      # 生产环境必须注入至少32字符的随机 JWT secret；compose 未配置时直接拒绝启动
+      - DATACHAIN_JWT_SECRET=${DATACHAIN_JWT_SECRET:?set DATACHAIN_JWT_SECRET in .env}
+      - DATACHAIN_CORS_ORIGINS=${DATACHAIN_CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
       interval: 30s
