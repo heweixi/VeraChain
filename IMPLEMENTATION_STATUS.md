@@ -8,11 +8,11 @@
 
 DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、JWT 登录、区块/PoW/Merkle 核心、版本追踪、聚合策略、CLI 和 Docker 构建骨架。
 
-但 README 中“完整 REST、WebSocket、RBAC、递归汇总”等表述高于当前实现。当前仍有以下实质差异：
+但 README 中“完整 REST、WebSocket、RBAC、递归汇总”等表述高于当前实现。当前已推进 P0-A 安全加固，代码提交为 `fe93939`；由于本机无 Rust 工具链且 247 磁盘已满，本阶段尚未完成编译/运行验证。当前仍有以下实质差异：
 
-- P0：公开注册可自行指定 `admin`；RBAC 权限表没有真正接入 API 路由；默认 JWT secret 不会阻止生产启动。
+- ✅ P0-A（待验证）：公开注册已固定普通用户；认证中间件已接入账户状态、角色新鲜度和路由权限；JWT secret 支持环境变量并拒绝默认值；CORS 改为显式 allowlist；WebSocket 要求 JWT、限制连接数和消息大小。
 - P0：注册/挖矿/版本写库失败时部分 handler 仍返回成功；pending 元数据、聚合结果和事件没有完整持久化。
-- P1：WebSocket Hub/EventBus 已定义但没有接入 AppState 和业务 handler；Scheduler 已定义但 server 没启动。
+- P1：WebSocket Hub/EventBus 已放入 AppState并具备连接管理，但业务 handler 尚未发布事件；Scheduler 已定义但 server 还没启动。
 - P1：没有 SQLx migrations；启动恢复不会完整验证链；没有区块同步/P2P。
 - P1：版本内容寻址存储没有接入 HTTP 主流程，文件路径存在越权读取风险。
 - P2：递归汇总目前只有单层 summary；API/数据库/调度/越权测试不足；Docker 和运行时行为需要重新验证。
@@ -29,21 +29,21 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿写库失败仍返回成功，链恢复/验证完整性不足 |
 | Merkle proof | 🔺 | `get_proof` 只返回命中区块、root 等信息，不返回 sibling/path，也没有真正调用 Merkle proof 验证流程；不能视为完整 Merkle proof |
 | 版本 API | ⚠️ | 元数据写入 SQLite，但文件内容快照未接入主流程；历史文件被覆盖或删除后不能可靠还原 |
-| WebSocket 实时事件 | 🧩/⚠️ | `src/api/websocket.rs` 定义了 `WsHub` 和频道处理，但 `AppState` 没有 Hub，业务 handler 也未发布事件；当前主要是连接确认、Ping/Pong 和占位频道 |
+| WebSocket 实时事件 | ⚠️ | `AppState` 现在持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务 handler 仍未发布事件，当前主要是连接确认、Ping/Pong 和占位频道 |
 | EventBus/通知 | 🧩 | `src/api/notification.rs` 已定义 EventBus/NotificationService，但创建元数据、挖矿、聚合、版本追踪没有调用它 |
 
 ### 2.2 认证、授权与安全
 
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
-| JWT access/refresh | ⚠️ | `src/auth/jwt.rs` 可生成/验证；缺 issuer/audience 强校验、撤销、轮换和账户实时状态检查 |
+| JWT access/refresh | ⚠️ | `src/auth/jwt.rs` 可生成/验证；缺 issuer/audience 强校验、撤销、轮换和设备会话管理；secret 安全前置已在 `fe93939` 接入，待编译验证 |
 | 用户持久化 | ⚠️ | 启动可从 SQLite 加载；运行中注册写库失败仍成功返回，运行中资料/密码管理 API 未完整提供 |
-| 公开注册 | 🔺 | `RegisterRequest.role` 可由客户端指定，公开注册可注册 `admin`；应强制普通用户或仅管理员可分配高权限角色 |
-| RBAC | 🔺 | `src/auth/permissions.rs` 定义了权限矩阵，但路由只做“有 JWT 即可”；挖矿 handler 的角色判断还允许普通 `user`，与权限表的 `BlockMine` 定义冲突 |
+| 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
+| RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
-| 默认 JWT secret | 🔺 | `config.rs`、`config.toml`、`config/config.toml` 含可预测占位 secret，启动不拒绝默认值，也没有环境变量/secret-file 覆盖 |
-| CORS/TLS/限流 | ⏳ | CORS 当前 `allow_origin(Any)` 等全开放；没有 TLS 强制、请求体限制、登录限速/锁定、审计日志 |
-| WebSocket 认证 | ⏳ | WebSocket 路由未经过 JWT middleware，连接和频道没有认证/授权 |
+| 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
+| CORS/TLS/限流 | ⚠️ | CORS 已改为 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时本地开发来源）；TLS、请求体限制、登录限速/锁定、审计日志仍未实现 |
+| WebSocket 认证 | ✅基础代码已接入/待验证 | WebSocket 路由现在经过 JWT 认证；Hub 限制 256 连接、单条文本 16 KiB；事件授权/广播接线仍待 P1 |
 
 ### 2.3 区块链核心与数据完整性
 
