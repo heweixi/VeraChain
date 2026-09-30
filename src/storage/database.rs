@@ -1,8 +1,9 @@
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
 use std::sync::Arc;
 
+use crate::aggregation::AggregationSummary;
 use crate::auth::User;
-use crate::core::Block;
+use crate::core::{Block, MetadataEntry};
 use crate::error::{DataChainError, Result};
 use crate::versioning::Version;
 
@@ -89,6 +90,31 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
+        // pending 和 aggregation 使用完整 JSON 保存领域对象，避免改变现有公开模型。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_metadata (
+                data_id TEXT PRIMARY KEY NOT NULL,
+                data TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS aggregations (
+                summary_id TEXT PRIMARY KEY NOT NULL,
+                created_at DATETIME NOT NULL,
+                data TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // 创建索引
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
             .execute(&self.pool)
@@ -100,6 +126,9 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_versions_file_path ON versions(file_path)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_aggregations_created_at ON aggregations(created_at)")
             .execute(&self.pool)
             .await?;
 
@@ -150,12 +179,9 @@ impl Storage {
                 .fetch_all(&self.pool)
                 .await?;
 
-        let blocks: Vec<Block> = rows
-            .into_iter()
-            .filter_map(|(data,)| serde_json::from_str(&data).ok())
-            .collect();
-
-        Ok(blocks)
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
     }
 
     /// 获取区块数量
@@ -278,6 +304,76 @@ impl Storage {
         Ok(versions)
     }
 
+    /// 保存待打包元数据。
+    pub async fn save_pending_metadata(&self, entry: &MetadataEntry) -> Result<()> {
+        let data = serde_json::to_string(entry)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO pending_metadata (data_id, data) VALUES (?, ?)",
+        )
+        .bind(&entry.data_id)
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 获取所有待打包元数据。
+    pub async fn get_pending_metadata(&self) -> Result<Vec<MetadataEntry>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM pending_metadata ORDER BY created_at ASC, data_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
+    /// 删除已写入区块的待打包元数据。
+    pub async fn delete_pending_metadata(&self, data_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_metadata WHERE data_id = ?")
+            .bind(data_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 保存聚合结果。
+    pub async fn save_aggregation(&self, summary: &AggregationSummary) -> Result<()> {
+        let data = serde_json::to_string(summary)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO aggregations (summary_id, created_at, data) VALUES (?, ?, ?)",
+        )
+        .bind(&summary.summary_id)
+        .bind(summary.created_at.to_rfc3339())
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 获取单个聚合结果。
+    pub async fn get_aggregation(&self, summary_id: &str) -> Result<AggregationSummary> {
+        let row: (String,) = sqlx::query_as("SELECT data FROM aggregations WHERE summary_id = ?")
+            .bind(summary_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| DataChainError::AggregationFailed(format!("aggregation not found: {}", summary_id)))?;
+        Ok(serde_json::from_str(&row.0)?)
+    }
+
+    /// 获取全部聚合结果，按创建时间恢复历史顺序。
+    pub async fn get_all_aggregations(&self) -> Result<Vec<AggregationSummary>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM aggregations ORDER BY created_at ASC, summary_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
     /// 关闭存储
     pub async fn close(&self) {
         self.pool.close().await;
@@ -288,4 +384,57 @@ impl Storage {
 pub async fn create_storage(dsn: &str) -> Result<Arc<Storage>> {
     let storage = Storage::new(dsn).await?;
     Ok(Arc::new(storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn pending_metadata_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let entry = MetadataEntry {
+            data_id: "pending-1".to_string(),
+            data_size: 10,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            owner: "tester".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        };
+
+        storage.save_pending_metadata(&entry).await.unwrap();
+        assert_eq!(storage.get_pending_metadata().await.unwrap().len(), 1);
+        storage.delete_pending_metadata(&entry.data_id).await.unwrap();
+        assert!(storage.get_pending_metadata().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregation_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let summary = AggregationSummary {
+            summary_id: "summary-1".to_string(),
+            summary_type: "manual".to_string(),
+            level: 1,
+            created_at: Utc::now(),
+            time_range: None,
+            block_range: Some((0, 1)),
+            statistics: std::collections::HashMap::new(),
+            merkle_root: "root".to_string(),
+            metadata_count: 1,
+            parent_summaries: Vec::new(),
+        };
+
+        storage.save_aggregation(&summary).await.unwrap();
+        assert_eq!(storage.get_aggregation("summary-1").await.unwrap().summary_id, "summary-1");
+        assert_eq!(storage.get_all_aggregations().await.unwrap().len(), 1);
+    }
 }

@@ -195,6 +195,21 @@ impl VersionTracker {
             .push(version);
     }
 
+    /// 回滚尚未成功写入存储的新版本。
+    pub fn remove_version(&self, version_id: &str) -> bool {
+        let mut versions = self.versions.write();
+        let mut removed = false;
+        for file_versions in versions.values_mut() {
+            if let Some(pos) = file_versions.iter().position(|version| version.version_id == version_id) {
+                file_versions.remove(pos);
+                removed = true;
+                break;
+            }
+        }
+        versions.retain(|_, file_versions| !file_versions.is_empty());
+        removed
+    }
+
     /// 获取统计信息
     pub fn get_statistics(&self) -> VersionStatistics {
         let versions = self.versions.read();

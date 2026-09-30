@@ -25,6 +25,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     // 从存储加载区块
     let blocks = storage.get_all_blocks().await?;
     if !blocks.is_empty() {
+        chain.validate_loaded_blocks(&blocks)?;
         chain.load_blocks(blocks);
         info!("已加载 {} 个区块", chain.get_block_count());
     } else {
@@ -33,6 +34,25 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         storage.save_block(&genesis).await?;
         info!("已创建创世区块");
     }
+
+    // 恢复尚未打包的元数据；它们不会出现在 blocks 快照中。
+    // 若上次进程在 save_block 成功后删除 pending 失败，启动时丢弃已提交的重复行。
+    let pending = storage.get_pending_metadata().await?;
+    let committed_data_ids: std::collections::HashSet<String> = chain
+        .get_all_blocks()
+        .iter()
+        .flat_map(|block| block.metadata_list.iter().map(|entry| entry.data_id.clone()))
+        .collect();
+    let mut pending_to_load = Vec::new();
+    for entry in pending {
+        if committed_data_ids.contains(&entry.data_id) {
+            storage.delete_pending_metadata(&entry.data_id).await?;
+        } else {
+            pending_to_load.push(entry);
+        }
+    }
+    chain.load_pending(pending_to_load);
+    info!("已加载 {} 条待打包元数据", chain.get_pending_count());
 
     // 创建服务
     let auth_service = create_auth_service(config.jwt.secret.clone(), config.jwt.expire_hours);
@@ -54,6 +74,12 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     let versions = storage.get_all_versions().await?;
     for version in versions {
         version_tracker.load_version(version);
+    }
+
+    // 加载历史聚合结果，恢复查询结果和聚合计数。
+    let aggregations = storage.get_all_aggregations().await?;
+    for summary in aggregations {
+        aggregation_engine.load_aggregation(summary);
     }
 
     // 创建应用状态

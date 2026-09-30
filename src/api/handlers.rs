@@ -75,9 +75,11 @@ pub async fn register(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.auth_service.register(&req) {
         Ok(user) => {
-            // 保存到存储
+            // 保存到存储；内存状态不能在持久化失败时对外宣称成功。
             if let Err(e) = state.storage.save_user(&user).await {
+                state.auth_service.remove_user(&user.user_id);
                 tracing::error!("保存用户失败: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
             Ok((StatusCode::CREATED, Json(ApiResponse::success(user.to_public()))))
         }
@@ -128,7 +130,14 @@ pub async fn create_metadata(
     Json(req): Json<CreateMetadataRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.metadata_manager.create(&req, &claims.username) {
-        Ok(entry) => Ok((StatusCode::CREATED, Json(ApiResponse::success(entry)))),
+        Ok(entry) => {
+            if let Err(e) = state.storage.save_pending_metadata(&entry).await {
+                state.chain.remove_pending_metadata(&entry.data_id);
+                tracing::error!("保存待打包元数据失败: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+            }
+            Ok((StatusCode::CREATED, Json(ApiResponse::success(entry))))
+        }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string())))),
     }
 }
@@ -218,9 +227,19 @@ pub async fn mine_block(
 
     match state.chain.mine_block() {
         Ok(block) => {
-            // 保存到存储
+            // 先持久化区块；失败时恢复内存中的区块和 pending 队列。
             if let Err(e) = state.storage.save_block(&block).await {
+                state.chain.rollback_mined_block(&block);
                 tracing::error!("保存区块失败: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+            }
+
+            // 区块落库后再删除对应 pending。两者不是同一 SQLite 事务，删除失败必须显式返回错误。
+            for entry in &block.metadata_list {
+                if let Err(e) = state.storage.delete_pending_metadata(&entry.data_id).await {
+                    tracing::error!("删除已打包元数据失败: {}", e);
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                }
             }
             Ok((StatusCode::CREATED, Json(ApiResponse::success(block))))
         }
@@ -279,11 +298,20 @@ pub async fn track_version(
     Extension(claims): Extension<Claims>,
     Json(req): Json<TrackVersionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let previous_version_id = state
+        .version_tracker
+        .get_latest_version(&req.file_path)
+        .map(|version| version.version_id);
     match state.version_tracker.track_file(&req.file_path, &claims.username, &req.message) {
         Ok(version) => {
-            // 保存到存储
+            // 同内容会返回既有版本，不应在持久化失败时移除它。
+            let is_new_version = previous_version_id.as_deref() != Some(version.version_id.as_str());
             if let Err(e) = state.storage.save_version(&version).await {
+                if is_new_version {
+                    state.version_tracker.remove_version(&version.version_id);
+                }
                 tracing::error!("保存版本失败: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
             Ok((StatusCode::CREATED, Json(ApiResponse::success(version))))
         }
@@ -344,7 +372,14 @@ pub async fn trigger_aggregation(
     };
 
     match state.aggregation_engine.aggregate(strategy) {
-        Some(summary) => Ok((StatusCode::CREATED, Json(ApiResponse::success(summary)))),
+        Some(summary) => {
+            if let Err(e) = state.storage.save_aggregation(&summary).await {
+                state.aggregation_engine.remove_aggregation(&summary.summary_id);
+                tracing::error!("保存聚合结果失败: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+            }
+            Ok((StatusCode::CREATED, Json(ApiResponse::success(summary))))
+        }
         None => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("aggregation failed or no data")))),
     }
 }

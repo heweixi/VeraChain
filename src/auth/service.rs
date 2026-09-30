@@ -201,6 +201,20 @@ impl AuthService {
         users.insert(user.user_id.clone(), user);
     }
 
+    /// 回滚尚未成功写入存储的用户。
+    pub fn remove_user(&self, user_id: &str) -> bool {
+        let mut users = self.users.write();
+        let mut username_index = self.username_index.write();
+        let mut email_index = self.email_index.write();
+        if let Some(user) = users.remove(user_id) {
+            username_index.remove(&user.username);
+            email_index.remove(&user.email);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 停用用户
     pub fn deactivate_user(&self, user_id: &str) -> Result<()> {
         let mut users = self.users.write();

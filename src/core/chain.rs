@@ -93,6 +93,45 @@ impl Chain {
         self.pending.read().len()
     }
 
+    /// 从持久化存储恢复待打包元数据。
+    pub fn load_pending(&self, entries: Vec<MetadataEntry>) {
+        let mut pending = self.pending.write();
+        *pending = entries;
+    }
+
+    /// 删除指定的待打包元数据。
+    pub fn remove_pending_metadata(&self, data_id: &str) -> bool {
+        let mut pending = self.pending.write();
+        if let Some(pos) = pending.iter().position(|entry| entry.data_id == data_id) {
+            pending.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 回滚尚未完成持久化的挖矿结果。
+    ///
+    /// 挖矿和 SQLite 写入不是同一事务；调用方必须只在 save_block 失败时调用此方法。
+    pub fn rollback_mined_block(&self, block: &Block) -> bool {
+        let mut blocks = self.blocks.write();
+        let is_latest = blocks
+            .last()
+            .map(|latest| latest.index == block.index && latest.hash == block.hash)
+            .unwrap_or(false);
+        if !is_latest {
+            return false;
+        }
+        blocks.pop();
+        drop(blocks);
+
+        let mut pending = self.pending.write();
+        let mut restored = block.metadata_list.clone();
+        restored.append(&mut *pending);
+        *pending = restored;
+        true
+    }
+
     /// 挖掘新区块
     pub fn mine_block(&self) -> Result<Block> {
         let blocks = self.blocks.read();
@@ -197,7 +236,48 @@ impl Chain {
         }
     }
 
-    /// 加载区块（从存储恢复）
+    /// 验证待加载区块，不通过时不替换当前内存链。
+    pub fn validate_loaded_blocks(&self, blocks: &[Block]) -> Result<()> {
+        if blocks.is_empty() {
+            return Err(DataChainError::InvalidChain);
+        }
+
+        let genesis = &blocks[0];
+        if genesis.index != 0 || genesis.previous_hash != "0" {
+            return Err(DataChainError::InvalidBlock("invalid genesis block".to_string()));
+        }
+
+        for (position, block) in blocks.iter().enumerate() {
+            if block.index != position as i64 {
+                return Err(DataChainError::InvalidBlock(format!(
+                    "invalid block index at position {}",
+                    position
+                )));
+            }
+            if block.hash != block.calculate_hash() || !block.is_valid() {
+                return Err(DataChainError::InvalidBlock(format!(
+                    "invalid block hash or proof of work at index {}",
+                    block.index
+                )));
+            }
+            if block.merkle_root != block.calculate_merkle_root() {
+                return Err(DataChainError::InvalidBlock(format!(
+                    "invalid merkle root at index {}",
+                    block.index
+                )));
+            }
+            if position > 0 && block.previous_hash != blocks[position - 1].hash {
+                return Err(DataChainError::InvalidBlock(format!(
+                    "invalid previous hash at index {}",
+                    block.index
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 加载区块（从存储恢复）。调用方应先调用 validate_loaded_blocks。
     pub fn load_blocks(&self, blocks: Vec<Block>) {
         let mut chain_blocks = self.blocks.write();
         *chain_blocks = blocks;
@@ -244,5 +324,23 @@ mod tests {
         let chain = Chain::new(2, 100);
         chain.init();
         assert!(chain.validate_chain());
+    }
+
+    #[test]
+    fn test_loaded_blocks_validate_merkle_payload() {
+        let chain = Chain::new(1, 100);
+        let mut genesis = chain.init();
+        genesis.metadata_list.push(MetadataEntry {
+            data_id: "tampered".to_string(),
+            data_size: 1,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            owner: "tester".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        });
+        assert!(chain.validate_loaded_blocks(&[genesis]).is_err());
     }
 }

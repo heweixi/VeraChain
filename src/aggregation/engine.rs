@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +123,46 @@ impl AggregationEngine {
         Some(summary)
     }
 
+    /// 加载持久化的聚合结果。
+    pub fn load_aggregation(&self, summary: AggregationSummary) {
+        let latest = {
+            let mut aggregations = self.aggregations.write();
+            if aggregations.iter().any(|item| item.summary_id == summary.summary_id) {
+                return;
+            }
+            aggregations.push(summary);
+            aggregations.iter().max_by_key(|item| item.created_at).cloned()
+        };
+
+        if let Some(latest) = latest {
+            *self.last_aggregation.write() = latest.created_at;
+            *self.aggregated_count.write() = latest.metadata_count;
+        }
+    }
+
+    /// 移除尚未成功持久化的聚合结果。
+    pub fn remove_aggregation(&self, summary_id: &str) -> bool {
+        let (removed, latest) = {
+            let mut aggregations = self.aggregations.write();
+            let before = aggregations.len();
+            aggregations.retain(|item| item.summary_id != summary_id);
+            let removed = aggregations.len() != before;
+            let latest = aggregations.iter().max_by_key(|item| item.created_at).cloned();
+            (removed, latest)
+        };
+
+        if removed {
+            if let Some(latest) = latest {
+                *self.last_aggregation.write() = latest.created_at;
+                *self.aggregated_count.write() = latest.metadata_count;
+            } else {
+                *self.last_aggregation.write() = Utc::now();
+                *self.aggregated_count.write() = 0;
+            }
+        }
+        removed
+    }
+
     /// 计算统计信息
     fn compute_statistics(&self, metadata_list: &[MetadataEntry]) -> HashMap<String, serde_json::Value> {
         let mut stats = HashMap::new();
@@ -214,7 +254,7 @@ impl AggregationEngine {
 }
 
 /// 汇总摘要
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregationSummary {
     pub summary_id: String,
     pub summary_type: String,

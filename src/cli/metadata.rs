@@ -94,6 +94,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
             }
 
             let entry = manager.create(&req, &owner)?;
+            storage.save_pending_metadata(&entry).await?;
             println!("✓ 元数据已添加");
             println!("  数据 ID: {}", entry.data_id);
             println!("  大小: {} bytes", entry.data_size);

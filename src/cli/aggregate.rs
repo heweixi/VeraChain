@@ -37,6 +37,9 @@ pub async fn run_aggregate(config: &AppConfig, action: AggregateAction) -> anyho
         config.aggregation.time_interval_secs,
         config.aggregation.count_threshold,
     );
+    for summary in storage.get_all_aggregations().await? {
+        engine.load_aggregation(summary);
+    }
 
     match action {
         AggregateAction::Trigger { strategy } => {
@@ -44,6 +47,7 @@ pub async fn run_aggregate(config: &AppConfig, action: AggregateAction) -> anyho
 
             match engine.aggregate(strategy_type) {
                 Some(summary) => {
+                    storage.save_aggregation(&summary).await?;
                     println!("✓ 汇总完成");
                     println!("  汇总 ID: {}", summary.summary_id);
                     println!("  类型: {}", summary.summary_type);
