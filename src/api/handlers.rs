@@ -570,6 +570,7 @@ pub async fn export_blocks(
     State(state): State<AppState>,
     Query(query): Query<SyncQuery>,
 ) -> Result<Json<SyncBlocksResponse>, (StatusCode, Json<ApiResponse<()>>)> {
+    let start = query.start.max(0) as usize;
     let total = state.chain.get_block_count();
     if start > total {
         return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("sync start is beyond local chain"))));

@@ -85,7 +85,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     }
 
     // 创建 WebSocket Hub、通知服务和事件总线
-    let ws_hub = api::websocket::WsHub::new();
+    let ws_hub = api::WsHub::new();
     let notification = Arc::new(NotificationService::new(ws_hub.clone()));
     let event_bus = Arc::new(EventBus::new(notification));
 
