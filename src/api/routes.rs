@@ -5,9 +5,16 @@ use axum::{
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use super::{handlers, middleware::auth_middleware, websocket, AppState};
+use super::{
+    handlers,
+    middleware::auth_middleware,
+    rate_limit::rate_limit_middleware,
+    websocket,
+    AppState,
+};
 
 /// 创建路由
 pub fn create_router(state: AppState) -> Router {
@@ -102,17 +109,32 @@ pub fn create_router(state: AppState) -> Router {
         .merge(protected_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .with_state(state)
 }
 
 /// 运行服务器
-pub async fn run_server(state: AppState, addr: &str) -> anyhow::Result<()> {
+pub async fn run_server(
+    state: AppState,
+    addr: &str,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+) -> anyhow::Result<()> {
     let app = create_router(state);
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("服务器启动于 http://{}", addr);
-
-    axum::serve(listener, app).await?;
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+        tracing::info!("服务器启动于 HTTPS://{}", addr);
+        axum_server::bind_rustls(socket_addr, tls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+        tracing::info!("服务器启动于 HTTP://{}", addr);
+        axum::serve(listener, app).await?;
+    }
 
     Ok(())
 }

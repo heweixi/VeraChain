@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{notification::EventBus, websocket::WsHub};
+use super::{notification::EventBus, rate_limit::RateLimiter, websocket::WsHub};
 use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
 use crate::core::Chain;
@@ -22,6 +22,7 @@ pub struct AppState {
     pub event_bus: Arc<EventBus>,
     pub scheduler: Arc<Scheduler>,
     pub p2p: Arc<P2PService>,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -37,6 +38,7 @@ impl AppState {
         event_bus: Arc<EventBus>,
         scheduler: Arc<Scheduler>,
         p2p: Arc<P2PService>,
+        rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             chain,
@@ -49,6 +51,7 @@ impl AppState {
             event_bus,
             scheduler,
             p2p,
+            rate_limiter,
         }
     }
 }

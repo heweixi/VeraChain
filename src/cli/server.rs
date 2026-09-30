@@ -118,6 +118,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     scheduler.start();
 
     let p2p = crate::p2p::P2PService::new();
+    let rate_limiter = api::RateLimiter::default();
     let _p2p_sync_task = p2p.clone().start_sync_loop(chain.clone());
 
     // 创建应用状态
@@ -132,6 +133,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         event_bus,
         scheduler,
         p2p,
+        rate_limiter,
     };
 
     // 启动服务
@@ -139,7 +141,13 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("DataChain 服务启动于 http://{}", addr);
     info!("WebSocket 端点: ws://{}/ws", addr);
 
-    api::run_server(app_state, &addr).await?;
+    api::run_server(
+        app_state,
+        &addr,
+        config.server.tls_cert.clone(),
+        config.server.tls_key.clone(),
+    )
+    .await?;
 
     Ok(())
 }

@@ -1,6 +1,9 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::Role;
 use crate::error::{DataChainError, Result};
@@ -14,6 +17,7 @@ pub struct Claims {
     pub exp: i64,    // 过期时间
     pub iat: i64,    // 签发时间
     pub iss: String, // 签发者
+    pub aud: String, // 受众
 }
 
 impl Claims {
@@ -28,8 +32,11 @@ impl Claims {
 pub struct RefreshClaims {
     pub sub: String, // user_id
     pub token_type: String,
+    pub jti: String,
     pub exp: i64,
     pub iat: i64,
+    pub iss: String,
+    pub aud: String,
 }
 
 /// JWT 处理器
@@ -37,6 +44,7 @@ pub struct JwtHandler {
     secret: String,
     access_expire_hours: u64,
     refresh_expire_days: u64,
+    revoked_refresh: Arc<RwLock<HashSet<String>>>,
 }
 
 impl JwtHandler {
@@ -46,7 +54,15 @@ impl JwtHandler {
             secret,
             access_expire_hours,
             refresh_expire_days: 7,
+            revoked_refresh: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    fn validation(&self) -> Validation {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&["datachain"]);
+        validation.set_audience(&["datachain-api"]);
+        validation
     }
 
     /// 生成访问令牌
@@ -66,6 +82,7 @@ impl JwtHandler {
             exp: exp.timestamp(),
             iat: now.timestamp(),
             iss: "datachain".to_string(),
+            aud: "datachain-api".to_string(),
         };
 
         encode(
@@ -84,8 +101,11 @@ impl JwtHandler {
         let claims = RefreshClaims {
             sub: user_id.to_string(),
             token_type: "refresh".to_string(),
+            jti: uuid::Uuid::new_v4().to_string(),
             exp: exp.timestamp(),
             iat: now.timestamp(),
+            iss: "datachain".to_string(),
+            aud: "datachain-api".to_string(),
         };
 
         encode(
@@ -101,7 +121,7 @@ impl JwtHandler {
         let token_data = decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.secret.as_bytes()),
-            &Validation::default(),
+            &self.validation(),
         )
         .map_err(|e| match e.kind() {
             jsonwebtoken::errors::ErrorKind::ExpiredSignature => DataChainError::TokenExpired,
@@ -116,18 +136,32 @@ impl JwtHandler {
         let token_data = decode::<RefreshClaims>(
             token,
             &DecodingKey::from_secret(self.secret.as_bytes()),
-            &Validation::default(),
+            &self.validation(),
         )
         .map_err(|e| match e.kind() {
             jsonwebtoken::errors::ErrorKind::ExpiredSignature => DataChainError::TokenExpired,
             _ => DataChainError::InvalidToken,
         })?;
 
-        if token_data.claims.token_type != "refresh" {
+        if token_data.claims.token_type != "refresh"
+            || self.revoked_refresh.read().contains(&token_data.claims.jti)
+        {
             return Err(DataChainError::InvalidToken);
         }
 
         Ok(token_data.claims.sub)
+    }
+
+    /// 撤销已使用的刷新令牌，防止 refresh token 重放。
+    pub fn revoke_refresh_token(&self, token: &str) -> Result<()> {
+        let token_data = decode::<RefreshClaims>(
+            token,
+            &DecodingKey::from_secret(self.secret.as_bytes()),
+            &self.validation(),
+        )
+        .map_err(|_| DataChainError::InvalidToken)?;
+        self.revoked_refresh.write().insert(token_data.claims.jti);
+        Ok(())
     }
 
     /// 生成令牌对

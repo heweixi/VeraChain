@@ -17,6 +17,10 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_host")]
     pub host: String,
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +102,8 @@ impl Default for AppConfig {
             server: ServerConfig {
                 port: default_port(),
                 host: default_host(),
+                tls_cert: None,
+                tls_key: None,
             },
             blockchain: BlockchainConfig {
                 difficulty: default_difficulty(),
@@ -153,6 +159,12 @@ impl AppConfig {
             if let Ok(port) = port.parse() {
                 self.server.port = port;
             }
+        }
+        if let Ok(cert) = std::env::var("DATACHAIN_TLS_CERT") {
+            self.server.tls_cert = Some(cert);
+        }
+        if let Ok(key) = std::env::var("DATACHAIN_TLS_KEY") {
+            self.server.tls_key = Some(key);
         }
     }
 

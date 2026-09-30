@@ -127,6 +127,7 @@ impl AuthService {
     /// 刷新令牌
     pub fn refresh_token(&self, refresh_token: &str) -> Result<LoginResponse> {
         let user_id = self.jwt_handler.verify_refresh_token(refresh_token)?;
+        self.jwt_handler.revoke_refresh_token(refresh_token)?;
 
         let user = {
             let users = self.users.read();
