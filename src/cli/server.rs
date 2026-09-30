@@ -118,7 +118,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     scheduler.start();
 
     let p2p = crate::p2p::P2PService::new();
-    let rate_limiter = api::RateLimiter::default();
+    let rate_limiter = Arc::new(api::RateLimiter::default());
     let _p2p_sync_task = p2p.clone().start_sync_loop(chain.clone());
 
     // 创建应用状态
