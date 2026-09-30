@@ -67,6 +67,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/aggregations/trigger", post(handlers::trigger_aggregation))
         // 统计
         .route("/api/v1/stats", get(handlers::get_stats))
+        .route("/api/v1/peers", get(handlers::list_peers))
+        .route("/api/v1/peers/register", post(handlers::register_peer))
+        .route("/api/v1/peers/:peer_id/sync", post(handlers::sync_peer))
+        .route("/api/v1/sync/blocks", get(handlers::export_blocks))
+        .route("/api/v1/sync/blocks", post(handlers::import_blocks))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // 合并路由

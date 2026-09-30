@@ -12,6 +12,7 @@ use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
 use crate::auth::{Claims, LoginRequest, RegisterRequest};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
+use crate::p2p::{PeerRegistration, SyncBlocksRequest, SyncBlocksResponse, SyncQuery};
 
 // ==================== 响应结构 ====================
 
@@ -545,6 +546,67 @@ pub async fn trigger_aggregation(
             Ok((StatusCode::CREATED, Json(ApiResponse::success(summary))))
         }
         None => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("aggregation failed or no data")))),
+    }
+}
+
+// ==================== P2P 同步处理器 ====================
+
+pub async fn list_peers(State(state): State<AppState>) -> Json<ApiResponse<Vec<crate::p2p::PeerInfo>>> {
+    Json(ApiResponse::success(state.p2p.list_peers()))
+}
+
+pub async fn register_peer(
+    State(state): State<AppState>,
+    Json(req): Json<PeerRegistration>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.p2p.register_peer(req) {
+        Ok(peer) => Ok((StatusCode::CREATED, Json(ApiResponse::success(peer)))),
+        Err(error) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(error.to_string())))),
+    }
+}
+
+/// 导出本节点从 start 开始的区块，供其他节点拉取。
+pub async fn export_blocks(
+    State(state): State<AppState>,
+    Query(query): Query<SyncQuery>,
+) -> Result<Json<SyncBlocksResponse>, (StatusCode, Json<ApiResponse<()>>)> {
+    let total = state.chain.get_block_count();
+    if start > total {
+        return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("sync start is beyond local chain"))));
+    }
+    Ok(Json(SyncBlocksResponse {
+        start: start as i64,
+        blocks: state.chain.get_blocks(start, total - start),
+    }))
+}
+
+/// 导入另一节点提供的区块；Chain::add_block 逐块验证链接、PoW 和 Merkle。
+pub async fn import_blocks(
+    State(state): State<AppState>,
+    Json(req): Json<SyncBlocksRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut imported = 0usize;
+    for block in req.blocks {
+        if let Err(error) = state.chain.add_block(block.clone()) {
+            return Err((StatusCode::CONFLICT, Json(ApiResponse::error(format!(
+                "block sync rejected after {} blocks: {}", imported, error
+            )))));
+        }
+        if let Err(error) = state.storage.save_block(&block).await {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(error.to_string()))));
+        }
+        imported += 1;
+    }
+    Ok(Json(ApiResponse::success(serde_json::json!({ "imported": imported }))))
+}
+
+pub async fn sync_peer(
+    State(state): State<AppState>,
+    Path(peer_id): Path<String>,
+) -> Result<Json<ApiResponse<crate::p2p::SyncReport>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.p2p.sync_peer(&peer_id, &state.chain).await {
+        Ok(report) => Ok(Json(ApiResponse::success(report))),
+        Err(error) => Err((StatusCode::BAD_GATEWAY, Json(ApiResponse::error(error.to_string())))),
     }
 }
 

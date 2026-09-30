@@ -112,6 +112,8 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     }));
     scheduler.start();
 
+    let p2p = crate::p2p::P2PService::new();
+
     // 创建应用状态
     let app_state = api::AppState {
         chain,
@@ -123,6 +125,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         ws_hub,
         event_bus,
         scheduler,
+        p2p,
     };
 
     // 启动服务

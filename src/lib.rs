@@ -17,5 +17,6 @@ pub mod metadata;
 pub mod storage;
 pub mod versioning;
 pub mod aggregation;
+pub mod p2p;
 pub mod api;
 pub mod cli;

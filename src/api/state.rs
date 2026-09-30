@@ -4,6 +4,7 @@ use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
 use crate::core::Chain;
 use crate::metadata::MetadataManager;
+use crate::p2p::P2PService;
 use crate::storage::Storage;
 use crate::versioning::VersionTracker;
 use super::{notification::EventBus, websocket::WsHub};
@@ -20,6 +21,7 @@ pub struct AppState {
     pub ws_hub: Arc<WsHub>,
     pub event_bus: Arc<EventBus>,
     pub scheduler: Arc<Scheduler>,
+    pub p2p: Arc<P2PService>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
         ws_hub: Arc<WsHub>,
         event_bus: Arc<EventBus>,
         scheduler: Arc<Scheduler>,
+        p2p: Arc<P2PService>,
     ) -> Self {
         Self {
             chain,
@@ -45,6 +48,7 @@ impl AppState {
             ws_hub,
             event_bus,
             scheduler,
+            p2p,
         }
     }
 }

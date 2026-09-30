@@ -37,6 +37,8 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 # 全局单例(auth/permissions、utils/performance)
 lazy_static = "1"
+# HTTP P2P 同步客户端
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # CLI(cli/* 用 clap derive)
 clap = { version = "4", features = ["derive"] }
 # 并发锁(chain/websocket)

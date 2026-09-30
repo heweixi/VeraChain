@@ -48,6 +48,18 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     if path == "/api/v1/stats" {
         return Some(Permission::StatsRead);
     }
+    if path == "/api/v1/peers" {
+        return Some(Permission::SystemMonitor);
+    }
+    if path == "/api/v1/peers/register" || path.starts_with("/api/v1/peers/") {
+        return Some(Permission::SystemAdmin);
+    }
+    if path == "/api/v1/sync/blocks" && method == Method::GET {
+        return Some(Permission::BlockRead);
+    }
+    if path == "/api/v1/sync/blocks" {
+        return Some(Permission::SystemAdmin);
+    }
     None
 }
 
