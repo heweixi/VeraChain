@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::core::{Block, Chain};
 use crate::error::{DataChainError, Result};
@@ -99,7 +100,7 @@ impl P2PService {
         let peer = self
             .get_peer(peer_id)
             .ok_or_else(|| DataChainError::UserNotFound(format!("peer not found: {}", peer_id)))?;
-        let start = chain.get_block_count() as i64;
+        let start = 0i64;
         let url = format!("{}/api/v1/sync/blocks?start={}", peer.base_url, start);
         let mut request = self.client.get(url);
         if let Some(token) = &peer.auth_token {
@@ -120,11 +121,13 @@ impl P2PService {
             .await
             .map_err(|e| DataChainError::StorageError(format!("invalid sync response: {}", e)))?;
         let received = payload.blocks.len();
-        let mut imported = 0;
-        for block in payload.blocks {
-            chain.add_block(block)?;
-            imported += 1;
-        }
+        let before = chain.get_block_count();
+        let replaced = chain.replace_chain_if_longer(payload.blocks)?;
+        let imported = if replaced {
+            chain.get_block_count().saturating_sub(before)
+        } else {
+            0
+        };
         if let Some(peer) = self.peers.write().get_mut(peer_id) {
             peer.last_sync = Some(Utc::now());
         }
@@ -134,6 +137,22 @@ impl P2PService {
             received,
             imported,
             local_block_count: chain.get_block_count(),
+        })
+    }
+
+    /// 启动定时同步循环。peer 仍需通过注册接口显式加入，避免无认证自动发现。
+    pub fn start_sync_loop(self: Arc<Self>, chain: Arc<Chain>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let peers = self.list_peers();
+                for peer in peers {
+                    if let Err(error) = self.sync_peer(&peer.peer_id, &chain).await {
+                        tracing::warn!("P2P sync with {} failed: {}", peer.peer_id, error);
+                    }
+                }
+            }
         })
     }
 }

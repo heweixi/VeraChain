@@ -277,6 +277,18 @@ impl Chain {
         Ok(())
     }
 
+    /// 用更长且完整校验通过的候选链替换本地链。
+    /// 同长度分叉不自动覆盖，避免在没有共识规则时发生静默分叉选择。
+    pub fn replace_chain_if_longer(&self, candidate: Vec<Block>) -> Result<bool> {
+        self.validate_loaded_blocks(&candidate)?;
+        let mut blocks = self.blocks.write();
+        if candidate.len() <= blocks.len() {
+            return Ok(false);
+        }
+        *blocks = candidate;
+        Ok(true)
+    }
+
     /// 加载区块（从存储恢复）。调用方应先调用 validate_loaded_blocks。
     pub fn load_blocks(&self, blocks: Vec<Block>) {
         let mut chain_blocks = self.blocks.write();
