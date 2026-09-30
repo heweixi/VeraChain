@@ -7,7 +7,7 @@
 >
 > P0-A 安全加固已提交 `fe93939`：公开注册固定普通用户、路由权限检查、默认 JWT secret
 > 校验/env 覆盖、CORS allowlist、WebSocket JWT/连接数/消息大小保护。P0-B/P1/P2 基础能力已分别
-> 提交 `11797fb`、`4ca5f32`、`7ab5602`、`f48ff6e`、`4a0f516`、`17e5e70`，详情见状态文档。
+> 提交 `11797fb`、`4ca5f32`、`7ab5602`、`f48ff6e`、`4a0f516`、`17e5e70`、`60aa000`，详情见状态文档。
 > 由于当前验证环境磁盘已满，这些提交尚待 `cargo check`、`cargo test` 和 Docker smoke test 验证。
 
 数据追溯区块链系统 - Rust 实现

@@ -15,7 +15,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 - ✅ P1-A 运行闭环基础已接入：WsHub/EventBus/Scheduler 进入 AppState；业务 handler 发布事件；WebSocket 订阅广播；Scheduler 自动启动并异步持久化聚合。
 - ✅ P1-B 已有版本化 SQL migration 和坏记录显式报错；旧 init_tables 仍保留幂等建表兼容逻辑，尚未完全重构为纯 migration 驱动。
 - ✅ P1-C 已接入内容快照、基于快照 diff 和版本路径 allowlist/大小/符号链接校验。
-- ⚠️ P2 区块同步已实现最小认证 HTTP 方案(显式注册 peer、拉取/导入、逐块校验)，但没有自动发现、广播网络、共识/分叉选择。
+- ⚠️ P2 区块同步已实现基础方案：显式注册 peer、认证拉取/导入、完整链校验、最长合法链替换和 60 秒定时同步；没有自动发现、广播网络、共识或同长度分叉选择。
 - P2：API/数据库/调度/越权测试不足；Cargo.lock 尚未生成 reqwest 新依赖的最终锁定变更；Docker 和运行时行为需要重新验证。
 
 ## 二、需求/设计与实现对照
@@ -55,7 +55,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ⏳ | pending metadata 只在内存；进入 pending 后进程退出、尚未挖矿时数据会丢失 |
 | attestation/identity/key transactions | 🧩 | Block 字段存在，但签名验证、身份注册、密钥轮换、交易处理和持久化业务流程未接入 |
-| P2P/节点同步/冲突解决 | ⚠️基础同步已实现/仍不完整 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks` 提供显式 peer 注册、拉取/导入和逐块校验；没有自动发现、广播网络、共识或分叉选择 |
+| P2P/节点同步/冲突解决 | ⚠️基础同步已实现/仍不完整 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks` 提供显式 peer 注册、认证拉取/导入、最长合法链选择和定时同步；没有自动发现、广播网络、共识或同长度分叉选择 |
 
 ### 2.4 存储、迁移与恢复
 
