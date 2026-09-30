@@ -31,8 +31,44 @@ impl Storage {
         Ok(storage)
     }
 
-    /// 初始化表
+    /// 执行版本化 SQL migration。迁移文件采用幂等 DDL,兼容早期直接建表的数据库。
+    async fn apply_migrations(&self) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let (current,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let migrations: &[(i64, &str)] = &[
+            (1, include_str!("../../migrations/001_base.sql")),
+            (2, include_str!("../../migrations/002_pending_aggregations.sql")),
+        ];
+        for (version, sql) in migrations {
+            if *version <= current {
+                continue;
+            }
+            let mut tx = self.pool.begin().await?;
+            for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                sqlx::query(statement).execute(&mut *tx).await?;
+            }
+            sqlx::query("INSERT INTO schema_migrations (version) VALUES (?)")
+                .bind(version)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// 初始化表（保留幂等建表作为旧数据库兼容兜底）。
     async fn init_tables(&self) -> Result<()> {
+        self.apply_migrations().await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS blocks (
