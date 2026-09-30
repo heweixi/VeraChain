@@ -164,5 +164,9 @@ pub struct QueryMetadataRequest {
     pub page_size: usize,
 }
 
-fn default_page() -> usize { 1 }
-fn default_page_size() -> usize { 20 }
+fn default_page() -> usize {
+    1
+}
+fn default_page_size() -> usize {
+    20
+}

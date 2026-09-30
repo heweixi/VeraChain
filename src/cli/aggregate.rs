@@ -61,13 +61,13 @@ pub async fn run_aggregate(config: &AppConfig, action: AggregateAction) -> anyho
         }
         AggregateAction::Status => {
             let (should_agg, strategy) = engine.should_aggregate();
-            
+
             println!("汇总状态");
             println!("========");
             println!("上次汇总: {}", engine.get_last_aggregation());
             println!("已汇总数量: {}", engine.get_aggregated_count());
             println!("需要汇总: {}", if should_agg { "是" } else { "否" });
-            
+
             if let Some(s) = strategy {
                 println!("触发策略: {}", s);
             }
@@ -89,20 +89,21 @@ pub async fn run_aggregate(config: &AppConfig, action: AggregateAction) -> anyho
         }
         AggregateAction::Stats => {
             let aggregations = engine.get_all_aggregations();
-            
+
             let total_metadata: usize = aggregations.iter().map(|a| a.metadata_count).sum();
-            let by_type: std::collections::HashMap<String, usize> = aggregations
-                .iter()
-                .fold(std::collections::HashMap::new(), |mut acc, a| {
-                    *acc.entry(a.summary_type.clone()).or_insert(0) += 1;
-                    acc
-                });
+            let by_type: std::collections::HashMap<String, usize> =
+                aggregations
+                    .iter()
+                    .fold(std::collections::HashMap::new(), |mut acc, a| {
+                        *acc.entry(a.summary_type.clone()).or_insert(0) += 1;
+                        acc
+                    });
 
             println!("汇总统计");
             println!("========");
             println!("总汇总数: {}", aggregations.len());
             println!("总元数据数: {}", total_metadata);
-            
+
             println!();
             println!("按类型:");
             for (t, count) in &by_type {

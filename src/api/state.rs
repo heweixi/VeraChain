@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::{notification::EventBus, websocket::WsHub};
 use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
 use crate::core::Chain;
@@ -7,7 +8,6 @@ use crate::metadata::MetadataManager;
 use crate::p2p::P2PService;
 use crate::storage::Storage;
 use crate::versioning::VersionTracker;
-use super::{notification::EventBus, websocket::WsHub};
 
 /// 应用状态
 #[derive(Clone)]

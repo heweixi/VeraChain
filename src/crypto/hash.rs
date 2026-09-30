@@ -1,5 +1,5 @@
 use md5::Md5;
-use sha2::{Sha256, Sha512, Digest};
+use sha2::{Digest, Sha256, Sha512};
 use sha3::{Sha3_256, Sha3_512};
 use std::collections::HashMap;
 
@@ -66,12 +66,12 @@ impl HashEngine {
 
     /// 计算 Argon2 哈希
     pub fn compute_argon2(&self, data: &[u8]) -> String {
-        use argon2::{Argon2, PasswordHasher};
         use argon2::password_hash::SaltString;
-        
+        use argon2::{Argon2, PasswordHasher};
+
         let salt = SaltString::encode_b64(&self.salt).unwrap();
         let argon2 = Argon2::default();
-        
+
         match argon2.hash_password(data, &salt) {
             Ok(hash) => hash.to_string(),
             Err(_) => String::new(),
@@ -80,9 +80,9 @@ impl HashEngine {
 
     /// 验证 Argon2 哈希
     pub fn verify_argon2(&self, data: &[u8], hash: &str) -> bool {
-        use argon2::{Argon2, PasswordVerifier};
         use argon2::password_hash::PasswordHash;
-        
+        use argon2::{Argon2, PasswordVerifier};
+
         let argon2 = Argon2::default();
         match PasswordHash::new(hash) {
             Ok(parsed_hash) => argon2.verify_password(data, &parsed_hash).is_ok(),
@@ -94,7 +94,7 @@ impl HashEngine {
     pub fn compute_pbkdf2(&self, data: &[u8]) -> String {
         use pbkdf2::pbkdf2_hmac_array;
         use sha2::Sha256;
-        
+
         let result = pbkdf2_hmac_array::<Sha256, 32>(data, &self.salt, 100_000);
         hex::encode(result)
     }
@@ -102,7 +102,7 @@ impl HashEngine {
     /// 计算 scrypt 哈希
     pub fn compute_scrypt(&self, data: &[u8]) -> Result<String, scrypt::errors::InvalidParams> {
         use scrypt::{scrypt, Params};
-        
+
         let params = Params::new(14, 8, 1, 32)?;
         let mut output = [0u8; 32];
         scrypt(data, &self.salt, &params, &mut output).ok();
@@ -126,7 +126,7 @@ impl HashEngine {
     /// 计算所有支持的哈希值
     pub fn compute_all_hashes(&self, data: &[u8]) -> HashMap<String, String> {
         let mut hashes = HashMap::new();
-        
+
         hashes.insert("md5".to_string(), self.compute_md5(data));
         hashes.insert("sha256".to_string(), self.compute_sha256(data));
         hashes.insert("sha512".to_string(), self.compute_sha512(data));
@@ -134,15 +134,15 @@ impl HashEngine {
         hashes.insert("sha3_512".to_string(), self.compute_sha3_512(data));
         hashes.insert("argon2".to_string(), self.compute_argon2(data));
         hashes.insert("pbkdf2".to_string(), self.compute_pbkdf2(data));
-        
+
         if let Ok(bcrypt_hash) = self.compute_bcrypt(data) {
             hashes.insert("bcrypt".to_string(), bcrypt_hash);
         }
-        
+
         if let Ok(scrypt_hash) = self.compute_scrypt(data) {
             hashes.insert("scrypt".to_string(), scrypt_hash);
         }
-        
+
         hashes
     }
 
@@ -179,10 +179,10 @@ mod tests {
     fn test_hash_engine() {
         let engine = HashEngine::new(None);
         let data = b"hello world";
-        
+
         let md5 = engine.compute_md5(data);
         assert!(!md5.is_empty());
-        
+
         let sha256 = engine.compute_sha256(data);
         assert!(!sha256.is_empty());
     }

@@ -21,10 +21,15 @@ impl AggregationEngine {
     /// 创建汇总引擎
     pub fn new(chain: Arc<Chain>, time_interval_secs: u64, count_threshold: usize) -> Self {
         let mut strategies: Vec<Box<dyn AggregationStrategy>> = Vec::new();
-        
+
         // 添加默认策略
-        strategies.push(Box::new(TimeBasedStrategy::new(Duration::from_secs(time_interval_secs))));
-        strategies.push(Box::new(CountBasedStrategy::new(count_threshold, Duration::from_secs(86400))));
+        strategies.push(Box::new(TimeBasedStrategy::new(Duration::from_secs(
+            time_interval_secs,
+        ))));
+        strategies.push(Box::new(CountBasedStrategy::new(
+            count_threshold,
+            Duration::from_secs(86400),
+        )));
 
         Self {
             chain,
@@ -127,11 +132,17 @@ impl AggregationEngine {
     pub fn load_aggregation(&self, summary: AggregationSummary) {
         let latest = {
             let mut aggregations = self.aggregations.write();
-            if aggregations.iter().any(|item| item.summary_id == summary.summary_id) {
+            if aggregations
+                .iter()
+                .any(|item| item.summary_id == summary.summary_id)
+            {
                 return;
             }
             aggregations.push(summary);
-            aggregations.iter().max_by_key(|item| item.created_at).cloned()
+            aggregations
+                .iter()
+                .max_by_key(|item| item.created_at)
+                .cloned()
         };
 
         if let Some(latest) = latest {
@@ -147,7 +158,10 @@ impl AggregationEngine {
             let before = aggregations.len();
             aggregations.retain(|item| item.summary_id != summary_id);
             let removed = aggregations.len() != before;
-            let latest = aggregations.iter().max_by_key(|item| item.created_at).cloned();
+            let latest = aggregations
+                .iter()
+                .max_by_key(|item| item.created_at)
+                .cloned();
             (removed, latest)
         };
 
@@ -164,7 +178,10 @@ impl AggregationEngine {
     }
 
     /// 计算统计信息
-    fn compute_statistics(&self, metadata_list: &[MetadataEntry]) -> HashMap<String, serde_json::Value> {
+    fn compute_statistics(
+        &self,
+        metadata_list: &[MetadataEntry],
+    ) -> HashMap<String, serde_json::Value> {
         let mut stats = HashMap::new();
 
         if metadata_list.is_empty() {
@@ -215,10 +232,19 @@ impl AggregationEngine {
         top_tags.sort_by(|a, b| b.1.cmp(&a.1));
         top_tags.truncate(10);
 
-        stats.insert("total_metadata".to_string(), serde_json::json!(total_metadata));
+        stats.insert(
+            "total_metadata".to_string(),
+            serde_json::json!(total_metadata),
+        );
         stats.insert("total_size".to_string(), serde_json::json!(total_size));
-        stats.insert("unique_owners".to_string(), serde_json::json!(top_owners.len()));
-        stats.insert("size_distribution".to_string(), serde_json::json!(size_distribution));
+        stats.insert(
+            "unique_owners".to_string(),
+            serde_json::json!(top_owners.len()),
+        );
+        stats.insert(
+            "size_distribution".to_string(),
+            serde_json::json!(size_distribution),
+        );
         stats.insert("top_owners".to_string(), serde_json::json!(top_owners));
         stats.insert("top_tags".to_string(), serde_json::json!(top_tags));
 
@@ -234,7 +260,10 @@ impl AggregationEngine {
     /// 获取汇总
     pub fn get_aggregation(&self, summary_id: &str) -> Option<AggregationSummary> {
         let aggregations = self.aggregations.read();
-        aggregations.iter().find(|a| a.summary_id == summary_id).cloned()
+        aggregations
+            .iter()
+            .find(|a| a.summary_id == summary_id)
+            .cloned()
     }
 
     /// 获取所有汇总
@@ -274,5 +303,9 @@ pub fn create_aggregation_engine(
     time_interval_secs: u64,
     count_threshold: usize,
 ) -> Arc<AggregationEngine> {
-    Arc::new(AggregationEngine::new(chain, time_interval_secs, count_threshold))
+    Arc::new(AggregationEngine::new(
+        chain,
+        time_interval_secs,
+        count_threshold,
+    ))
 }

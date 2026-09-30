@@ -161,7 +161,8 @@ impl Block {
         }
 
         // 叶子 = SHA256(data_id)(BLOCK_HASH_SPEC 第10节 v1,三版本一致)
-        let hashes: Vec<String> = self.metadata_list
+        let hashes: Vec<String> = self
+            .metadata_list
             .iter()
             .map(|entry| super::metadata_leaf_hash(&entry.data_id))
             .collect();

@@ -21,7 +21,11 @@ use datachain::config::AppConfig;
 use datachain::utils::{init_logger, LogConfig};
 
 #[derive(Parser)]
-#[command(name = "datachain", version, about = "DataChain - 数据追溯区块链系统 (Rust)")]
+#[command(
+    name = "datachain",
+    version,
+    about = "DataChain - 数据追溯区块链系统 (Rust)"
+)]
 struct Cli {
     /// 配置文件路径
     #[arg(short, long, global = true, default_value = "config.toml")]

@@ -51,8 +51,8 @@ impl std::str::FromStr for LogFormat {
 
 /// 初始化日志系统
 pub fn init_logger(config: &LogConfig) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
     match config.format {
         LogFormat::Json => {

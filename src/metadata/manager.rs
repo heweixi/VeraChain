@@ -23,7 +23,7 @@ impl MetadataManager {
     /// 创建元数据
     pub fn create(&self, req: &CreateMetadataRequest, username: &str) -> Result<MetadataEntry> {
         let owner = req.owner.clone().unwrap_or_else(|| username.to_string());
-        
+
         let mut entry = MetadataEntry {
             data_id: uuid::Uuid::new_v4().to_string(),
             data_size: req.data_size,
@@ -48,7 +48,11 @@ impl MetadataManager {
     }
 
     /// 创建元数据（计算快速哈希）
-    pub fn create_with_fast_hash(&self, req: &CreateMetadataRequest, username: &str) -> Result<MetadataEntry> {
+    pub fn create_with_fast_hash(
+        &self,
+        req: &CreateMetadataRequest,
+        username: &str,
+    ) -> Result<MetadataEntry> {
         self.create(req, username)
     }
 

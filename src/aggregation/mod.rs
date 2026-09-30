@@ -1,7 +1,7 @@
 mod engine;
-mod strategies;
 mod scheduler;
+mod strategies;
 
 pub use engine::*;
-pub use strategies::*;
 pub use scheduler::*;
+pub use strategies::*;

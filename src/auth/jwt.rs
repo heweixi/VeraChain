@@ -8,12 +8,12 @@ use crate::error::{DataChainError, Result};
 /// JWT 声明
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,        // user_id
+    pub sub: String, // user_id
     pub username: String,
     pub role: String,
-    pub exp: i64,           // 过期时间
-    pub iat: i64,           // 签发时间
-    pub iss: String,        // 签发者
+    pub exp: i64,    // 过期时间
+    pub iat: i64,    // 签发时间
+    pub iss: String, // 签发者
 }
 
 impl Claims {
@@ -26,7 +26,7 @@ impl Claims {
 /// 刷新令牌声明
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshClaims {
-    pub sub: String,        // user_id
+    pub sub: String, // user_id
     pub token_type: String,
     pub exp: i64,
     pub iat: i64,
@@ -50,7 +50,12 @@ impl JwtHandler {
     }
 
     /// 生成访问令牌
-    pub fn generate_access_token(&self, user_id: &str, username: &str, role: Role) -> Result<String> {
+    pub fn generate_access_token(
+        &self,
+        user_id: &str,
+        username: &str,
+        role: Role,
+    ) -> Result<String> {
         let now = Utc::now();
         let exp = now + Duration::hours(self.access_expire_hours as i64);
 
@@ -126,7 +131,12 @@ impl JwtHandler {
     }
 
     /// 生成令牌对
-    pub fn generate_token_pair(&self, user_id: &str, username: &str, role: Role) -> Result<TokenPair> {
+    pub fn generate_token_pair(
+        &self,
+        user_id: &str,
+        username: &str,
+        role: Role,
+    ) -> Result<TokenPair> {
         let access_token = self.generate_access_token(user_id, username, role)?;
         let refresh_token = self.generate_refresh_token(user_id)?;
         let expires_at = Utc::now() + Duration::hours(self.access_expire_hours as i64);
@@ -156,10 +166,12 @@ mod tests {
     #[test]
     fn test_jwt_generation() {
         let handler = JwtHandler::new("test-secret".to_string(), 24);
-        
-        let token = handler.generate_access_token("user-123", "testuser", Role::User).unwrap();
+
+        let token = handler
+            .generate_access_token("user-123", "testuser", Role::User)
+            .unwrap();
         assert!(!token.is_empty());
-        
+
         let claims = handler.verify_access_token(&token).unwrap();
         assert_eq!(claims.sub, "user-123");
         assert_eq!(claims.username, "testuser");

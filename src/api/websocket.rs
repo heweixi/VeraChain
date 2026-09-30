@@ -3,8 +3,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::{IntoResponse, Response},
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
@@ -97,7 +97,12 @@ impl WsHub {
     }
 
     /// 广播到特定频道
-    pub fn broadcast_to_channel(&self, channel: &str, msg_type: MessageType, data: serde_json::Value) {
+    pub fn broadcast_to_channel(
+        &self,
+        channel: &str,
+        msg_type: MessageType,
+        data: serde_json::Value,
+    ) {
         let msg = WsMessage::new(msg_type, Some(data)).with_channel(channel);
         self.broadcast(msg);
     }
@@ -172,39 +177,44 @@ pub async fn ws_handler(
     State(state): State<AppState>,
 ) -> Response {
     if !state.ws_hub.try_add_client() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
     }
     let client_id = query
         .client_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let hub = state.ws_hub.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, client_id, hub)).into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, client_id, hub))
+        .into_response()
 }
 
 /// 区块链 WebSocket 处理器
-pub async fn chain_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn chain_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     if !state.ws_hub.try_add_client() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
     }
     let client_id = uuid::Uuid::new_v4().to_string();
     let hub = state.ws_hub.clone();
-    ws.on_upgrade(move |socket| {
-        handle_channel_socket(socket, client_id, "chain".to_string(), hub)
-    })
-    .into_response()
+    ws.on_upgrade(move |socket| handle_channel_socket(socket, client_id, "chain".to_string(), hub))
+        .into_response()
 }
 
 /// 元数据 WebSocket 处理器
-pub async fn metadata_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn metadata_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     if !state.ws_hub.try_add_client() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
     }
     let client_id = uuid::Uuid::new_v4().to_string();
     let hub = state.ws_hub.clone();
@@ -220,7 +230,11 @@ pub async fn aggregation_ws_handler(
     State(state): State<AppState>,
 ) -> Response {
     if !state.ws_hub.try_add_client() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "websocket connection limit reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
     }
     let client_id = uuid::Uuid::new_v4().to_string();
     let hub = state.ws_hub.clone();

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::websocket::{MessageType, WsHub, WsMessage};
@@ -20,27 +20,32 @@ impl NotificationService {
 
     /// 通知新区块
     pub fn notify_new_block(&self, block_data: serde_json::Value) {
-        self.hub.broadcast(WsMessage::new(MessageType::BlockAdded, Some(block_data)));
+        self.hub
+            .broadcast(WsMessage::new(MessageType::BlockAdded, Some(block_data)));
     }
 
     /// 通知新元数据
     pub fn notify_new_metadata(&self, metadata: serde_json::Value) {
-        self.hub.broadcast(WsMessage::new(MessageType::MetadataAdded, Some(metadata)));
+        self.hub
+            .broadcast(WsMessage::new(MessageType::MetadataAdded, Some(metadata)));
     }
 
     /// 通知汇总完成
     pub fn notify_aggregation_complete(&self, aggregation: serde_json::Value) {
-        self.hub.broadcast(WsMessage::new(MessageType::Aggregation, Some(aggregation)));
+        self.hub
+            .broadcast(WsMessage::new(MessageType::Aggregation, Some(aggregation)));
     }
 
     /// 通知链验证完成
     pub fn notify_chain_validated(&self, result: serde_json::Value) {
-        self.hub.broadcast(WsMessage::new(MessageType::ChainValidated, Some(result)));
+        self.hub
+            .broadcast(WsMessage::new(MessageType::ChainValidated, Some(result)));
     }
 
     /// 通知版本追踪
     pub fn notify_version_tracked(&self, version: serde_json::Value) {
-        self.hub.broadcast(WsMessage::new(MessageType::VersionTracked, Some(version)));
+        self.hub
+            .broadcast(WsMessage::new(MessageType::VersionTracked, Some(version)));
     }
 
     /// 发送到特定频道
@@ -162,7 +167,8 @@ impl EventBus {
                 self.notification.notify_new_metadata(event.data.clone());
             }
             EventType::AggregationDone => {
-                self.notification.notify_aggregation_complete(event.data.clone());
+                self.notification
+                    .notify_aggregation_complete(event.data.clone());
             }
             EventType::ChainValidated => {
                 self.notification.notify_chain_validated(event.data.clone());

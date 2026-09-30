@@ -6,10 +6,10 @@ use std::time::Duration;
 pub trait AggregationStrategy: Send + Sync {
     /// 检查是否应该汇总
     fn should_aggregate(&self, metadata_count: usize) -> bool;
-    
+
     /// 获取策略类型
     fn strategy_type(&self) -> &str;
-    
+
     /// 重置状态
     fn reset(&self);
 }
@@ -85,7 +85,9 @@ impl AggregationStrategy for CountBasedStrategy {
         // 检查最大等待时间
         let last = *self.last_aggregation.lock();
         let elapsed = Utc::now().signed_duration_since(last);
-        if elapsed >= chrono::Duration::from_std(self.max_wait_time).unwrap_or_default() && metadata_count > 0 {
+        if elapsed >= chrono::Duration::from_std(self.max_wait_time).unwrap_or_default()
+            && metadata_count > 0
+        {
             return true;
         }
 

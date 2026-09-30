@@ -37,7 +37,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ws/metadata", get(websocket::metadata_ws_handler))
         .route("/ws/aggregation", get(websocket::aggregation_ws_handler))
         // WebSocket 握手也必须携带 Bearer JWT。
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // 需要认证的路由
     let protected_routes = Router::new()
@@ -50,7 +53,10 @@ pub fn create_router(state: AppState) -> Router {
         // 区块链
         .route("/api/v1/blocks", get(handlers::get_blocks))
         .route("/api/v1/blocks/:index", get(handlers::get_block))
-        .route("/api/v1/blocks/by-hash/:hash", get(handlers::get_block_by_hash))
+        .route(
+            "/api/v1/blocks/by-hash/:hash",
+            get(handlers::get_block_by_hash),
+        )
         .route("/api/v1/blocks/proof/:sha256", get(handlers::get_proof))
         .route("/api/v1/chain/info", get(handlers::get_chain_info))
         .route("/api/v1/chain/mine", post(handlers::mine_block))
@@ -59,12 +65,24 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/versions", get(handlers::get_versions))
         .route("/api/v1/versions/:id", get(handlers::get_version))
         .route("/api/v1/versions/track", post(handlers::track_version))
-        .route("/api/v1/versions/diff/:old_version_id/:new_version_id", get(handlers::get_version_diff))
-        .route("/api/v1/versions/history/*file_path", get(handlers::get_version_history))
+        .route(
+            "/api/v1/versions/diff/:old_version_id/:new_version_id",
+            get(handlers::get_version_diff),
+        )
+        .route(
+            "/api/v1/versions/history/*file_path",
+            get(handlers::get_version_history),
+        )
         // 汇总
         .route("/api/v1/aggregations", get(handlers::get_aggregations))
-        .route("/api/v1/aggregations/status", get(handlers::aggregation_status))
-        .route("/api/v1/aggregations/trigger", post(handlers::trigger_aggregation))
+        .route(
+            "/api/v1/aggregations/status",
+            get(handlers::aggregation_status),
+        )
+        .route(
+            "/api/v1/aggregations/trigger",
+            post(handlers::trigger_aggregation),
+        )
         // 统计
         .route("/api/v1/stats", get(handlers::get_stats))
         .route("/api/v1/peers", get(handlers::list_peers))
@@ -72,7 +90,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/peers/:peer_id/sync", post(handlers::sync_peer))
         .route("/api/v1/sync/blocks", get(handlers::export_blocks))
         .route("/api/v1/sync/blocks", post(handlers::import_blocks))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // 合并路由
     Router::new()

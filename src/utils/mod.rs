@@ -1,7 +1,7 @@
 mod cache;
-mod performance;
 mod logger;
+mod performance;
 
 pub use cache::*;
-pub use performance::*;
 pub use logger::*;
+pub use performance::*;

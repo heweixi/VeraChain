@@ -141,7 +141,9 @@ impl Chain {
 
         let mut pending = self.pending.write();
         if pending.is_empty() {
-            return Err(DataChainError::AggregationFailed("no pending metadata".to_string()));
+            return Err(DataChainError::AggregationFailed(
+                "no pending metadata".to_string(),
+            ));
         }
 
         let latest = blocks.last().unwrap();
@@ -169,7 +171,7 @@ impl Chain {
     /// 添加区块（用于同步）
     pub fn add_block(&self, block: Block) -> Result<()> {
         let mut blocks = self.blocks.write();
-        
+
         if blocks.is_empty() {
             return Err(DataChainError::ChainNotInitialized);
         }
@@ -181,10 +183,14 @@ impl Chain {
             return Err(DataChainError::InvalidBlock("invalid index".to_string()));
         }
         if block.previous_hash != latest.hash {
-            return Err(DataChainError::InvalidBlock("invalid previous hash".to_string()));
+            return Err(DataChainError::InvalidBlock(
+                "invalid previous hash".to_string(),
+            ));
         }
         if !block.is_valid() {
-            return Err(DataChainError::InvalidBlock("invalid proof of work".to_string()));
+            return Err(DataChainError::InvalidBlock(
+                "invalid proof of work".to_string(),
+            ));
         }
 
         blocks.push(block);
@@ -194,7 +200,7 @@ impl Chain {
     /// 验证整条链的完整性
     pub fn validate_chain(&self) -> bool {
         let blocks = self.blocks.read();
-        
+
         for i in 1..blocks.len() {
             let current = &blocks[i];
             let previous = &blocks[i - 1];
@@ -244,7 +250,9 @@ impl Chain {
 
         let genesis = &blocks[0];
         if genesis.index != 0 || genesis.previous_hash != "0" {
-            return Err(DataChainError::InvalidBlock("invalid genesis block".to_string()));
+            return Err(DataChainError::InvalidBlock(
+                "invalid genesis block".to_string(),
+            ));
         }
 
         for (position, block) in blocks.iter().enumerate() {

@@ -43,7 +43,12 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     let committed_data_ids: std::collections::HashSet<String> = chain
         .get_all_blocks()
         .iter()
-        .flat_map(|block| block.metadata_list.iter().map(|entry| entry.data_id.clone()))
+        .flat_map(|block| {
+            block
+                .metadata_list
+                .iter()
+                .map(|entry| entry.data_id.clone())
+        })
         .collect();
     let mut pending_to_load = Vec::new();
     for entry in pending {

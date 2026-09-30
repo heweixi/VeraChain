@@ -142,12 +142,9 @@ impl PermissionManager {
         self.role_permissions.insert(Role::Auditor, auditor_perms);
 
         // Guest - 最小权限
-        let guest_perms: HashSet<Permission> = [
-            Permission::MetadataRead,
-            Permission::BlockRead,
-        ]
-        .into_iter()
-        .collect();
+        let guest_perms: HashSet<Permission> = [Permission::MetadataRead, Permission::BlockRead]
+            .into_iter()
+            .collect();
         self.role_permissions.insert(Role::Guest, guest_perms);
     }
 

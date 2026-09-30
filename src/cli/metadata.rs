@@ -75,14 +75,21 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
     let manager = create_metadata_manager(chain);
 
     match action {
-        MetadataAction::Add { file, size, owner, tags } => {
+        MetadataAction::Add {
+            file,
+            size,
+            owner,
+            tags,
+        } => {
             let mut req = CreateMetadataRequest {
                 data_size: size,
                 owner: Some(owner.clone()),
                 hashes: std::collections::HashMap::new(),
                 metadata: std::collections::HashMap::new(),
                 parent_id: None,
-                tags: tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+                tags: tags
+                    .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default(),
                 content: None,
             };
 
@@ -100,7 +107,11 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
             println!("  大小: {} bytes", entry.data_size);
             println!("  所有者: {}", entry.owner);
         }
-        MetadataAction::List { owner, page, page_size } => {
+        MetadataAction::List {
+            owner,
+            page,
+            page_size,
+        } => {
             let req = QueryMetadataRequest {
                 data_id: None,
                 owner,
@@ -125,54 +136,52 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
                 );
             }
         }
-        MetadataAction::Get { data_id } => {
-            match manager.get_by_data_id(&data_id) {
-                Some(entry) => {
-                    println!("元数据详情");
-                    println!("==========");
-                    println!("数据 ID: {}", entry.data_id);
-                    println!("大小: {} bytes", entry.data_size);
-                    println!("所有者: {}", entry.owner);
-                    println!("创建时间: {}", entry.created_at);
-                    println!("修改时间: {}", entry.modified_at);
-                    
-                    if !entry.tags.is_empty() {
-                        println!("标签: {}", entry.tags.join(", "));
-                    }
-                    
-                    if !entry.hashes.is_empty() {
-                        println!();
-                        println!("哈希值:");
-                        for (algo, hash) in &entry.hashes {
-                            println!("  {}: {}", algo, hash);
-                        }
-                    }
+        MetadataAction::Get { data_id } => match manager.get_by_data_id(&data_id) {
+            Some(entry) => {
+                println!("元数据详情");
+                println!("==========");
+                println!("数据 ID: {}", entry.data_id);
+                println!("大小: {} bytes", entry.data_size);
+                println!("所有者: {}", entry.owner);
+                println!("创建时间: {}", entry.created_at);
+                println!("修改时间: {}", entry.modified_at);
+
+                if !entry.tags.is_empty() {
+                    println!("标签: {}", entry.tags.join(", "));
                 }
-                None => {
-                    println!("✗ 元数据未找到: {}", data_id);
+
+                if !entry.hashes.is_empty() {
+                    println!();
+                    println!("哈希值:");
+                    for (algo, hash) in &entry.hashes {
+                        println!("  {}: {}", algo, hash);
+                    }
                 }
             }
-        }
+            None => {
+                println!("✗ 元数据未找到: {}", data_id);
+            }
+        },
         MetadataAction::Query { owner, tags } => {
             let req = QueryMetadataRequest {
                 data_id: None,
                 owner,
                 start_time: None,
                 end_time: None,
-                tags: tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),
+                tags: tags
+                    .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default(),
                 page: 1,
                 page_size: 50,
             };
 
             let results = manager.query(&req);
             println!("查询结果: {} 条", results.len());
-            
+
             for entry in results {
                 println!(
                     "{} | {} bytes | {}",
-                    entry.data_id,
-                    entry.data_size,
-                    entry.owner
+                    entry.data_id, entry.data_size, entry.owner
                 );
             }
         }
@@ -184,7 +193,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
             println!("总大小: {} bytes", stats.total_size);
             println!("唯一所有者: {}", stats.unique_owners);
             println!("待打包: {}", stats.pending_count);
-            
+
             if !stats.top_owners.is_empty() {
                 println!();
                 println!("Top 所有者:");

@@ -9,7 +9,7 @@ pub fn run_info(detailed: bool) {
         println!("操作系统: {}", std::env::consts::OS);
         println!("架构: {}", std::env::consts::ARCH);
         println!("编译时间: {}", env!("CARGO_PKG_VERSION"));
-        
+
         // 内存信息
         #[cfg(target_os = "linux")]
         {

@@ -1,9 +1,9 @@
-pub mod server;
-pub mod init;
-pub mod status;
-pub mod info;
-pub mod chain;
-pub mod metadata;
-pub mod user;
 pub mod aggregate;
+pub mod chain;
+pub mod info;
+pub mod init;
+pub mod metadata;
+pub mod server;
+pub mod status;
+pub mod user;
 pub mod version;

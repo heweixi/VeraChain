@@ -40,10 +40,7 @@ impl Timer {
 
         if let Some(threshold) = self.threshold {
             if elapsed > threshold {
-                warn!(
-                    "{} 耗时 {:?}，超过阈值 {:?}",
-                    self.name, elapsed, threshold
-                );
+                warn!("{} 耗时 {:?}，超过阈值 {:?}", self.name, elapsed, threshold);
             } else {
                 info!("{} 耗时 {:?}", self.name, elapsed);
             }

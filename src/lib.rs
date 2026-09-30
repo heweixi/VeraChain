@@ -7,16 +7,16 @@
 //! 本 lib.rs 逐步把真实模块接入编译单元,使其可编译、可测试(如 core 的区块哈希
 //! 黄金向量、auth 的权限模型)。模块按依赖关系分批接入。
 
-pub mod error;
+pub mod aggregation;
+pub mod api;
+pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod core;
 pub mod crypto;
-pub mod auth;
-pub mod utils;
+pub mod error;
 pub mod metadata;
-pub mod storage;
-pub mod versioning;
-pub mod aggregation;
 pub mod p2p;
-pub mod api;
-pub mod cli;
+pub mod storage;
+pub mod utils;
+pub mod versioning;

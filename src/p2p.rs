@@ -72,11 +72,15 @@ impl P2PService {
 
     pub fn register_peer(&self, req: PeerRegistration) -> Result<PeerInfo> {
         if req.peer_id.trim().is_empty() {
-            return Err(DataChainError::InvalidBlock("peer_id cannot be empty".to_string()));
+            return Err(DataChainError::InvalidBlock(
+                "peer_id cannot be empty".to_string(),
+            ));
         }
         let url = req.base_url.trim_end_matches('/').to_string();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(DataChainError::InvalidBlock("peer URL must use http or https".to_string()));
+            return Err(DataChainError::InvalidBlock(
+                "peer URL must use http or https".to_string(),
+            ));
         }
         let peer = PeerInfo {
             peer_id: req.peer_id.clone(),

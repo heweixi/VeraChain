@@ -48,7 +48,7 @@ pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Resul
             println!("难度: {}", info.difficulty);
             println!("区块大小: {}", info.block_size);
             println!("待打包: {}", info.pending_count);
-            
+
             if let Some(latest) = info.latest_block {
                 println!();
                 println!("最新区块:");
@@ -65,25 +65,23 @@ pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Resul
                 println!("✗ 链验证失败");
             }
         }
-        ChainAction::Mine => {
-            match chain.mine_block() {
-                Ok(block) => {
-                    storage.save_block(&block).await?;
-                    println!("✓ 新区块已挖掘");
-                    println!("  索引: {}", block.index);
-                    println!("  哈希: {}", block.hash);
-                    println!("  元数据数量: {}", block.metadata_list.len());
-                }
-                Err(e) => {
-                    println!("✗ 挖矿失败: {}", e);
-                }
+        ChainAction::Mine => match chain.mine_block() {
+            Ok(block) => {
+                storage.save_block(&block).await?;
+                println!("✓ 新区块已挖掘");
+                println!("  索引: {}", block.index);
+                println!("  哈希: {}", block.hash);
+                println!("  元数据数量: {}", block.metadata_list.len());
             }
-        }
+            Err(e) => {
+                println!("✗ 挖矿失败: {}", e);
+            }
+        },
         ChainAction::Blocks { start, limit } => {
             let blocks = chain.get_blocks(start, limit);
             println!("区块列表 (共 {} 个)", chain.get_block_count());
             println!("=========");
-            
+
             for block in blocks {
                 println!(
                     "[{}] {} | {} 条元数据 | {}",
@@ -94,32 +92,33 @@ pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Resul
                 );
             }
         }
-        ChainAction::Block { index } => {
-            match chain.get_block(index) {
-                Ok(block) => {
-                    println!("区块 #{}", block.index);
-                    println!("========");
-                    println!("哈希: {}", block.hash);
-                    println!("前一哈希: {}", block.previous_hash);
-                    println!("Merkle 根: {}", block.merkle_root);
-                    println!("时间戳: {}", block.timestamp);
-                    println!("难度: {}", block.difficulty);
-                    println!("Nonce: {}", block.nonce);
-                    println!("元数据数量: {}", block.metadata_list.len());
-                    
-                    if !block.metadata_list.is_empty() {
-                        println!();
-                        println!("元数据:");
-                        for (i, entry) in block.metadata_list.iter().enumerate() {
-                            println!("  [{}] {} | {} bytes | {}", i, entry.data_id, entry.data_size, entry.owner);
-                        }
+        ChainAction::Block { index } => match chain.get_block(index) {
+            Ok(block) => {
+                println!("区块 #{}", block.index);
+                println!("========");
+                println!("哈希: {}", block.hash);
+                println!("前一哈希: {}", block.previous_hash);
+                println!("Merkle 根: {}", block.merkle_root);
+                println!("时间戳: {}", block.timestamp);
+                println!("难度: {}", block.difficulty);
+                println!("Nonce: {}", block.nonce);
+                println!("元数据数量: {}", block.metadata_list.len());
+
+                if !block.metadata_list.is_empty() {
+                    println!();
+                    println!("元数据:");
+                    for (i, entry) in block.metadata_list.iter().enumerate() {
+                        println!(
+                            "  [{}] {} | {} bytes | {}",
+                            i, entry.data_id, entry.data_size, entry.owner
+                        );
                     }
                 }
-                Err(e) => {
-                    println!("✗ 获取区块失败: {}", e);
-                }
             }
-        }
+            Err(e) => {
+                println!("✗ 获取区块失败: {}", e);
+            }
+        },
     }
 
     Ok(())

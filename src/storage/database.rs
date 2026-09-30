@@ -39,15 +39,17 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
-        let (current,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let (current,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+                .fetch_one(&self.pool)
+                .await?;
 
         let migrations: &[(i64, &str)] = &[
             (1, include_str!("../../migrations/001_base.sql")),
-            (2, include_str!("../../migrations/002_pending_aggregations.sql")),
+            (
+                2,
+                include_str!("../../migrations/002_pending_aggregations.sql"),
+            ),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -164,9 +166,11 @@ impl Storage {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_versions_file_path ON versions(file_path)")
             .execute(&self.pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_aggregations_created_at ON aggregations(created_at)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_aggregations_created_at ON aggregations(created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -267,20 +271,8 @@ impl Storage {
 
         let users: Vec<User> = rows
             .into_iter()
-            .map(|(user_id, username, password_hash, email, role, public_key, created_at, last_login, is_active, metadata)| {
-                let role = role.parse().map_err(|e| DataChainError::StorageError(format!("invalid user role: {}", e)))?;
-                let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
-                    .map_err(|e| DataChainError::StorageError(format!("invalid user created_at: {}", e)))?
-                    .with_timezone(&chrono::Utc);
-                let last_login = last_login
-                    .map(|t| chrono::DateTime::parse_from_rfc3339(&t)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .map_err(|e| DataChainError::StorageError(format!("invalid user last_login: {}", e))))
-                    .transpose()?;
-                let metadata = serde_json::from_str(&metadata)
-                    .map_err(|e| DataChainError::StorageError(format!("invalid user metadata: {}", e)))?;
-                Ok(User {
-                    id: 0,
+            .map(
+                |(
                     user_id,
                     username,
                     password_hash,
@@ -291,8 +283,45 @@ impl Storage {
                     last_login,
                     is_active,
                     metadata,
-                })
-            })
+                )| {
+                    let role = role.parse().map_err(|e| {
+                        DataChainError::StorageError(format!("invalid user role: {}", e))
+                    })?;
+                    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|e| {
+                            DataChainError::StorageError(format!("invalid user created_at: {}", e))
+                        })?
+                        .with_timezone(&chrono::Utc);
+                    let last_login = last_login
+                        .map(|t| {
+                            chrono::DateTime::parse_from_rfc3339(&t)
+                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                .map_err(|e| {
+                                    DataChainError::StorageError(format!(
+                                        "invalid user last_login: {}",
+                                        e
+                                    ))
+                                })
+                        })
+                        .transpose()?;
+                    let metadata = serde_json::from_str(&metadata).map_err(|e| {
+                        DataChainError::StorageError(format!("invalid user metadata: {}", e))
+                    })?;
+                    Ok(User {
+                        id: 0,
+                        user_id,
+                        username,
+                        password_hash,
+                        email,
+                        role,
+                        public_key,
+                        created_at,
+                        last_login,
+                        is_active,
+                        metadata,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
 
         Ok(users)
@@ -333,12 +362,8 @@ impl Storage {
 
         let versions: Vec<Version> = rows
             .into_iter()
-            .map(|(version_id, timestamp, file_path, content_hash, size, author, message, parent_version)| {
-                let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
-                    .map_err(|e| DataChainError::StorageError(format!("invalid version timestamp: {}", e)))?
-                    .with_timezone(&chrono::Utc);
-                Ok(Version {
-                    id: 0,
+            .map(
+                |(
                     version_id,
                     timestamp,
                     file_path,
@@ -347,8 +372,28 @@ impl Storage {
                     author,
                     message,
                     parent_version,
-                })
-            })
+                )| {
+                    let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                        .map_err(|e| {
+                            DataChainError::StorageError(format!(
+                                "invalid version timestamp: {}",
+                                e
+                            ))
+                        })?
+                        .with_timezone(&chrono::Utc);
+                    Ok(Version {
+                        id: 0,
+                        version_id,
+                        timestamp,
+                        file_path,
+                        content_hash,
+                        size,
+                        author,
+                        message,
+                        parent_version,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
 
         Ok(versions)
@@ -357,13 +402,11 @@ impl Storage {
     /// 保存待打包元数据。
     pub async fn save_pending_metadata(&self, entry: &MetadataEntry) -> Result<()> {
         let data = serde_json::to_string(entry)?;
-        sqlx::query(
-            "INSERT OR REPLACE INTO pending_metadata (data_id, data) VALUES (?, ?)",
-        )
-        .bind(&entry.data_id)
-        .bind(data)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT OR REPLACE INTO pending_metadata (data_id, data) VALUES (?, ?)")
+            .bind(&entry.data_id)
+            .bind(data)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -408,17 +451,18 @@ impl Storage {
             .bind(summary_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|_| DataChainError::AggregationFailed(format!("aggregation not found: {}", summary_id)))?;
+            .map_err(|_| {
+                DataChainError::AggregationFailed(format!("aggregation not found: {}", summary_id))
+            })?;
         Ok(serde_json::from_str(&row.0)?)
     }
 
     /// 获取全部聚合结果，按创建时间恢复历史顺序。
     pub async fn get_all_aggregations(&self) -> Result<Vec<AggregationSummary>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM aggregations ORDER BY created_at ASC, summary_id ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data FROM aggregations ORDER BY created_at ASC, summary_id ASC")
+                .fetch_all(&self.pool)
+                .await?;
         rows.into_iter()
             .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
             .collect()
@@ -461,7 +505,10 @@ mod tests {
 
         storage.save_pending_metadata(&entry).await.unwrap();
         assert_eq!(storage.get_pending_metadata().await.unwrap().len(), 1);
-        storage.delete_pending_metadata(&entry.data_id).await.unwrap();
+        storage
+            .delete_pending_metadata(&entry.data_id)
+            .await
+            .unwrap();
         assert!(storage.get_pending_metadata().await.unwrap().is_empty());
     }
 
@@ -484,7 +531,14 @@ mod tests {
         };
 
         storage.save_aggregation(&summary).await.unwrap();
-        assert_eq!(storage.get_aggregation("summary-1").await.unwrap().summary_id, "summary-1");
+        assert_eq!(
+            storage
+                .get_aggregation("summary-1")
+                .await
+                .unwrap()
+                .summary_id,
+            "summary-1"
+        );
         assert_eq!(storage.get_all_aggregations().await.unwrap().len(), 1);
     }
 }

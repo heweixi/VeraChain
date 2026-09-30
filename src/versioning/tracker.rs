@@ -29,7 +29,13 @@ pub struct Version {
 
 impl Version {
     /// 创建新版本
-    pub fn new(file_path: String, content_hash: String, size: i64, author: String, message: String) -> Self {
+    pub fn new(
+        file_path: String,
+        content_hash: String,
+        size: i64,
+        author: String,
+        message: String,
+    ) -> Self {
         Self {
             id: 0,
             version_id: uuid::Uuid::new_v4().to_string(),
@@ -137,7 +143,12 @@ impl VersionTracker {
     }
 
     /// 追踪目录下所有文件
-    pub fn track_directory(&self, dir_path: &str, patterns: &[String], author: &str) -> Result<Vec<Version>> {
+    pub fn track_directory(
+        &self,
+        dir_path: &str,
+        patterns: &[String],
+        author: &str,
+    ) -> Result<Vec<Version>> {
         let mut versions = Vec::new();
 
         let path = Path::new(dir_path);
@@ -226,17 +237,31 @@ impl VersionTracker {
         let version = self
             .get_version(version_id)
             .ok_or_else(|| DataChainError::VersionNotFound(version_id.to_string()))?;
-        self.content_storage.retrieve_content(&version.content_hash).map_err(Into::into)
+        self.content_storage
+            .retrieve_content(&version.content_hash)
+            .map_err(Into::into)
     }
 
     /// 使用两个版本的历史快照计算文本差异，不依赖当前文件内容。
-    pub fn get_version_diff(&self, old_version_id: &str, new_version_id: &str) -> Result<DiffResult> {
-        let old_content = String::from_utf8(self.get_version_content(old_version_id)?).map_err(|_| {
-            DataChainError::StorageError(format!("版本 {} 的快照不是有效 UTF-8 文本", old_version_id))
-        })?;
-        let new_content = String::from_utf8(self.get_version_content(new_version_id)?).map_err(|_| {
-            DataChainError::StorageError(format!("版本 {} 的快照不是有效 UTF-8 文本", new_version_id))
-        })?;
+    pub fn get_version_diff(
+        &self,
+        old_version_id: &str,
+        new_version_id: &str,
+    ) -> Result<DiffResult> {
+        let old_content =
+            String::from_utf8(self.get_version_content(old_version_id)?).map_err(|_| {
+                DataChainError::StorageError(format!(
+                    "版本 {} 的快照不是有效 UTF-8 文本",
+                    old_version_id
+                ))
+            })?;
+        let new_content =
+            String::from_utf8(self.get_version_content(new_version_id)?).map_err(|_| {
+                DataChainError::StorageError(format!(
+                    "版本 {} 的快照不是有效 UTF-8 文本",
+                    new_version_id
+                ))
+            })?;
 
         Ok(DiffCalculator::compute_version_diff(
             old_version_id,
@@ -251,7 +276,10 @@ impl VersionTracker {
         let mut versions = self.versions.write();
         let mut removed = false;
         for file_versions in versions.values_mut() {
-            if let Some(pos) = file_versions.iter().position(|version| version.version_id == version_id) {
+            if let Some(pos) = file_versions
+                .iter()
+                .position(|version| version.version_id == version_id)
+            {
                 file_versions.remove(pos);
                 removed = true;
                 break;
@@ -314,12 +342,21 @@ mod tests {
         std::fs::write(&file, "first\n").unwrap();
 
         let tracker = VersionTracker::new_with_content_dir(snapshot_dir.path()).unwrap();
-        let first = tracker.track_file(file.to_str().unwrap(), "tester", "initial").unwrap();
-        assert_eq!(tracker.get_version_content(&first.version_id).unwrap(), b"first\n");
+        let first = tracker
+            .track_file(file.to_str().unwrap(), "tester", "initial")
+            .unwrap();
+        assert_eq!(
+            tracker.get_version_content(&first.version_id).unwrap(),
+            b"first\n"
+        );
 
         std::fs::write(&file, "second\n").unwrap();
-        let second = tracker.track_file(file.to_str().unwrap(), "tester", "update").unwrap();
-        let diff = tracker.get_version_diff(&first.version_id, &second.version_id).unwrap();
+        let second = tracker
+            .track_file(file.to_str().unwrap(), "tester", "update")
+            .unwrap();
+        let diff = tracker
+            .get_version_diff(&first.version_id, &second.version_id)
+            .unwrap();
         assert_eq!(diff.old_version, first.version_id);
         assert_eq!(diff.new_version, second.version_id);
         assert_eq!(diff.modifications, 1);

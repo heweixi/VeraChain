@@ -51,9 +51,14 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
     }
 
     match action {
-        UserAction::Create { username, password, email, role } => {
+        UserAction::Create {
+            username,
+            password,
+            email,
+            role,
+        } => {
             let role: Role = role.parse().unwrap_or(Role::User);
-            
+
             let req = RegisterRequest {
                 username: username.clone(),
                 password,
@@ -89,26 +94,24 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 );
             }
         }
-        UserAction::Get { username } => {
-            match auth_service.get_user(&username) {
-                Ok(user) => {
-                    println!("用户详情");
-                    println!("========");
-                    println!("用户 ID: {}", user.user_id);
-                    println!("用户名: {}", user.username);
-                    println!("邮箱: {}", user.email);
-                    println!("角色: {}", user.role);
-                    println!("状态: {}", if user.is_active { "活跃" } else { "停用" });
-                    println!("创建时间: {}", user.created_at);
-                    if let Some(last_login) = user.last_login {
-                        println!("最后登录: {}", last_login);
-                    }
-                }
-                Err(e) => {
-                    println!("✗ 用户未找到: {}", e);
+        UserAction::Get { username } => match auth_service.get_user(&username) {
+            Ok(user) => {
+                println!("用户详情");
+                println!("========");
+                println!("用户 ID: {}", user.user_id);
+                println!("用户名: {}", user.username);
+                println!("邮箱: {}", user.email);
+                println!("角色: {}", user.role);
+                println!("状态: {}", if user.is_active { "活跃" } else { "停用" });
+                println!("创建时间: {}", user.created_at);
+                if let Some(last_login) = user.last_login {
+                    println!("最后登录: {}", last_login);
                 }
             }
-        }
+            Err(e) => {
+                println!("✗ 用户未找到: {}", e);
+            }
+        },
         UserAction::Login { username, password } => {
             let req = LoginRequest { username, password };
 

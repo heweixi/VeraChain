@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// 构建 Merkle 根
 pub fn build_merkle_root(hashes: &[String]) -> String {
@@ -180,7 +180,10 @@ mod tests {
         );
         assert_eq!(
             build_merkle_root(&[
-                "a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
             ]),
             "12a40550c10c6339bf6f271445270e49b844d6c9e8abc36b9b642be532befe94"
         );
@@ -198,10 +201,10 @@ mod tests {
     fn test_merkle_proof() {
         let data = vec!["a", "b", "c", "d"];
         let tree = MerkleTree::from_data(&data);
-        
+
         let proof = tree.get_proof(0);
         let leaf_hash = &tree.leaves()[0];
-        
+
         assert!(MerkleTree::verify_proof(leaf_hash, &proof, tree.root()));
     }
 }

@@ -82,15 +82,24 @@ pub async fn register(
             if let Err(e) = state.storage.save_user(&user).await {
                 state.auth_service.remove_user(&user.user_id);
                 tracing::error!("保存用户失败: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(e.to_string())),
+                ));
             }
             state.event_bus.publish(Event::new(
                 EventType::UserRegistered,
                 serde_json::to_value(user.to_public()).unwrap_or_else(|_| serde_json::json!({})),
             ));
-            Ok((StatusCode::CREATED, Json(ApiResponse::success(user.to_public()))))
+            Ok((
+                StatusCode::CREATED,
+                Json(ApiResponse::success(user.to_public())),
+            ))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -100,7 +109,10 @@ pub async fn login(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.auth_service.login(&req) {
         Ok(resp) => Ok((StatusCode::OK, Json(ApiResponse::success(resp)))),
-        Err(e) => Err((StatusCode::UNAUTHORIZED, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -110,7 +122,10 @@ pub async fn get_profile(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.auth_service.get_user_by_id(&claims.sub) {
         Ok(user) => Ok(Json(ApiResponse::success(user.to_public()))),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -125,7 +140,10 @@ pub async fn refresh_token(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.auth_service.refresh_token(&req.refresh_token) {
         Ok(resp) => Ok(Json(ApiResponse::success(resp))),
-        Err(e) => Err((StatusCode::UNAUTHORIZED, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -141,7 +159,10 @@ pub async fn create_metadata(
             if let Err(e) = state.storage.save_pending_metadata(&entry).await {
                 state.chain.remove_pending_metadata(&entry.data_id);
                 tracing::error!("保存待打包元数据失败: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(e.to_string())),
+                ));
             }
             state.event_bus.publish(Event::new(
                 EventType::MetadataCreated,
@@ -149,7 +170,10 @@ pub async fn create_metadata(
             ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(entry))))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -159,7 +183,10 @@ pub async fn get_metadata(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.metadata_manager.get_by_data_id(&data_id) {
         Some(entry) => Ok(Json(ApiResponse::success(entry))),
-        None => Err((StatusCode::NOT_FOUND, Json(ApiResponse::error("metadata not found")))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("metadata not found")),
+        )),
     }
 }
 
@@ -218,11 +245,16 @@ pub async fn get_block(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.chain.get_block(index) {
         Ok(block) => Ok(Json(ApiResponse::success(block))),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
-pub async fn get_chain_info(State(state): State<AppState>) -> Json<ApiResponse<crate::core::ChainInfo>> {
+pub async fn get_chain_info(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<crate::core::ChainInfo>> {
     let info = state.chain.get_chain_info();
     Json(ApiResponse::success(info))
 }
@@ -233,7 +265,10 @@ pub async fn mine_block(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     // 检查权限
     if claims.role != "admin" && claims.role != "user" {
-        return Err((StatusCode::FORBIDDEN, Json(ApiResponse::error("permission denied"))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error("permission denied")),
+        ));
     }
 
     match state.chain.mine_block() {
@@ -242,14 +277,20 @@ pub async fn mine_block(
             if let Err(e) = state.storage.save_block(&block).await {
                 state.chain.rollback_mined_block(&block);
                 tracing::error!("保存区块失败: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(e.to_string())),
+                ));
             }
 
             // 区块落库后再删除对应 pending。两者不是同一 SQLite 事务，删除失败必须显式返回错误。
             for entry in &block.metadata_list {
                 if let Err(e) = state.storage.delete_pending_metadata(&entry.data_id).await {
                     tracing::error!("删除已打包元数据失败: {}", e);
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error(e.to_string())),
+                    ));
                 }
             }
             state.event_bus.publish(Event::new(
@@ -258,7 +299,10 @@ pub async fn mine_block(
             ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(block))))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -276,7 +320,10 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
         EventType::ChainValidated,
         serde_json::json!({ "valid": valid, "block_count": block_count }),
     ));
-    Json(ApiResponse::success(ValidateResponse { valid, block_count }))
+    Json(ApiResponse::success(ValidateResponse {
+        valid,
+        block_count,
+    }))
 }
 
 // ==================== 版本处理器 ====================
@@ -301,7 +348,10 @@ pub async fn get_version(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.version_tracker.get_version(&version_id) {
         Some(version) => Ok(Json(ApiResponse::success(version))),
-        None => Err((StatusCode::NOT_FOUND, Json(ApiResponse::error("version not found")))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("version not found")),
+        )),
     }
 }
 
@@ -316,7 +366,9 @@ pub enum VersionPathValidationError {
 impl VersionPathValidationError {
     fn response(self) -> (StatusCode, Json<ApiResponse<()>>) {
         match self {
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(message))),
+            Self::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, Json(ApiResponse::error(message)))
+            }
             Self::Forbidden(message) => (StatusCode::FORBIDDEN, Json(ApiResponse::error(message))),
         }
     }
@@ -330,7 +382,10 @@ pub fn validate_version_path(file_path: &str) -> Result<PathBuf, VersionPathVali
             "file_path 不能为空".to_string(),
         ));
     }
-    if input.components().any(|component| component == Component::ParentDir) {
+    if input
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
         return Err(VersionPathValidationError::BadRequest(
             "file_path 包含不允许的路径穿越组件".to_string(),
         ));
@@ -338,14 +393,9 @@ pub fn validate_version_path(file_path: &str) -> Result<PathBuf, VersionPathVali
 
     let configured_root = std::env::var_os("DATACHAIN_VERSION_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        });
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let root = fs::canonicalize(&configured_root).map_err(|error| {
-        VersionPathValidationError::Forbidden(format!(
-            "版本根目录不可用: {}",
-            error
-        ))
+        VersionPathValidationError::Forbidden(format!("版本根目录不可用: {}", error))
     })?;
     let candidate = if input.is_absolute() {
         input.to_path_buf()
@@ -420,22 +470,30 @@ pub async fn track_version(
     Extension(claims): Extension<Claims>,
     Json(req): Json<TrackVersionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let safe_path = validate_version_path(&req.file_path).map_err(VersionPathValidationError::response)?;
+    let safe_path =
+        validate_version_path(&req.file_path).map_err(VersionPathValidationError::response)?;
     let safe_path = safe_path.to_string_lossy().into_owned();
     let previous_version_id = state
         .version_tracker
         .get_latest_version(&safe_path)
         .map(|version| version.version_id);
 
-    match state.version_tracker.track_file(&safe_path, &claims.username, &req.message) {
+    match state
+        .version_tracker
+        .track_file(&safe_path, &claims.username, &req.message)
+    {
         Ok(version) => {
             // 同内容返回既有版本；只有真正的新版本才写入数据库，避免重复 version_id 冲突。
-            let is_new_version = previous_version_id.as_deref() != Some(version.version_id.as_str());
+            let is_new_version =
+                previous_version_id.as_deref() != Some(version.version_id.as_str());
             if is_new_version {
                 if let Err(e) = state.storage.save_version(&version).await {
                     state.version_tracker.remove_version(&version.version_id);
                     tracing::error!("保存版本失败: {}", e);
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error(e.to_string())),
+                    ));
                 }
             }
             state.event_bus.publish(Event::new(
@@ -444,7 +502,10 @@ pub async fn track_version(
             ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(version))))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string())))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )),
     }
 }
 
@@ -452,7 +513,8 @@ pub async fn get_version_history(
     State(state): State<AppState>,
     Path(file_path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let safe_path = validate_version_path(&file_path).map_err(VersionPathValidationError::response)?;
+    let safe_path =
+        validate_version_path(&file_path).map_err(VersionPathValidationError::response)?;
     let safe_path = safe_path.to_string_lossy();
     let versions = state.version_tracker.get_version_history(&safe_path);
     let total = versions.len();
@@ -469,24 +531,36 @@ pub async fn get_version_diff(
     State(state): State<AppState>,
     Path((old_version_id, new_version_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.version_tracker.get_version_diff(&old_version_id, &new_version_id) {
+    match state
+        .version_tracker
+        .get_version_diff(&old_version_id, &new_version_id)
+    {
         Ok(diff) => Ok(Json(ApiResponse::success(diff))),
         Err(crate::error::DataChainError::VersionNotFound(version_id)) => Err((
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::error(format!("version not found: {}", version_id))),
+            Json(ApiResponse::error(format!(
+                "version not found: {}",
+                version_id
+            ))),
         )),
         Err(crate::error::DataChainError::IoError(error))
-            if error.kind() == std::io::ErrorKind::NotFound => Err((
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Err((
                 StatusCode::NOT_FOUND,
                 Json(ApiResponse::error("版本内容快照不可用")),
-            )),
+            ))
+        }
         Err(crate::error::DataChainError::StorageError(message)) => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ApiResponse::error(message)),
         )),
         Err(error) => {
             tracing::error!("读取版本快照失败: {}", error);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(error.to_string()))))
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(error.to_string())),
+            ))
         }
     }
 }
@@ -507,7 +581,9 @@ pub async fn get_aggregations(
     })
 }
 
-pub async fn aggregation_status(State(state): State<AppState>) -> Json<ApiResponse<crate::aggregation::SchedulerStatus>> {
+pub async fn aggregation_status(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<crate::aggregation::SchedulerStatus>> {
     Json(ApiResponse::success(state.scheduler.get_status()))
 }
 
@@ -535,9 +611,14 @@ pub async fn trigger_aggregation(
     match state.aggregation_engine.aggregate(strategy) {
         Some(summary) => {
             if let Err(e) = state.storage.save_aggregation(&summary).await {
-                state.aggregation_engine.remove_aggregation(&summary.summary_id);
+                state
+                    .aggregation_engine
+                    .remove_aggregation(&summary.summary_id);
                 tracing::error!("保存聚合结果失败: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(e.to_string())),
+                ));
             }
             state.event_bus.publish(Event::new(
                 EventType::AggregationDone,
@@ -545,13 +626,18 @@ pub async fn trigger_aggregation(
             ));
             Ok((StatusCode::CREATED, Json(ApiResponse::success(summary))))
         }
-        None => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("aggregation failed or no data")))),
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("aggregation failed or no data")),
+        )),
     }
 }
 
 // ==================== P2P 同步处理器 ====================
 
-pub async fn list_peers(State(state): State<AppState>) -> Json<ApiResponse<Vec<crate::p2p::PeerInfo>>> {
+pub async fn list_peers(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<crate::p2p::PeerInfo>>> {
     Json(ApiResponse::success(state.p2p.list_peers()))
 }
 
@@ -561,7 +647,10 @@ pub async fn register_peer(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.p2p.register_peer(req) {
         Ok(peer) => Ok((StatusCode::CREATED, Json(ApiResponse::success(peer)))),
-        Err(error) => Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(error.to_string())))),
+        Err(error) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(error.to_string())),
+        )),
     }
 }
 
@@ -573,7 +662,10 @@ pub async fn export_blocks(
     let start = query.start.max(0) as usize;
     let total = state.chain.get_block_count();
     if start > total {
-        return Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error("sync start is beyond local chain"))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("sync start is beyond local chain")),
+        ));
     }
     Ok(Json(SyncBlocksResponse {
         start: start as i64,
@@ -589,16 +681,25 @@ pub async fn import_blocks(
     let mut imported = 0usize;
     for block in req.blocks {
         if let Err(error) = state.chain.add_block(block.clone()) {
-            return Err((StatusCode::CONFLICT, Json(ApiResponse::error(format!(
-                "block sync rejected after {} blocks: {}", imported, error
-            )))));
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(format!(
+                    "block sync rejected after {} blocks: {}",
+                    imported, error
+                ))),
+            ));
         }
         if let Err(error) = state.storage.save_block(&block).await {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(error.to_string()))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(error.to_string())),
+            ));
         }
         imported += 1;
     }
-    Ok(Json(ApiResponse::success(serde_json::json!({ "imported": imported }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "imported": imported }),
+    )))
 }
 
 pub async fn sync_peer(
@@ -607,7 +708,10 @@ pub async fn sync_peer(
 ) -> Result<Json<ApiResponse<crate::p2p::SyncReport>>, (StatusCode, Json<ApiResponse<()>>)> {
     match state.p2p.sync_peer(&peer_id, &state.chain).await {
         Ok(report) => Ok(Json(ApiResponse::success(report))),
-        Err(error) => Err((StatusCode::BAD_GATEWAY, Json(ApiResponse::error(error.to_string())))),
+        Err(error) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse::error(error.to_string())),
+        )),
     }
 }
 
@@ -645,7 +749,13 @@ pub async fn get_block_by_hash(
             return Ok(Json(ApiResponse::success(block)));
         }
     }
-    Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(format!("block not found with hash: {}", hash)))))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ApiResponse::error(format!(
+            "block not found with hash: {}",
+            hash
+        ))),
+    ))
 }
 
 /// 获取内容的 Merkle 证明
@@ -670,7 +780,7 @@ pub async fn get_proof(
     Path(sha256): Path<String>,
 ) -> Json<ProofResponse> {
     let blocks = state.chain.get_all_blocks();
-    
+
     for block in &blocks {
         // Check attestations array
         for att in &block.attestations {
@@ -722,7 +832,10 @@ mod version_path_tests {
     #[test]
     fn rejects_path_traversal_before_filesystem_access() {
         let result = validate_version_path("../outside.txt");
-        assert!(matches!(result, Err(VersionPathValidationError::BadRequest(_))));
+        assert!(matches!(
+            result,
+            Err(VersionPathValidationError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -730,7 +843,10 @@ mod version_path_tests {
         let root = std::env::current_dir().unwrap();
         let directory = tempfile::tempdir_in(root).unwrap();
         let result = validate_version_path(directory.path().to_str().unwrap());
-        assert!(matches!(result, Err(VersionPathValidationError::BadRequest(_))));
+        assert!(matches!(
+            result,
+            Err(VersionPathValidationError::BadRequest(_))
+        ));
     }
 
     #[test]

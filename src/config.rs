@@ -58,17 +58,39 @@ pub struct LogConfig {
 }
 
 // 默认值函数
-fn default_port() -> u16 { 8080 }
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_difficulty() -> u32 { 4 }
-fn default_block_size() -> usize { 100 }
-fn default_driver() -> String { "sqlite".to_string() }
-fn default_dsn() -> String { "./data/datachain.db".to_string() }
-fn default_secret() -> String { "datachain-secret-key-change-in-production".to_string() }
-fn default_expire() -> u64 { 24 }
-fn default_time_interval() -> u64 { 3600 }
-fn default_count_threshold() -> usize { 1000 }
-fn default_log_level() -> String { "info".to_string() }
+fn default_port() -> u16 {
+    8080
+}
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_difficulty() -> u32 {
+    4
+}
+fn default_block_size() -> usize {
+    100
+}
+fn default_driver() -> String {
+    "sqlite".to_string()
+}
+fn default_dsn() -> String {
+    "./data/datachain.db".to_string()
+}
+fn default_secret() -> String {
+    "datachain-secret-key-change-in-production".to_string()
+}
+fn default_expire() -> u64 {
+    24
+}
+fn default_time_interval() -> u64 {
+    3600
+}
+fn default_count_threshold() -> usize {
+    1000
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {

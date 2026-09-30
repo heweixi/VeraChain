@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use std::time::Duration;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -135,5 +135,8 @@ pub fn create_scheduler(
     engine: Arc<AggregationEngine>,
     check_interval_secs: u64,
 ) -> Arc<Scheduler> {
-    Arc::new(Scheduler::new(engine, Duration::from_secs(check_interval_secs)))
+    Arc::new(Scheduler::new(
+        engine,
+        Duration::from_secs(check_interval_secs),
+    ))
 }

@@ -8,9 +8,9 @@ use crate::error::{DataChainError, Result};
 
 /// 认证服务
 pub struct AuthService {
-    users: RwLock<HashMap<String, User>>,           // user_id -> User
+    users: RwLock<HashMap<String, User>>, // user_id -> User
     username_index: RwLock<HashMap<String, String>>, // username -> user_id
-    email_index: RwLock<HashMap<String, String>>,    // email -> user_id
+    email_index: RwLock<HashMap<String, String>>, // email -> user_id
     jwt_handler: JwtHandler,
 }
 
@@ -49,16 +49,11 @@ impl AuthService {
         }
 
         // 哈希密码
-        let password_hash = hash_password(&req.password)
-            .map_err(|e| DataChainError::Internal(e.to_string()))?;
+        let password_hash =
+            hash_password(&req.password).map_err(|e| DataChainError::Internal(e.to_string()))?;
 
         // 创建用户
-        let user = User::new(
-            req.username.clone(),
-            password_hash,
-            req.email.clone(),
-            role,
-        );
+        let user = User::new(req.username.clone(), password_hash, req.email.clone(), role);
 
         // 存储用户
         {
@@ -111,11 +106,9 @@ impl AuthService {
         }
 
         // 生成令牌
-        let token_pair = self.jwt_handler.generate_token_pair(
-            &user.user_id,
-            &user.username,
-            user.role,
-        )?;
+        let token_pair =
+            self.jwt_handler
+                .generate_token_pair(&user.user_id, &user.username, user.role)?;
 
         Ok(LoginResponse {
             token: token_pair.access_token,
@@ -143,11 +136,9 @@ impl AuthService {
                 .ok_or(DataChainError::UserNotFound(user_id.clone()))?
         };
 
-        let token_pair = self.jwt_handler.generate_token_pair(
-            &user.user_id,
-            &user.username,
-            user.role,
-        )?;
+        let token_pair =
+            self.jwt_handler
+                .generate_token_pair(&user.user_id, &user.username, user.role)?;
 
         Ok(LoginResponse {
             token: token_pair.access_token,

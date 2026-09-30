@@ -63,10 +63,8 @@ mod tests {
     use super::*;
 
     // 与 BLOCK_HASH_SPEC.md 第 6 节一致的黄金向量
-    const GOLDEN_A: &str =
-        "00c70da3ef00282af337628b29198c5168478082a97396a255346c30a0a45e93";
-    const GOLDEN_B: &str =
-        "48ecfe3fa4bbcaeccc3923314be8169e9311c714ccc84eae59e639c50b8fee46";
+    const GOLDEN_A: &str = "00c70da3ef00282af337628b29198c5168478082a97396a255346c30a0a45e93";
+    const GOLDEN_B: &str = "48ecfe3fa4bbcaeccc3923314be8169e9311c714ccc84eae59e639c50b8fee46";
 
     #[test]
     fn test_canonical_string_vectors() {
@@ -104,8 +102,7 @@ mod tests {
     // 元数据叶子(SHA256(data_id)) + merkle 黄金向量(BLOCK_HASH_SPEC 第10节 v1)
     #[test]
     fn test_metadata_leaf_merkle_golden() {
-        const LEAF_M1: &str =
-            "ca0df2c95aa144c1d0ff2ff3c8f967fdc1de9ef0c4120b3726416701b519d619";
+        const LEAF_M1: &str = "ca0df2c95aa144c1d0ff2ff3c8f967fdc1de9ef0c4120b3726416701b519d619";
         assert_eq!(metadata_leaf_hash("m1"), LEAF_M1);
 
         let root = |ids: &[&str]| -> String {

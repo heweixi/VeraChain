@@ -59,22 +59,28 @@ pub async fn run_version(config: &AppConfig, action: VersionAction) -> anyhow::R
     }
 
     match action {
-        VersionAction::Track { file, author, message } => {
-            match tracker.track_file(&file, &author, &message) {
-                Ok(version) => {
-                    storage.save_version(&version).await?;
-                    println!("✓ 文件已追踪");
-                    println!("  版本 ID: {}", version.version_id);
-                    println!("  文件: {}", version.file_path);
-                    println!("  哈希: {}", version.content_hash);
-                    println!("  大小: {} bytes", version.size);
-                }
-                Err(e) => {
-                    println!("✗ 追踪失败: {}", e);
-                }
+        VersionAction::Track {
+            file,
+            author,
+            message,
+        } => match tracker.track_file(&file, &author, &message) {
+            Ok(version) => {
+                storage.save_version(&version).await?;
+                println!("✓ 文件已追踪");
+                println!("  版本 ID: {}", version.version_id);
+                println!("  文件: {}", version.file_path);
+                println!("  哈希: {}", version.content_hash);
+                println!("  大小: {} bytes", version.size);
             }
-        }
-        VersionAction::TrackDir { dir, pattern, author } => {
+            Err(e) => {
+                println!("✗ 追踪失败: {}", e);
+            }
+        },
+        VersionAction::TrackDir {
+            dir,
+            pattern,
+            author,
+        } => {
             let patterns: Vec<String> = pattern
                 .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default();
@@ -121,22 +127,20 @@ pub async fn run_version(config: &AppConfig, action: VersionAction) -> anyhow::R
                 );
             }
         }
-        VersionAction::Diff { old, new } => {
-            match tracker.get_version_diff(&old, &new) {
-                Ok(diff) => {
-                    println!("版本差异");
-                    println!("========");
-                    println!("旧版本: {}", diff.old_version);
-                    println!("新版本: {}", diff.new_version);
-                    println!("添加: {} 行", diff.additions);
-                    println!("删除: {} 行", diff.deletions);
-                    println!("修改: {} 行", diff.modifications);
-                }
-                Err(e) => {
-                    println!("✗ 无法读取版本快照: {}", e);
-                }
+        VersionAction::Diff { old, new } => match tracker.get_version_diff(&old, &new) {
+            Ok(diff) => {
+                println!("版本差异");
+                println!("========");
+                println!("旧版本: {}", diff.old_version);
+                println!("新版本: {}", diff.new_version);
+                println!("添加: {} 行", diff.additions);
+                println!("删除: {} 行", diff.deletions);
+                println!("修改: {} 行", diff.modifications);
             }
-        }
+            Err(e) => {
+                println!("✗ 无法读取版本快照: {}", e);
+            }
+        },
         VersionAction::Stats => {
             let stats = tracker.get_statistics();
             println!("版本统计");
