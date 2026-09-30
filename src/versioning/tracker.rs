@@ -1,14 +1,16 @@
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{DataChainError, Result};
+
+use super::{ContentStorage, DiffCalculator, DiffResult};
 
 /// 版本记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,46 +47,72 @@ impl Version {
 /// 版本追踪器
 pub struct VersionTracker {
     versions: RwLock<HashMap<String, Vec<Version>>>, // file_path -> versions
+    content_storage: Arc<ContentStorage>,
 }
 
 impl VersionTracker {
-    /// 创建版本追踪器
+    /// 创建版本追踪器，快照目录由 DATACHAIN_VERSION_CONTENT_DIR 配置。
     pub fn new() -> Self {
+        Self::try_new().expect("无法初始化版本内容快照存储，请检查 DATACHAIN_VERSION_CONTENT_DIR")
+    }
+
+    /// 创建版本追踪器；用于需要显式处理快照目录初始化错误的调用方。
+    pub fn try_new() -> Result<Self> {
+        let content_storage = ContentStorage::from_env()?;
+        Ok(Self::with_content_storage(Arc::new(content_storage)))
+    }
+
+    /// 使用指定目录创建版本追踪器。
+    pub fn new_with_content_dir(storage_dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let content_storage = ContentStorage::new(storage_dir)?;
+        Ok(Self::with_content_storage(Arc::new(content_storage)))
+    }
+
+    /// 使用已有内容存储创建版本追踪器。
+    pub fn with_content_storage(content_storage: Arc<ContentStorage>) -> Self {
         Self {
             versions: RwLock::new(HashMap::new()),
+            content_storage,
         }
     }
 
-    /// 追踪文件变更
+    /// 返回快照存储目录路径。
+    pub fn content_storage_dir(&self) -> PathBuf {
+        PathBuf::from(self.content_storage.get_storage_stats().storage_dir)
+    }
+
+    /// 追踪文件变更，同时保存该版本的不可变内容快照。
     pub fn track_file(&self, file_path: &str, author: &str, message: &str) -> Result<Version> {
         let path = Path::new(file_path);
-        
-        // 读取文件
+
         let mut file = File::open(path)?;
         let mut content = Vec::new();
         file.read_to_end(&mut content)?;
 
-        // 获取文件信息
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len() as i64;
-
-        // 计算哈希
+        let size = content.len() as i64;
         let mut hasher = Sha256::new();
         hasher.update(&content);
         let content_hash = hex::encode(hasher.finalize());
 
-        // 检查是否有变更
+        // 无论是否新建元数据，都确保已有版本的内容快照存在。
+        // 这也允许为从旧数据库恢复、但尚未有快照的版本补齐内容。
+        let stored_hash = self.content_storage.store_content(&content)?;
+        if stored_hash != content_hash {
+            return Err(DataChainError::StorageError(
+                "内容快照哈希与版本内容哈希不一致".to_string(),
+            ));
+        }
+
         let versions = self.versions.read();
         if let Some(file_versions) = versions.get(file_path) {
             if let Some(last) = file_versions.last() {
                 if last.content_hash == content_hash {
-                    return Ok(last.clone()); // 无变更
+                    return Ok(last.clone());
                 }
             }
         }
         drop(versions);
 
-        // 创建新版本
         let mut version = Version::new(
             file_path.to_string(),
             content_hash,
@@ -93,7 +121,6 @@ impl VersionTracker {
             message.to_string(),
         );
 
-        // 设置父版本
         let mut versions = self.versions.write();
         if let Some(file_versions) = versions.get(file_path) {
             if let Some(last) = file_versions.last() {
@@ -101,7 +128,6 @@ impl VersionTracker {
             }
         }
 
-        // 保存版本
         versions
             .entry(file_path.to_string())
             .or_insert_with(Vec::new)
@@ -127,7 +153,6 @@ impl VersionTracker {
             let file_path = entry.path();
 
             if file_path.is_file() {
-                // 检查是否匹配模式
                 if !patterns.is_empty() {
                     let file_name = file_path.file_name().unwrap().to_string_lossy();
                     let matched = patterns.iter().any(|p| {
@@ -140,9 +165,10 @@ impl VersionTracker {
                     }
                 }
 
-                if let Ok(version) = self.track_file(file_path.to_str().unwrap(), author, "") {
-                    versions.push(version);
-                }
+                let file_path = file_path.to_str().ok_or_else(|| {
+                    DataChainError::StorageError("文件路径不是有效的 UTF-8 路径".to_string())
+                })?;
+                versions.push(self.track_file(file_path, author, "")?);
             }
         }
 
@@ -159,9 +185,9 @@ impl VersionTracker {
     pub fn get_version(&self, version_id: &str) -> Option<Version> {
         let versions = self.versions.read();
         for file_versions in versions.values() {
-            for v in file_versions {
-                if v.version_id == version_id {
-                    return Some(v.clone());
+            for version in file_versions {
+                if version.version_id == version_id {
+                    return Some(version.clone());
                 }
             }
         }
@@ -195,6 +221,31 @@ impl VersionTracker {
             .push(version);
     }
 
+    /// 按版本 ID 读取不可变内容快照，不会读取当前文件路径。
+    pub fn get_version_content(&self, version_id: &str) -> Result<Vec<u8>> {
+        let version = self
+            .get_version(version_id)
+            .ok_or_else(|| DataChainError::VersionNotFound(version_id.to_string()))?;
+        self.content_storage.retrieve_content(&version.content_hash).map_err(Into::into)
+    }
+
+    /// 使用两个版本的历史快照计算文本差异，不依赖当前文件内容。
+    pub fn get_version_diff(&self, old_version_id: &str, new_version_id: &str) -> Result<DiffResult> {
+        let old_content = String::from_utf8(self.get_version_content(old_version_id)?).map_err(|_| {
+            DataChainError::StorageError(format!("版本 {} 的快照不是有效 UTF-8 文本", old_version_id))
+        })?;
+        let new_content = String::from_utf8(self.get_version_content(new_version_id)?).map_err(|_| {
+            DataChainError::StorageError(format!("版本 {} 的快照不是有效 UTF-8 文本", new_version_id))
+        })?;
+
+        Ok(DiffCalculator::compute_version_diff(
+            old_version_id,
+            new_version_id,
+            &old_content,
+            &new_content,
+        ))
+    }
+
     /// 回滚尚未成功写入存储的新版本。
     pub fn remove_version(&self, version_id: &str) -> bool {
         let mut versions = self.versions.write();
@@ -214,15 +265,11 @@ impl VersionTracker {
     pub fn get_statistics(&self) -> VersionStatistics {
         let versions = self.versions.read();
         let total_versions: usize = versions.values().map(|v| v.len()).sum();
-        let total_size: i64 = versions
-            .values()
-            .flatten()
-            .map(|v| v.size)
-            .sum();
+        let total_size: i64 = versions.values().flatten().map(|v| v.size).sum();
 
         let mut authors: HashMap<String, usize> = HashMap::new();
-        for v in versions.values().flatten() {
-            *authors.entry(v.author.clone()).or_insert(0) += 1;
+        for version in versions.values().flatten() {
+            *authors.entry(version.author.clone()).or_insert(0) += 1;
         }
 
         VersionStatistics {
@@ -252,4 +299,49 @@ pub struct VersionStatistics {
 /// 创建共享的 VersionTracker 实例
 pub fn create_version_tracker() -> Arc<VersionTracker> {
     Arc::new(VersionTracker::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn track_file_saves_and_reads_snapshot() {
+        let source_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let file = source_dir.path().join("tracked.txt");
+        std::fs::write(&file, "first\n").unwrap();
+
+        let tracker = VersionTracker::new_with_content_dir(snapshot_dir.path()).unwrap();
+        let first = tracker.track_file(file.to_str().unwrap(), "tester", "initial").unwrap();
+        assert_eq!(tracker.get_version_content(&first.version_id).unwrap(), b"first\n");
+
+        std::fs::write(&file, "second\n").unwrap();
+        let second = tracker.track_file(file.to_str().unwrap(), "tester", "update").unwrap();
+        let diff = tracker.get_version_diff(&first.version_id, &second.version_id).unwrap();
+        assert_eq!(diff.old_version, first.version_id);
+        assert_eq!(diff.new_version, second.version_id);
+        assert_eq!(diff.modifications, 1);
+    }
+
+    #[test]
+    fn missing_snapshot_is_reported() {
+        let source_dir = tempdir().unwrap();
+        let snapshot_dir = tempdir().unwrap();
+        let file = source_dir.path().join("tracked.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let tracker = VersionTracker::new_with_content_dir(snapshot_dir.path()).unwrap();
+        let version = Version::new(
+            file.to_string_lossy().to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            7,
+            "tester".to_string(),
+            "loaded".to_string(),
+        );
+        let version_id = version.version_id.clone();
+        tracker.load_version(version);
+        assert!(tracker.get_version_content(&version_id).is_err());
+    }
 }

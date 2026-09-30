@@ -2,7 +2,7 @@ use clap::Subcommand;
 
 use crate::config::AppConfig;
 use crate::storage::create_storage;
-use crate::versioning::{create_version_tracker, DiffCalculator};
+use crate::versioning::create_version_tracker;
 
 #[derive(Subcommand)]
 pub enum VersionAction {
@@ -122,22 +122,8 @@ pub async fn run_version(config: &AppConfig, action: VersionAction) -> anyhow::R
             }
         }
         VersionAction::Diff { old, new } => {
-            let old_version = tracker.get_version(&old);
-            let new_version = tracker.get_version(&new);
-
-            match (old_version, new_version) {
-                (Some(old_v), Some(new_v)) => {
-                    // 读取文件内容
-                    let old_content = std::fs::read_to_string(&old_v.file_path).unwrap_or_default();
-                    let new_content = std::fs::read_to_string(&new_v.file_path).unwrap_or_default();
-
-                    let diff = DiffCalculator::compute_version_diff(
-                        &old_v.version_id,
-                        &new_v.version_id,
-                        &old_content,
-                        &new_content,
-                    );
-
+            match tracker.get_version_diff(&old, &new) {
+                Ok(diff) => {
                     println!("版本差异");
                     println!("========");
                     println!("旧版本: {}", diff.old_version);
@@ -146,8 +132,8 @@ pub async fn run_version(config: &AppConfig, action: VersionAction) -> anyhow::R
                     println!("删除: {} 行", diff.deletions);
                     println!("修改: {} 行", diff.modifications);
                 }
-                _ => {
-                    println!("✗ 版本未找到");
+                Err(e) => {
+                    println!("✗ 无法读取版本快照: {}", e);
                 }
             }
         }

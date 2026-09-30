@@ -5,6 +5,8 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Component, Path as FsPath, PathBuf};
 
 use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
@@ -302,6 +304,109 @@ pub async fn get_version(
     }
 }
 
+const MAX_VERSION_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum VersionPathValidationError {
+    BadRequest(String),
+    Forbidden(String),
+}
+
+impl VersionPathValidationError {
+    fn response(self) -> (StatusCode, Json<ApiResponse<()>>) {
+        match self {
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(message))),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, Json(ApiResponse::error(message))),
+        }
+    }
+}
+
+/// 校验版本 API 使用的文件路径，并返回可安全使用的 canonical 路径。
+pub fn validate_version_path(file_path: &str) -> Result<PathBuf, VersionPathValidationError> {
+    let input = FsPath::new(file_path);
+    if file_path.trim().is_empty() {
+        return Err(VersionPathValidationError::BadRequest(
+            "file_path 不能为空".to_string(),
+        ));
+    }
+    if input.components().any(|component| component == Component::ParentDir) {
+        return Err(VersionPathValidationError::BadRequest(
+            "file_path 包含不允许的路径穿越组件".to_string(),
+        ));
+    }
+
+    let configured_root = std::env::var_os("DATACHAIN_VERSION_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        });
+    let root = fs::canonicalize(&configured_root).map_err(|error| {
+        VersionPathValidationError::Forbidden(format!(
+            "版本根目录不可用: {}",
+            error
+        ))
+    })?;
+    let candidate = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        configured_root.join(input)
+    };
+
+    // 检查从目标文件到根路径的每个既存组件，拒绝通过符号链接访问文件。
+    let mut component_path = candidate.clone();
+    loop {
+        match fs::symlink_metadata(&component_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(VersionPathValidationError::Forbidden(
+                    "file_path 不允许包含符号链接".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(VersionPathValidationError::BadRequest(format!(
+                    "无法检查 file_path: {}",
+                    error
+                )));
+            }
+        }
+        if !component_path.pop() {
+            break;
+        }
+    }
+
+    let canonical = fs::canonicalize(&candidate).map_err(|error| {
+        VersionPathValidationError::BadRequest(format!("file_path 不可访问: {}", error))
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(VersionPathValidationError::Forbidden(
+            "file_path 必须位于 DATACHAIN_VERSION_ROOT 内".to_string(),
+        ));
+    }
+
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        VersionPathValidationError::BadRequest(format!("无法读取 file_path 元数据: {}", error))
+    })?;
+    if metadata.is_dir() {
+        return Err(VersionPathValidationError::BadRequest(
+            "file_path 必须指向文件，不能是目录".to_string(),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(VersionPathValidationError::BadRequest(
+            "file_path 必须指向普通文件".to_string(),
+        ));
+    }
+    if metadata.len() > MAX_VERSION_FILE_SIZE {
+        return Err(VersionPathValidationError::BadRequest(format!(
+            "file_path 文件大小超过 50 MiB 限制（{} bytes）",
+            metadata.len()
+        )));
+    }
+
+    Ok(canonical)
+}
+
 #[derive(Deserialize)]
 pub struct TrackVersionRequest {
     pub file_path: String,
@@ -314,20 +419,23 @@ pub async fn track_version(
     Extension(claims): Extension<Claims>,
     Json(req): Json<TrackVersionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let safe_path = validate_version_path(&req.file_path).map_err(VersionPathValidationError::response)?;
+    let safe_path = safe_path.to_string_lossy().into_owned();
     let previous_version_id = state
         .version_tracker
-        .get_latest_version(&req.file_path)
+        .get_latest_version(&safe_path)
         .map(|version| version.version_id);
-    match state.version_tracker.track_file(&req.file_path, &claims.username, &req.message) {
+
+    match state.version_tracker.track_file(&safe_path, &claims.username, &req.message) {
         Ok(version) => {
-            // 同内容会返回既有版本，不应在持久化失败时移除它。
+            // 同内容返回既有版本；只有真正的新版本才写入数据库，避免重复 version_id 冲突。
             let is_new_version = previous_version_id.as_deref() != Some(version.version_id.as_str());
-            if let Err(e) = state.storage.save_version(&version).await {
-                if is_new_version {
+            if is_new_version {
+                if let Err(e) = state.storage.save_version(&version).await {
                     state.version_tracker.remove_version(&version.version_id);
+                    tracing::error!("保存版本失败: {}", e);
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
                 }
-                tracing::error!("保存版本失败: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(e.to_string()))));
             }
             state.event_bus.publish(Event::new(
                 EventType::VersionTracked,
@@ -342,16 +450,44 @@ pub async fn track_version(
 pub async fn get_version_history(
     State(state): State<AppState>,
     Path(file_path): Path<String>,
-) -> Json<PaginatedResponse<crate::versioning::Version>> {
-    let versions = state.version_tracker.get_version_history(&file_path);
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let safe_path = validate_version_path(&file_path).map_err(VersionPathValidationError::response)?;
+    let safe_path = safe_path.to_string_lossy();
+    let versions = state.version_tracker.get_version_history(&safe_path);
     let total = versions.len();
 
-    Json(PaginatedResponse {
+    Ok(Json(PaginatedResponse {
         data: versions,
         page: 1,
         page_size: total,
         total,
-    })
+    }))
+}
+
+pub async fn get_version_diff(
+    State(state): State<AppState>,
+    Path((old_version_id, new_version_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.version_tracker.get_version_diff(&old_version_id, &new_version_id) {
+        Ok(diff) => Ok(Json(ApiResponse::success(diff))),
+        Err(crate::error::DataChainError::VersionNotFound(version_id)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(format!("version not found: {}", version_id))),
+        )),
+        Err(crate::error::DataChainError::IoError(error))
+            if error.kind() == std::io::ErrorKind::NotFound => Err((
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("版本内容快照不可用")),
+            )),
+        Err(crate::error::DataChainError::StorageError(message)) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::error(message)),
+        )),
+        Err(error) => {
+            tracing::error!("读取版本快照失败: {}", error);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::error(error.to_string()))))
+        }
+    }
 }
 
 // ==================== 汇总处理器 ====================
@@ -514,4 +650,34 @@ pub async fn get_proof(
         submitter_key: None,
         reason: Some("content hash not found in any block attestation".to_string()),
     })
+}
+
+#[cfg(test)]
+mod version_path_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_path_traversal_before_filesystem_access() {
+        let result = validate_version_path("../outside.txt");
+        assert!(matches!(result, Err(VersionPathValidationError::BadRequest(_))));
+    }
+
+    #[test]
+    fn rejects_directories_as_version_files() {
+        let root = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let result = validate_version_path(directory.path().to_str().unwrap());
+        assert!(matches!(result, Err(VersionPathValidationError::BadRequest(_))));
+    }
+
+    #[test]
+    fn accepts_a_regular_file_under_the_default_root() {
+        let root = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&root).unwrap();
+        let file = directory.path().join("safe.txt");
+        std::fs::write(&file, b"safe").unwrap();
+
+        let validated = validate_version_path(file.to_str().unwrap()).unwrap();
+        assert_eq!(validated, std::fs::canonicalize(file).unwrap());
+    }
 }

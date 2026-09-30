@@ -1,9 +1,13 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::{Version, VersionTracker};
+
+/// 默认版本内容快照目录。
+pub const DEFAULT_CONTENT_STORAGE_DIR: &str = "./data/version-content";
 
 /// 内容寻址存储
 pub struct ContentStorage {
@@ -19,63 +23,65 @@ impl ContentStorage {
         Ok(Self { storage_dir })
     }
 
-    /// 获取内容存储路径（使用前2个字符作为子目录）
-    fn get_content_path(&self, content_hash: &str) -> PathBuf {
-        if content_hash.len() < 2 {
-            return self.storage_dir.join(content_hash);
+    /// 从 DATACHAIN_VERSION_CONTENT_DIR 创建内容存储，未配置时使用默认目录。
+    pub fn from_env() -> io::Result<Self> {
+        let storage_dir = std::env::var_os("DATACHAIN_VERSION_CONTENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTENT_STORAGE_DIR));
+        Self::new(storage_dir)
+    }
+
+    /// 获取内容存储路径（使用前2个字符作为子目录）。
+    fn get_content_path(&self, content_hash: &str) -> io::Result<PathBuf> {
+        if content_hash.len() != 64 || !content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "content hash must be a 64-character hexadecimal SHA-256 value",
+            ));
         }
 
         let subdir = &content_hash[..2];
         let filename = &content_hash[2..];
-        self.storage_dir.join(subdir).join(filename)
+        Ok(self.storage_dir.join(subdir).join(filename))
     }
 
     /// 存储内容
     pub fn store_content(&self, content: &[u8]) -> io::Result<String> {
-        // 计算哈希
         let mut hasher = Sha256::new();
         hasher.update(content);
         let content_hash = hex::encode(hasher.finalize());
+        let path = self.get_content_path(&content_hash)?;
 
-        // 获取存储路径
-        let path = self.get_content_path(&content_hash);
-
-        // 创建子目录
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
 
-        // 如果已存在则跳过
-        if path.exists() {
-            return Ok(content_hash);
+        // 内容按哈希寻址；已存在的快照可以直接复用。
+        if !path.exists() {
+            fs::write(&path, content)?;
         }
-
-        // 写入内容
-        fs::write(&path, content)?;
 
         Ok(content_hash)
     }
 
     /// 获取内容
     pub fn retrieve_content(&self, content_hash: &str) -> io::Result<Vec<u8>> {
-        let path = self.get_content_path(content_hash);
+        let path = self.get_content_path(content_hash)?;
         fs::read(&path)
     }
 
     /// 检查内容是否存在
     pub fn has_content(&self, content_hash: &str) -> bool {
-        let path = self.get_content_path(content_hash);
-        path.exists()
+        self.get_content_path(content_hash)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
     }
 
     /// 删除内容
     pub fn delete_content(&self, content_hash: &str) -> io::Result<()> {
-        let path = self.get_content_path(content_hash);
-
-        // 删除文件
+        let path = self.get_content_path(content_hash)?;
         fs::remove_file(&path)?;
 
-        // 尝试删除空的父目录
         if let Some(dir) = path.parent() {
             if let Ok(entries) = fs::read_dir(dir) {
                 if entries.count() == 0 {
@@ -150,7 +156,10 @@ impl ContentStorage {
                 if components.len() == 2 {
                     let dir = components[0].as_os_str().to_string_lossy();
                     let file = components[1].as_os_str().to_string_lossy();
-                    hashes.push(format!("{}{}", dir, file));
+                    let hash = format!("{}{}", dir, file);
+                    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        hashes.push(hash);
+                    }
                 }
             }
         }
@@ -163,10 +172,8 @@ impl ContentStorage {
         let mut deleted = 0;
 
         for hash in self.list_contents()? {
-            if !valid_hashes.contains(&hash) {
-                if self.delete_content(&hash).is_ok() {
-                    deleted += 1;
-                }
+            if !valid_hashes.contains(&hash) && self.delete_content(&hash).is_ok() {
+                deleted += 1;
             }
         }
 
@@ -201,17 +208,13 @@ impl VersionedStorage {
 
     /// 存储文件并追踪版本
     pub fn store_file(&self, file_path: &str, author: &str, message: &str) -> io::Result<Version> {
-        // 读取文件内容
         let content = fs::read(file_path)?;
-
-        // 存储内容
         let content_hash = self.content.store_content(&content)?;
 
-        // 追踪版本
-        let mut version = self.tracker.track_file(file_path, author, message)
+        let mut version = self
+            .tracker
+            .track_file(file_path, author, message)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-        // 更新内容哈希
         version.content_hash = content_hash;
 
         Ok(version)
@@ -219,7 +222,9 @@ impl VersionedStorage {
 
     /// 获取版本内容
     pub fn retrieve_version(&self, version_id: &str) -> io::Result<Vec<u8>> {
-        let version = self.tracker.get_version(version_id)
+        let version = self
+            .tracker
+            .get_version(version_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "version not found"))?;
 
         self.content.retrieve_content(&version.content_hash)
@@ -272,5 +277,14 @@ mod tests {
 
         let stats = storage.get_storage_stats();
         assert_eq!(stats.total_files, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_content_hash() {
+        let dir = tempdir().unwrap();
+        let storage = ContentStorage::new(dir.path()).unwrap();
+
+        assert!(storage.retrieve_content("../outside").is_err());
+        assert!(!storage.has_content("../outside"));
     }
 }
