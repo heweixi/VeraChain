@@ -1,7 +1,7 @@
 # DataChain Rust
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
-> 最后核实:2026-10-18(进度至 R7,提交 `c90c65a`)。
+> 最后核实:2026-10-18(进度至 R7 + backlog #4 WebSocket 集成测试,提交 `97eeee5`)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -12,10 +12,14 @@
 > - R5 跨链证明与锚定:完整 Merkle proof、ed25519 节点签名、ChainAnchor/AnchorReceipt、
 >   anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` 端点。
 > - R6 P2P 区块广播 + 认证 gossip 发现 + 种子 peer(双节点 smoke 验证)。
-> - R7 集成测试 `tests/api_integration.rs`(health/401/RBAC 越权/SQLite 重启恢复),共 55 单测 + 4 集成测试通过。
+> - R7 集成测试 `tests/api_integration.rs`(health/401/RBAC 越权/SQLite 重启恢复)。
+> - backlog #4 WebSocket 实时事件集成测试 `tests/websocket_integration.rs`(握手鉴权/EventBus 广播/
+>   16KiB 消息上限/256 连接上限),`97eeee5` 247 验证 8 passed。
+> - 共 55 单测 + 12 集成测试(api 4 + websocket 8)通过。
 >
 > ⚠️ 仍未实现:P2P 共识与同长度分叉选择(单一诚实源假设)、密钥轮换/链上身份注册、
-> refresh token 轮换、WebSocket 收发自动化集成测试。具体以 `IMPLEMENTATION_STATUS.md` 为准。
+> refresh token 轮换、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播,服务端不按频道过滤)。
+> 具体以 `IMPLEMENTATION_STATUS.md` 为准。
 
 数据追溯区块链系统 - Rust 实现
 
@@ -30,7 +34,7 @@
 - **跨链锚定**: 完整 Merkle proof、ed25519 节点签名、ChainAnchor/回执、outbox 重试投递
 - **P2P 同步**: 显式注册 + 区块广播 + 认证 gossip 发现 + 最长合法链替换
 - **RESTful API**: HTTP 接口(认证/元数据/区块/版本/聚合/跨链/P2P)
-- **WebSocket**: 实时事件推送(JWT 认证)
+- **WebSocket**: 实时事件推送(JWT 认证;当前各频道为全量广播,服务端频道隔离未实现)
 
 ## 项目结构
 
@@ -201,12 +205,15 @@ datachain version diff <v1> <v2>
 
 ### WebSocket
 
+> 注意:以下频道当前均订阅同一 Hub 的**全量广播**,服务端不按频道过滤;
+> 订阅 `/ws/chain` 仍会收到 metadata/aggregation 等全部事件。频道隔离为已知遗留(见 `IMPLEMENTATION_STATUS.md`)。
+
 | 路径 | 描述 |
 |------|------|
-| /ws | 通用 WebSocket |
-| /ws/chain | 区块链事件 |
-| /ws/metadata | 元数据事件 |
-| /ws/aggregation | 汇总事件 |
+| /ws | 通用 WebSocket(JWT 认证,全量事件) |
+| /ws/chain | 区块链事件(当前实为全量广播) |
+| /ws/metadata | 元数据事件(当前实为全量广播) |
+| /ws/aggregation | 汇总事件(当前实为全量广播) |
 
 ## 配置说明
 

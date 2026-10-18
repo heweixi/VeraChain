@@ -1,8 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `c90c65a`(R7 集成测试)。
-> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke。
-> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)。
+> 核实日期:2026-10-18，代码进度更新至提交 `97eeee5`(backlog #4 WebSocket 集成测试)。
+> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 实时事件集成测试)已补并在 247 验证。
+> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
@@ -22,7 +22,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
 - ⚠️ P2P 无共识、无同长度分叉选择(单一诚实源假设);无跨链密钥轮换与链上身份注册交易。
-- ⚠️ refresh token 轮换、WebSocket 收发自动化集成测试未补(当前 WS 由连接级保护 + 手工/单测覆盖)。
+- ⚠️ refresh token 轮换未补(WebSocket 收发自动化集成测试已补,见 `97eeee5`/247 8 passed)。
+- 🔺 WebSocket 频道(`/ws/chain`、`/ws/metadata`、`/ws/aggregation`)当前都订阅同一 `WsHub` 的**全量广播**,服务端 `handle_channel_socket` 不按频道过滤;任何 EventBus 事件会推给所有频道客户端。真正的频道隔离(如 `/ws/chain` 只收 chain 事件)未实现,属已知遗留(非 backlog #4 范围,#4 只验证"频道客户端能收到广播")。
 - ⚠️ 元数据仍以内存 pending + 区块 JSON 为主,无独立 metadata 查询表;注册失败写库的返回语义待收敛。
 - ⚠️ 旧 `init_tables` 幂等建表作为兼容兜底与 migration 并存,未纯 migration 驱动。
 
@@ -40,8 +41,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
 | 节点签名身份 | ✅ `4cf84f8`/247 已验证 | `src/node_signing.rs`:ed25519 密钥对(生成/base64 种子恢复/签名/验签);配置 `DATACHAIN_NODE_SECRET` 持久化,未配置则启动随机生成并打印公钥 |
 | 版本 API | ✅ 247 已验证 | `track_version` 经 `validate_version_path`(DATACHAIN_VERSION_ROOT allowlist+路径遍历/目录/符号链接防护)后保存不可变内容快照(ContentStorage);`get_version_diff` 用两版本历史快照计算,`get_version_content` 读快照不读当前文件;历史文件被覆盖/删除仍可还原。单测覆盖 track/diff/快照缺失/路径校验 |
-| WebSocket 实时事件 | ⚠️代码已接线/待验证 | `AppState` 持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务事件现在可经 EventBus 广播，但频道过滤和运行时 smoke test仍待验证 |
-| EventBus/通知 | ✅代码已接线/待验证 | `src/api/notification.rs` 已由 server 创建并注入；注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件 |
+| WebSocket 实时事件 | ⚠️ 已接线+集成测试已验证(频道隔离未实现) `97eeee5`/247 | `AppState` 持有 `WsHub`,连接有 JWT/连接数(256)/消息大小(16KiB)保护;业务事件经 EventBus 广播,已由 `tests/websocket_integration.rs` 自动化验证(8 passed):握手鉴权(无/无效 token 401、合法 101+welcome)、EventBus 广播(block_mined→block_added、metadata_created→metadata_added、aggregation_done→aggregation)、16KiB 上限(`/ws` 回 error 后断开、`/ws/chain` 只断开不回 error)、256 连接上限(第 257 个 503,释放后恢复)。**频道过滤未实现**:三频道共享全量广播,见下 🔺 频道隔离 |
+| WebSocket 频道隔离 | 🔺 未实现 `97eeee5` | `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 均 `hub.subscribe()` 订阅同一 `WsHub` 全量广播,`handle_channel_socket` 不做任何按频道过滤;所有 EventBus 事件推给所有频道客户端。差异影响:客户端订阅特定频道并不能只收到该类事件;原因:服务端尚未实现频道级路由,属已知遗留,后续若做需另起 backlog |
+| EventBus/通知 | ✅ 247 已验证 `97eeee5` | `src/api/notification.rs` 已由 server 创建并注入;注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件;广播链路已由 WS 集成测试覆盖(block/metadata/aggregation 三类事件实际收到) |
 
 ### 2.2 认证、授权与安全
 
@@ -54,7 +56,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
 | 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
 | CORS/TLS/限流 | ⚠️ | CORS 已改为 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时本地开发来源）；TLS、请求体限制、登录限速/锁定、审计日志仍未实现 |
-| WebSocket 认证 | ✅基础代码已接入/待验证 | WebSocket 路由现在经过 JWT 认证；Hub 限制 256 连接、单条文本 16 KiB；事件授权/广播接线仍待 P1 |
+| WebSocket 认证 | ✅ 247 集成测试已验证 `97eeee5` | WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome);Hub 限制 256 连接、单条文本 16 KiB;广播接线已由 `tests/websocket_integration.rs` 验证。按频道的事件授权/过滤仍未实现(见 2.1 WebSocket 频道隔离 🔺) |
 
 ### 2.3 区块链核心与数据完整性
 
@@ -92,9 +94,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ✅ `R7` 已新增 `tests/api_integration.rs` 集成测试(tower oneshot 进程内驱动真实 Router):公开 health、受保护路由 401、RBAC 越权(user 创建 anchor 403 / 读 proof 200 / admin anchor 200 pending)、SQLite 重启恢复区块与用户。247 验证 4 passed。
+- ✅ 集成测试共 12 passed:`tests/api_integration.rs`(4,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 user 创建 anchor 403 / 读 proof 200 / admin anchor 200 pending、SQLite 重启恢复区块与用户,247 验证 4 passed)+ `tests/websocket_integration.rs`(8,真实 axum 服务 TcpListener + tokio-tungstenite 客户端真实握手/帧收发:握手鉴权、EventBus 广播三类事件、16KiB 消息上限、256 连接上限,247 验证 8 passed,`97eeee5`)。
 - ✅ 核心算法 + 新增能力单测共 55 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p)。
-- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试);refresh token 轮换/WebSocket 收发的自动化集成测试仍待补。
+- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试);refresh token 轮换自动化集成测试仍待补。WebSocket 收发自动化集成测试已补(见上 `97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
 ## 四、开发进度与后续建议
@@ -112,9 +114,11 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 ### 后续建议(backlog,非当前目标)
 
+- ✅ #4 WebSocket 收发自动化集成测试 — `97eeee5` 247 `cargo test --test websocket_integration` 8 passed。
 - P2P 共识与分叉选择(当前为单一诚实源假设)。
 - 跨链密钥轮换与链上身份注册交易。
-- refresh token 轮换;WebSocket 收发自动化集成测试。
+- refresh token 轮换。
+- 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
 - 独立 metadata 查询表;注册失败写库返回语义收敛。
 - 纯 migration 驱动(移除 init_tables 兼容兜底);回滚/数据回填迁移。
 
