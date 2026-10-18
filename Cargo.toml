@@ -64,6 +64,8 @@ rustc_version_runtime = "0.3"
 tempfile = "3"    # versioning storage 测试用临时目录
 tower = { version = "0.5", features = ["util"] }    # 集成测试用 oneshot 驱动 Router
 http-body-util = "0.1"    # 集成测试读取响应 body
+# WebSocket 集成测试:真实客户端连接(ws://,不启用 TLS),用 http 1.x 与 axum 0.7 对齐
+tokio-tungstenite = "0.24"
 
 [profile.release]
 opt-level = "s"
