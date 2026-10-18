@@ -33,6 +33,17 @@ pub fn build_merkle_root(hashes: &[String]) -> String {
     current_level.into_iter().next().unwrap_or_default()
 }
 
+/// 完整 Merkle 证明：包含叶子、索引、每层 sibling 和方向，可由任意目标链独立验证。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MerkleProof {
+    pub leaf: String,
+    pub leaf_index: usize,
+    pub siblings: Vec<String>,
+    /// 与 siblings 等长；true 表示 sibling 在左侧，false 表示在右侧。
+    pub sibling_is_left: Vec<bool>,
+    pub root: String,
+}
+
 /// Merkle 树
 pub struct MerkleTree {
     root: String,
@@ -106,13 +117,27 @@ impl MerkleTree {
         &self.leaves
     }
 
-    /// 获取证明路径
+    /// 获取证明路径。奇数节点按构建规则与自身配对，证明中显式记录该 sibling。
     pub fn get_proof(&self, index: usize) -> Vec<(String, bool)> {
+        self.get_structured_proof(index)
+            .map(|proof| {
+                proof
+                    .siblings
+                    .into_iter()
+                    .zip(proof.sibling_is_left)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 获取可序列化、跨链可验证的完整证明。
+    pub fn get_structured_proof(&self, index: usize) -> Option<MerkleProof> {
         if index >= self.leaves.len() {
-            return Vec::new();
+            return None;
         }
 
-        let mut proof = Vec::new();
+        let mut siblings = Vec::new();
+        let mut sibling_is_left = Vec::new();
         let mut current_index = index;
 
         for level in &self.levels[..self.levels.len().saturating_sub(1)] {
@@ -121,16 +146,37 @@ impl MerkleTree {
             } else {
                 current_index - 1
             };
-
-            if sibling_index < level.len() {
-                let is_left = current_index % 2 == 1;
-                proof.push((level[sibling_index].clone(), is_left));
-            }
-
+            // 奇数节点在构建根时与自身拼接，证明也必须显式包含自身。
+            let sibling = level
+                .get(sibling_index)
+                .cloned()
+                .unwrap_or_else(|| level[current_index].clone());
+            siblings.push(sibling);
+            sibling_is_left.push(current_index % 2 == 1);
             current_index /= 2;
         }
 
-        proof
+        Some(MerkleProof {
+            leaf: self.leaves[index].clone(),
+            leaf_index: index,
+            siblings,
+            sibling_is_left,
+            root: self.root.clone(),
+        })
+    }
+
+    /// 验证完整证明。
+    pub fn verify_structured_proof(proof: &MerkleProof) -> bool {
+        if proof.siblings.len() != proof.sibling_is_left.len() {
+            return false;
+        }
+        let path: Vec<(String, bool)> = proof
+            .siblings
+            .iter()
+            .cloned()
+            .zip(proof.sibling_is_left.iter().copied())
+            .collect();
+        Self::verify_proof(&proof.leaf, &path, &proof.root)
     }
 
     /// 验证证明
@@ -206,5 +252,13 @@ mod tests {
         let leaf_hash = &tree.leaves()[0];
 
         assert!(MerkleTree::verify_proof(leaf_hash, &proof, tree.root()));
+    }
+
+    #[test]
+    fn test_structured_proof_for_odd_leaf() {
+        let tree = MerkleTree::from_hashes(vec!["a".into(), "b".into(), "c".into()]);
+        let proof = tree.get_structured_proof(2).unwrap();
+        assert_eq!(proof.siblings.len(), 2);
+        assert!(MerkleTree::verify_structured_proof(&proof));
     }
 }

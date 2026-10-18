@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub jwt: JwtConfig,
     pub aggregation: AggregationConfig,
     pub log: LogConfig,
+    #[serde(default)]
+    pub chain_identity: ChainIdentityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +63,42 @@ pub struct LogConfig {
     pub level: String,
 }
 
+/// 链身份与跨链锚定配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainIdentityConfig {
+    /// 本链标识（source_chain_id）。
+    #[serde(default = "default_chain_id")]
+    pub chain_id: String,
+    /// 本节点标识（source_node_id）。
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    /// 节点 ed25519 私钥种子（base64，32 字节）。为空时启动随机生成。
+    #[serde(default)]
+    pub node_secret: Option<String>,
+    /// 跨链锚定投递目标端点（attestation 服务），为空时仅生成锚定不投递。
+    #[serde(default)]
+    pub anchor_endpoint: Option<String>,
+    /// 投递目标链标识。
+    #[serde(default = "default_target_chain_id")]
+    pub target_chain_id: String,
+    /// 投递鉴权 token。
+    #[serde(default)]
+    pub anchor_auth_token: Option<String>,
+}
+
+impl Default for ChainIdentityConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: default_chain_id(),
+            node_id: default_node_id(),
+            node_secret: None,
+            anchor_endpoint: None,
+            target_chain_id: default_target_chain_id(),
+            anchor_auth_token: None,
+        }
+    }
+}
+
 // 默认值函数
 fn default_port() -> u16 {
     8080
@@ -95,6 +133,15 @@ fn default_count_threshold() -> usize {
 fn default_log_level() -> String {
     "info".to_string()
 }
+fn default_chain_id() -> String {
+    "datachain-main".to_string()
+}
+fn default_node_id() -> String {
+    "node-1".to_string()
+}
+fn default_target_chain_id() -> String {
+    "attestation-service".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -124,6 +171,7 @@ impl Default for AppConfig {
             log: LogConfig {
                 level: default_log_level(),
             },
+            chain_identity: ChainIdentityConfig::default(),
         }
     }
 }
@@ -165,6 +213,24 @@ impl AppConfig {
         }
         if let Ok(key) = std::env::var("DATACHAIN_TLS_KEY") {
             self.server.tls_key = Some(key);
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_CHAIN_ID") {
+            self.chain_identity.chain_id = v;
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_NODE_ID") {
+            self.chain_identity.node_id = v;
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_NODE_SECRET") {
+            self.chain_identity.node_secret = Some(v);
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_ANCHOR_ENDPOINT") {
+            self.chain_identity.anchor_endpoint = Some(v);
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_TARGET_CHAIN_ID") {
+            self.chain_identity.target_chain_id = v;
+        }
+        if let Ok(v) = std::env::var("DATACHAIN_ANCHOR_AUTH_TOKEN") {
+            self.chain_identity.anchor_auth_token = Some(v);
         }
     }
 

@@ -61,6 +61,22 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_block_by_hash),
         )
         .route("/api/v1/blocks/proof/:sha256", get(handlers::get_proof))
+        .route(
+            "/api/v1/crosschain/proof/:data_id",
+            get(handlers::get_merkle_proof),
+        )
+        .route(
+            "/api/v1/crosschain/anchor/:data_id",
+            post(handlers::create_anchor),
+        )
+        .route(
+            "/api/v1/crosschain/anchor/status/:anchor_id",
+            get(handlers::get_anchor_status),
+        )
+        .route(
+            "/api/v1/crosschain/identity",
+            get(handlers::get_node_identity),
+        )
         .route("/api/v1/chain/info", get(handlers::get_chain_info))
         .route("/api/v1/chain/mine", post(handlers::mine_block))
         .route("/api/v1/chain/validate", post(handlers::validate_chain))

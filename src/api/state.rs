@@ -4,6 +4,7 @@ use super::{notification::EventBus, rate_limit::RateLimiter, websocket::WsHub};
 use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
 use crate::core::Chain;
+use crate::crosschain::AnchorService;
 use crate::metadata::MetadataManager;
 use crate::p2p::P2PService;
 use crate::storage::Storage;
@@ -23,6 +24,7 @@ pub struct AppState {
     pub scheduler: Arc<Scheduler>,
     pub p2p: Arc<P2PService>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub anchor_service: Arc<AnchorService>,
 }
 
 impl AppState {
@@ -39,6 +41,7 @@ impl AppState {
         scheduler: Arc<Scheduler>,
         p2p: Arc<P2PService>,
         rate_limiter: Arc<RateLimiter>,
+        anchor_service: Arc<AnchorService>,
     ) -> Self {
         Self {
             chain,
@@ -52,6 +55,7 @@ impl AppState {
             scheduler,
             p2p,
             rate_limiter,
+            anchor_service,
         }
     }
 }

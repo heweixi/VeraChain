@@ -33,6 +33,13 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     {
         return Some(Permission::BlockRead);
     }
+    // 跨链锚定：生成锚定属于特权写操作，查询/证明/身份按读处理。
+    if method == Method::POST && path.starts_with("/api/v1/crosschain/anchor/") {
+        return Some(Permission::BlockMine);
+    }
+    if path.starts_with("/api/v1/crosschain/") {
+        return Some(Permission::BlockRead);
+    }
     if path == "/api/v1/versions/track" {
         return Some(Permission::VersionTrack);
     }

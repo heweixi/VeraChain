@@ -40,6 +40,11 @@ thiserror = "1"
 lazy_static = "1"
 # HTTP P2P 同步客户端
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 节点与跨链锚定签名
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+async-trait = "0.1"
 # CLI(cli/* 用 clap derive)
 clap = { version = "4", features = ["derive"] }
 # 并发锁(chain/websocket)

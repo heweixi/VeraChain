@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::aggregation::AggregationSummary;
 use crate::auth::User;
 use crate::core::{Block, MetadataEntry};
+use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
 use crate::error::{DataChainError, Result};
 use crate::versioning::Version;
 
@@ -50,6 +51,7 @@ impl Storage {
                 2,
                 include_str!("../../migrations/002_pending_aggregations.sql"),
             ),
+            (3, include_str!("../../migrations/003_anchor_outbox.sql")),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -153,6 +155,26 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
+        // 跨链锚定 outbox（旧库兼容兜底，正式建表见 migration 003）。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS anchor_outbox (
+                anchor_id TEXT PRIMARY KEY NOT NULL,
+                target_chain_id TEXT NOT NULL,
+                data_id TEXT NOT NULL,
+                signed TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                receipt TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // 创建索引
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
             .execute(&self.pool)
@@ -171,6 +193,9 @@ impl Storage {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_anchor_outbox_status ON anchor_outbox(status)")
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -466,6 +491,136 @@ impl Storage {
         rows.into_iter()
             .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
             .collect()
+    }
+
+    /// 将签名锚定写入 outbox（pending）。重复 anchor_id 时覆盖。
+    pub async fn enqueue_anchor(&self, signed: &SignedChainAnchor) -> Result<()> {
+        let data = serde_json::to_string(signed)?;
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO anchor_outbox
+                (anchor_id, target_chain_id, data_id, signed, status, attempts, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', 0, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(&signed.anchor.anchor_id)
+        .bind(&signed.anchor.target_chain_id)
+        .bind(&signed.anchor.data_id)
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 列出待投递锚定（pending），按创建时间升序，限制批量大小。
+    pub async fn list_pending_anchors(&self, limit: i64) -> Result<Vec<AnchorOutboxEntry>> {
+        let rows: Vec<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT signed, status, attempts, last_error, receipt
+            FROM anchor_outbox
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(signed, status, attempts, last_error, receipt)| {
+                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
+                let receipt = match receipt {
+                    Some(r) => Some(serde_json::from_str(&r)?),
+                    None => None,
+                };
+                Ok(AnchorOutboxEntry {
+                    signed,
+                    status: AnchorStatus::parse_status(&status),
+                    attempts,
+                    last_error,
+                    receipt,
+                    updated_at: chrono::Utc::now(),
+                })
+            })
+            .collect()
+    }
+
+    /// 标记锚定已确认，记录回执。
+    pub async fn mark_anchor_confirmed(
+        &self,
+        anchor_id: &str,
+        receipt: &AnchorReceipt,
+    ) -> Result<()> {
+        let receipt_json = serde_json::to_string(receipt)?;
+        sqlx::query(
+            r#"
+            UPDATE anchor_outbox
+            SET status = 'confirmed', receipt = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE anchor_id = ?
+            "#,
+        )
+        .bind(receipt_json)
+        .bind(anchor_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 记录一次投递尝试：更新 attempts、状态与错误信息。
+    pub async fn mark_anchor_attempt(
+        &self,
+        anchor_id: &str,
+        attempts: i64,
+        status: AnchorStatus,
+        error: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE anchor_outbox
+            SET attempts = ?, status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE anchor_id = ?
+            "#,
+        )
+        .bind(attempts)
+        .bind(status.as_str())
+        .bind(error)
+        .bind(anchor_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 查询单个锚定条目（供 API 查询状态）。
+    pub async fn get_anchor(&self, anchor_id: &str) -> Result<Option<AnchorOutboxEntry>> {
+        let row: Option<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT signed, status, attempts, last_error, receipt
+            FROM anchor_outbox WHERE anchor_id = ?
+            "#,
+        )
+        .bind(anchor_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            None => Ok(None),
+            Some((signed, status, attempts, last_error, receipt)) => {
+                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
+                let receipt = match receipt {
+                    Some(r) => Some(serde_json::from_str(&r)?),
+                    None => None,
+                };
+                Ok(Some(AnchorOutboxEntry {
+                    signed,
+                    status: AnchorStatus::parse_status(&status),
+                    attempts,
+                    last_error,
+                    receipt,
+                    updated_at: chrono::Utc::now(),
+                }))
+            }
+        }
     }
 
     /// 关闭存储

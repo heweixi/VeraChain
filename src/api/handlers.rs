@@ -11,6 +11,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
 use crate::auth::{Claims, LoginRequest, RegisterRequest};
+use crate::core::{metadata_leaf_hash, MerkleTree};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::p2p::{PeerRegistration, SyncBlocksRequest, SyncBlocksResponse, SyncQuery};
 
@@ -756,6 +757,176 @@ pub async fn get_block_by_hash(
             hash
         ))),
     ))
+}
+
+/// 完整 Merkle proof：返回叶子、索引、sibling/path 和根，可由目标链独立验证。
+pub async fn get_merkle_proof(
+    State(state): State<AppState>,
+    Path(data_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    for block in state.chain.get_all_blocks() {
+        if let Some(index) = block
+            .metadata_list
+            .iter()
+            .position(|entry| entry.data_id == data_id)
+        {
+            let leaves = block
+                .metadata_list
+                .iter()
+                .map(|entry| metadata_leaf_hash(&entry.data_id))
+                .collect();
+            let tree = MerkleTree::from_hashes(leaves);
+            let proof = tree.get_structured_proof(index).ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("failed to create merkle proof")),
+                )
+            })?;
+            if proof.root != block.merkle_root || !MerkleTree::verify_structured_proof(&proof) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(
+                        "stored block merkle proof is inconsistent",
+                    )),
+                ));
+            }
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "data_id": data_id,
+                "block_index": block.index,
+                "block_hash": block.hash,
+                "merkle_root": block.merkle_root,
+                "proof": proof,
+            }))));
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ApiResponse::error("data_id not found in committed blocks")),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct CreateAnchorRequest {
+    /// 目标链标识；缺省时使用配置的默认目标链。
+    #[serde(default)]
+    pub target_chain_id: Option<String>,
+}
+
+/// 为某个已上链 data_id 生成跨链锚定（签名 + 入 outbox），由后台 worker 投递。
+pub async fn create_anchor(
+    State(state): State<AppState>,
+    Path(data_id): Path<String>,
+    body: Option<Json<CreateAnchorRequest>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let target_chain_id = body
+        .and_then(|b| b.0.target_chain_id)
+        .filter(|s| !s.trim().is_empty());
+
+    for block in state.chain.get_all_blocks() {
+        if let Some(index) = block
+            .metadata_list
+            .iter()
+            .position(|entry| entry.data_id == data_id)
+        {
+            let leaves = block
+                .metadata_list
+                .iter()
+                .map(|entry| metadata_leaf_hash(&entry.data_id))
+                .collect();
+            let tree = MerkleTree::from_hashes(leaves);
+            let proof = tree.get_structured_proof(index).ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("failed to create merkle proof")),
+                )
+            })?;
+            if proof.root != block.merkle_root || !MerkleTree::verify_structured_proof(&proof) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(
+                        "stored block merkle proof is inconsistent",
+                    )),
+                ));
+            }
+            let target = target_chain_id
+                .unwrap_or_else(|| state.anchor_service.default_target_chain_id().to_string());
+            let signed = state
+                .anchor_service
+                .enqueue_anchor(
+                    target,
+                    data_id.clone(),
+                    block.hash.clone(),
+                    block.merkle_root.clone(),
+                    proof,
+                )
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error(format!(
+                            "failed to enqueue anchor: {}",
+                            e
+                        ))),
+                    )
+                })?;
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "anchor_id": signed.anchor.anchor_id,
+                "source_chain_id": signed.anchor.source_chain_id,
+                "source_node_id": signed.anchor.source_node_id,
+                "target_chain_id": signed.anchor.target_chain_id,
+                "data_id": signed.anchor.data_id,
+                "block_hash": signed.anchor.block_hash,
+                "merkle_root": signed.anchor.merkle_root,
+                "public_key": signed.public_key,
+                "signature": signed.signature,
+                "status": "pending",
+            }))));
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(ApiResponse::error("data_id not found in committed blocks")),
+    ))
+}
+
+/// 查询锚定投递状态与回执。
+pub async fn get_anchor_status(
+    State(state): State<AppState>,
+    Path(anchor_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let entry = state.storage.get_anchor(&anchor_id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(format!("failed to query anchor: {}", e))),
+        )
+    })?;
+    match entry {
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("anchor not found")),
+        )),
+        Some(entry) => Ok(Json(ApiResponse::success(serde_json::json!({
+            "anchor_id": entry.signed.anchor.anchor_id,
+            "target_chain_id": entry.signed.anchor.target_chain_id,
+            "data_id": entry.signed.anchor.data_id,
+            "status": entry.status.as_str(),
+            "attempts": entry.attempts,
+            "last_error": entry.last_error,
+            "receipt": entry.receipt,
+        })))),
+    }
+}
+
+/// 返回本节点公开身份（node_id + 公钥），供目标链/审计方验签。
+pub async fn get_node_identity(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let identity = state.anchor_service.node_identity();
+    Json(ApiResponse::success(serde_json::json!({
+        "chain_id": state.anchor_service.chain_id(),
+        "node_id": identity.node_id(),
+        "public_key": identity.public_key_base64(),
+    })))
 }
 
 /// 获取内容的 Merkle 证明

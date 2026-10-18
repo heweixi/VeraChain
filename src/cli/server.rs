@@ -121,6 +121,49 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     let rate_limiter = Arc::new(api::RateLimiter::default());
     let _p2p_sync_task = p2p.clone().start_sync_loop(chain.clone());
 
+    // 构造节点签名身份与跨链锚定服务。
+    let ident_cfg = &config.chain_identity;
+    let node_identity = match &ident_cfg.node_secret {
+        Some(secret) if !secret.trim().is_empty() => {
+            crate::node_signing::NodeIdentity::from_secret_base64(
+                ident_cfg.node_id.clone(),
+                secret,
+            )?
+        }
+        _ => {
+            let identity = crate::node_signing::NodeIdentity::generate(ident_cfg.node_id.clone());
+            info!(
+                "未配置 DATACHAIN_NODE_SECRET，已生成临时节点密钥；公钥: {}",
+                identity.public_key_base64()
+            );
+            identity
+        }
+    };
+    let connector: Option<Arc<dyn crate::crosschain::AnchorConnector>> =
+        match &ident_cfg.anchor_endpoint {
+            Some(endpoint) if !endpoint.trim().is_empty() => {
+                info!("跨链锚定投递目标: {}", endpoint);
+                Some(Arc::new(crate::crosschain::HttpAttestationConnector::new(
+                    endpoint.clone(),
+                    ident_cfg.anchor_auth_token.clone(),
+                )))
+            }
+            _ => {
+                info!("未配置锚定投递端点，锚定将仅生成并入库，不自动投递");
+                None
+            }
+        };
+    let anchor_service = Arc::new(
+        crate::crosschain::AnchorService::new(
+            Arc::new(node_identity),
+            config.chain_identity.chain_id.clone(),
+            storage.clone(),
+            connector,
+        )
+        .with_default_target_chain_id(config.chain_identity.target_chain_id.clone()),
+    );
+    let _anchor_worker = anchor_service.clone().start_worker();
+
     // 创建应用状态
     let app_state = api::AppState {
         chain,
@@ -134,6 +177,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         scheduler,
         p2p,
         rate_limiter,
+        anchor_service,
     };
 
     // 启动服务
