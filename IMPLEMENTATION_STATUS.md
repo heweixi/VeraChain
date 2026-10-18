@@ -32,7 +32,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
 | 节点签名身份 | ✅ `4cf84f8`/247 已验证 | `src/node_signing.rs`:ed25519 密钥对(生成/base64 种子恢复/签名/验签);配置 `DATACHAIN_NODE_SECRET` 持久化,未配置则启动随机生成并打印公钥 |
-| 版本 API | ⚠️ | 元数据写入 SQLite，但文件内容快照未接入主流程；历史文件被覆盖或删除后不能可靠还原 |
+| 版本 API | ✅ 247 已验证 | `track_version` 经 `validate_version_path`(DATACHAIN_VERSION_ROOT allowlist+路径遍历/目录/符号链接防护)后保存不可变内容快照(ContentStorage);`get_version_diff` 用两版本历史快照计算,`get_version_content` 读快照不读当前文件;历史文件被覆盖/删除仍可还原。单测覆盖 track/diff/快照缺失/路径校验 |
 | WebSocket 实时事件 | ⚠️代码已接线/待验证 | `AppState` 持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务事件现在可经 EventBus 广播，但频道过滤和运行时 smoke test仍待验证 |
 | EventBus/通知 | ✅代码已接线/待验证 | `src/api/notification.rs` 已由 server 创建并注入；注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件 |
 
@@ -78,9 +78,9 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 |---|---|---|
 | 时间/数量策略 | ⚠️ | 策略和 engine 存在，但聚合通常扫描所有历史 metadata，不区分未聚合部分 |
 | 递归汇总 | ✅ `4cf84f8`/247 已验证 | `aggregate(Recursive)` 走 `aggregate_recursive`:自底向上,未合并 summary 数达 `recursive_threshold`(min(count_threshold,8)≥2)即合并为 level+1 父 summary;父 `merkle_root=build_merkle_root(子 root)`、`metadata_count/total_size` 累加、`parent_summaries` 记子 id、子标记 `is_merged`。`should_aggregate` 按每 level 未合并数触发递归。单测覆盖单层合并/阈值不足/多层(level1→2→3) |
-| 内容寻址存储 | 🧩 | `src/versioning/storage.rs` 功能较完整，但 server/HTTP track 使用 VersionTracker，未接入 ContentStorage |
-| 版本差异 | ⚠️ | diff 读取当前路径文件，不是版本快照；文件被覆盖/删除后无法可靠比较历史内容 |
-| 文件路径安全 | 🔺 | HTTP track 接受任意 `file_path`，缺根目录 allowlist、大小限制、符号链接限制和内容类型限制 |
+| 内容寻址存储 | ✅ 247 已验证 | `VersionTracker` 内置 `ContentStorage`(快照目录由 DATACHAIN_VERSION_CONTENT_DIR 配置);HTTP/CLI track 均保存内容快照并校验快照哈希==内容哈希 |
+| 版本差异 | ✅ 247 已验证 | `get_version_diff` 从两版本的不可变快照读取内容再 diff,不依赖当前文件;文件被覆盖/删除仍可比较历史 |
+| 文件路径安全 | ✅ 247 已验证 | `validate_version_path`:拒绝空/绝对/`..` 遍历,canonical 后必须位于 `DATACHAIN_VERSION_ROOT` 内,拒绝目录与越界符号链接。单测 `rejects_path_traversal_before_filesystem_access` 等 |
 
 ## 三、测试与验证状态
 
