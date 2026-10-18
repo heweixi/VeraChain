@@ -1,14 +1,21 @@
 # DataChain Rust
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
+> 最后核实:2026-10-18(进度至 R7,提交 `4395546` 及其后集成测试)。
 >
-> ⚠️ README 中“完整 REST、WebSocket、RBAC、递归汇总”等描述高于当前实现，
-> 具体限制以 `IMPLEMENTATION_STATUS.md` 为准。
+> R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
+> - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
+>   默认/短 JWT secret 启动拒绝、CORS allowlist、10MiB 请求体限制、进程内限流、WebSocket JWT/256 连接/16KiB、可选 TLS。
+> - R2 挖矿经 `commit_block` 原子落库(写区块+删 pending 同事务)。
+> - R3 递归父聚合(自底向上合并为 level+1 父 summary)。
+> - R4 版本内容快照 + 历史 diff + `DATACHAIN_VERSION_ROOT` 路径 allowlist。
+> - R5 跨链证明与锚定:完整 Merkle proof、ed25519 节点签名、ChainAnchor/AnchorReceipt、
+>   anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` 端点。
+> - R6 P2P 区块广播 + 认证 gossip 发现 + 种子 peer(双节点 smoke 验证)。
+> - R7 集成测试 `tests/api_integration.rs`(health/401/RBAC 越权/SQLite 重启恢复),共 55 单测 + 4 集成测试通过。
 >
-> P0-A 安全加固已提交 `fe93939`：公开注册固定普通用户、路由权限检查、默认 JWT secret
-> 校验/env 覆盖、CORS allowlist、WebSocket JWT/连接数/消息大小保护。P0-B/P1/P2 基础能力已分别
-> 提交 `11797fb`、`4ca5f32`、`7ab5602`、`f48ff6e`、`4a0f516`、`17e5e70`、`60aa000`，详情见状态文档。
-> 由于当前验证环境磁盘已满，这些提交尚待 `cargo check`、`cargo test` 和 Docker smoke test 验证。
+> ⚠️ 仍未实现:P2P 共识与同长度分叉选择(单一诚实源假设)、密钥轮换/链上身份注册、
+> refresh token 轮换、WebSocket 收发自动化集成测试。具体以 `IMPLEMENTATION_STATUS.md` 为准。
 
 数据追溯区块链系统 - Rust 实现
 
@@ -18,10 +25,12 @@
 - **多哈希支持**: MD5, SHA-256, SHA-3, bcrypt, scrypt, Argon2, PBKDF2
 - **认证系统**: JWT 令牌、RBAC 权限控制
 - **元数据管理**: 数据追溯、标签、查询
-- **汇总引擎**: 时间/数量策略、递归汇总
-- **版本控制**: 文件追踪、差异计算
-- **RESTful API**: 完整的 HTTP 接口
-- **WebSocket**: 实时事件推送
+- **汇总引擎**: 时间/数量策略、递归父聚合(多层合并)
+- **版本控制**: 文件追踪、内容快照、历史差异
+- **跨链锚定**: 完整 Merkle proof、ed25519 节点签名、ChainAnchor/回执、outbox 重试投递
+- **P2P 同步**: 显式注册 + 区块广播 + 认证 gossip 发现 + 最长合法链替换
+- **RESTful API**: HTTP 接口(认证/元数据/区块/版本/聚合/跨链/P2P)
+- **WebSocket**: 实时事件推送(JWT 认证)
 
 ## 项目结构
 

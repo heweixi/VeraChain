@@ -85,8 +85,10 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ⏳ 没有独立 `tests/` 集成测试目录；API handler、Router、注册落库失败、角色越权、refresh token、WebSocket 收发、SQLx schema/重启恢复、Scheduler、聚合递归等缺少系统测试。
-- ⚠️ 本次拆分只读核查，没有重新执行 `cargo test`、`cargo check`、Docker build、容器启动或 HTTP/WS smoke test。此前 monorepo 环境曾对默认 Rust 构建和 release 构建做过验证，但独立仓库应重新建立自己的 CI 证据。
+- ✅ `R7` 已新增 `tests/api_integration.rs` 集成测试(tower oneshot 进程内驱动真实 Router):公开 health、受保护路由 401、RBAC 越权(user 创建 anchor 403 / 读 proof 200 / admin anchor 200 pending)、SQLite 重启恢复区块与用户。247 验证 4 passed。
+- ✅ 核心算法 + 新增能力单测共 55 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p)。
+- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试);refresh token 轮换/WebSocket 收发的自动化集成测试仍待补。
+- ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
 ## 四、建议开发顺序
 

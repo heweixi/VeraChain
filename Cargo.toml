@@ -62,6 +62,8 @@ rustc_version_runtime = "0.3"
 
 [dev-dependencies]
 tempfile = "3"    # versioning storage 测试用临时目录
+tower = { version = "0.5", features = ["util"] }    # 集成测试用 oneshot 驱动 Router
+http-body-util = "0.1"    # 集成测试读取响应 body
 
 [profile.release]
 opt-level = "s"

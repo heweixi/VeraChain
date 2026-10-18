@@ -473,6 +473,19 @@ pub struct AggregationSummary {
     pub is_merged: bool,
 }
 
+/// 创建共享的 AggregationEngine 实例
+pub fn create_aggregation_engine(
+    chain: Arc<Chain>,
+    time_interval_secs: u64,
+    count_threshold: usize,
+) -> Arc<AggregationEngine> {
+    Arc::new(AggregationEngine::new(
+        chain,
+        time_interval_secs,
+        count_threshold,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,17 +568,4 @@ mod tests {
         assert_eq!(p3.level, 3);
         assert_eq!(p3.parent_summaries.len(), 2);
     }
-}
-
-/// 创建共享的 AggregationEngine 实例
-pub fn create_aggregation_engine(
-    chain: Arc<Chain>,
-    time_interval_secs: u64,
-    count_threshold: usize,
-) -> Arc<AggregationEngine> {
-    Arc::new(AggregationEngine::new(
-        chain,
-        time_interval_secs,
-        count_threshold,
-    ))
 }
