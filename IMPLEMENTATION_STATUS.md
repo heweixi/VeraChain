@@ -1,7 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `4cf84f8`(R5 跨链证明与锚定)。
-> R0/R1/R5 已在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy 验证并做 HTTP smoke；R2/R3/R4/R6/R7/R8 待推进。
+> 核实日期:2026-10-18，代码进度更新至提交 `c90c65a`(R7 集成测试)。
+> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke。
+> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
@@ -9,15 +10,21 @@
 
 DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、JWT 登录、区块/PoW/Merkle 核心、版本追踪、聚合策略、CLI 和 Docker 构建骨架。
 
-但 README 中“完整 REST、WebSocket、RBAC、递归汇总”等表述高于当前实现。当前已完成 P0-A 安全代码接入、P0-B 数据可靠性基础、P1-A 事件/调度闭环基础、P1-B 版本化迁移基础、P1-C 版本快照安全基础，以及 P2 的最小认证 HTTP 区块同步；所有新代码仍待 Rust/Docker 验证。当前仍有以下实质差异：
+R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异如下:
 
-- ✅ P0-A 安全代码已接入：公开注册固定普通用户；认证中间件接入账户状态、角色新鲜度和路由权限；JWT secret 环境覆盖/默认拒绝；CORS allowlist；WebSocket JWT/连接数/消息大小保护。
-- ✅ P0-B 数据可靠性基础已接入：pending metadata/aggregation SQLite 持久化、写库错误传播、启动恢复和区块/Merkle 校验；区块保存与 pending 删除仍不是同一事务。
-- ✅ P1-A 运行闭环基础已接入：WsHub/EventBus/Scheduler 进入 AppState；业务 handler 发布事件；WebSocket 订阅广播；Scheduler 自动启动并异步持久化聚合。
-- ✅ P1-B 已有版本化 SQL migration 和坏记录显式报错；旧 init_tables 仍保留幂等建表兼容逻辑，尚未完全重构为纯 migration 驱动。
-- ✅ P1-C 已接入内容快照、基于快照 diff 和版本路径 allowlist/大小/符号链接校验。
-- ⚠️ P2 区块同步已实现基础方案：显式注册 peer、认证拉取/导入、完整链校验、最长合法链替换和 60 秒定时同步；没有自动发现、广播网络、共识或同长度分叉选择。
-- P2：API/数据库/调度/越权测试不足；Cargo.lock 尚未生成 reqwest 新依赖的最终锁定变更；Docker 和运行时行为需要重新验证。
+- ✅ R1 安全:公开注册固定普通用户;认证中间件接入账户状态、角色新鲜度和路由权限;JWT issuer/audience + refresh jti 一次性撤销;默认/短 JWT secret 启动拒绝 + env 覆盖;CORS allowlist;10MiB 请求体限制;进程内限流;WebSocket JWT/256 连接/16KiB;可选 TLS。
+- ✅ R2 数据可靠性:pending/aggregation SQLite 持久化、写库错误传播、启动恢复与区块/Merkle 校验;挖矿经 `commit_block` 在**同一事务**内写区块+删 pending(消除原子性缺口)。
+- ✅ R3 递归聚合:`aggregate_recursive` 自底向上把未合并 summary 合并为 level+1 父 summary,真实多层(level1→2→3),不再是单层 level:1。
+- ✅ R4 版本快照:内容快照 + 基于快照的历史 diff + `DATACHAIN_VERSION_ROOT` 路径 allowlist/遍历/符号链接校验。
+- ✅ R5 跨链:完整 Merkle proof(可独立验证 data→root)、ed25519 节点签名、ChainAnchor/AnchorReceipt、anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` + RBAC。
+- ✅ R6 P2P:显式注册 + **主动区块广播** + **认证 gossip 发现**(跳过自身)+ 种子 peer + 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。
+- ✅ R7 测试:55 单测 + 4 集成测试(`tests/api_integration.rs`:health/401/RBAC 越权/SQLite 重启恢复),双节点 smoke 验证广播/发现。
+
+**仍存在的实质差异(⚠️/🧩,非本轮目标)**:
+- ⚠️ P2P 无共识、无同长度分叉选择(单一诚实源假设);无跨链密钥轮换与链上身份注册交易。
+- ⚠️ refresh token 轮换、WebSocket 收发自动化集成测试未补(当前 WS 由连接级保护 + 手工/单测覆盖)。
+- ⚠️ 元数据仍以内存 pending + 区块 JSON 为主,无独立 metadata 查询表;注册失败写库的返回语义待收敛。
+- ⚠️ 旧 `init_tables` 幂等建表作为兼容兜底与 migration 并存,未纯 migration 驱动。
 
 ## 二、需求/设计与实现对照
 
@@ -90,14 +97,26 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 - ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试);refresh token 轮换/WebSocket 收发的自动化集成测试仍待补。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
-## 四、建议开发顺序
+## 四、开发进度与后续建议
 
-1. **P0 安全**：禁止公开注册指定 admin；接入真实 Permission middleware；拒绝默认 JWT secret；限制 CORS；给 WebSocket 加认证、连接数和消息大小限制。
-2. **P0 数据可靠性**：注册/挖矿/版本写库失败必须返回错误；pending、metadata、aggregation 纳入持久化和事务；启动恢复时验证整条链和 Merkle。
-3. **P1 运行闭环**：把 WsHub/EventBus 放入 AppState 并在 metadata/mine/aggregate/version handler 发布事件；启动并管理 Scheduler；聚合结果持久化并恢复。
-4. **P1 数据库演进**：引入 SQLx migrations、schema version、唯一约束/索引测试、坏记录告警和回滚策略。
-5. **P1 版本安全**：接入 ContentStorage 或明确只做元数据追踪；限制 file_path 根目录；diff 读取内容快照。
-6. **P1/P2 网络与测试**：若产品需要多节点，设计并实现 P2P/节点同步协议；补 API/SQLite/越权/WebSocket/Docker 集成测试和独立 CI。
+### 已完成(R0-R7,推荐顺序)
+
+1. ✅ **R0 构建基线**:Cargo.lock(含 reqwest)、cargo check/test/fmt/clippy、Docker build、HTTP smoke。
+2. ✅ **R1 安全**:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 撤销、默认/短 secret 拒绝、CORS allowlist、请求体限制、限流、WebSocket 保护、可选 TLS。
+3. ✅ **R2 数据可靠性**:写库错误传播、持久化与启动恢复、`commit_block` 区块+pending 同事务原子化。
+4. ✅ **R3 递归聚合**:自底向上多层父 summary 合并。
+5. ✅ **R4 版本安全**:ContentStorage 快照、历史快照 diff、file_path 根目录 allowlist。
+6. ✅ **R5 跨链**:Merkle proof、ed25519 签名、ChainAnchor/回执、outbox 重试、attestation connector。
+7. ✅ **R6 P2P**:区块广播、认证 gossip 发现、种子 peer、最长合法链替换。
+8. ✅ **R7 测试与 CI**:集成测试(API/RBAC/重启恢复)、双节点 smoke、247 CI 证据。
+
+### 后续建议(backlog,非当前目标)
+
+- P2P 共识与分叉选择(当前为单一诚实源假设)。
+- 跨链密钥轮换与链上身份注册交易。
+- refresh token 轮换;WebSocket 收发自动化集成测试。
+- 独立 metadata 查询表;注册失败写库返回语义收敛。
+- 纯 migration 驱动(移除 init_tables 兼容兜底);回滚/数据回填迁移。
 
 ## 五、独立仓库维护约定
 
