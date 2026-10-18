@@ -274,25 +274,14 @@ pub async fn mine_block(
 
     match state.chain.mine_block() {
         Ok(block) => {
-            // 先持久化区块；失败时恢复内存中的区块和 pending 队列。
-            if let Err(e) = state.storage.save_block(&block).await {
+            // 在同一事务内原子提交区块并删除对应 pending;失败时回滚内存区块与 pending 队列。
+            if let Err(e) = state.storage.commit_block(&block).await {
                 state.chain.rollback_mined_block(&block);
-                tracing::error!("保存区块失败: {}", e);
+                tracing::error!("提交区块失败: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiResponse::error(e.to_string())),
                 ));
-            }
-
-            // 区块落库后再删除对应 pending。两者不是同一 SQLite 事务，删除失败必须显式返回错误。
-            for entry in &block.metadata_list {
-                if let Err(e) = state.storage.delete_pending_metadata(&entry.data_id).await {
-                    tracing::error!("删除已打包元数据失败: {}", e);
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::error(e.to_string())),
-                    ));
-                }
             }
             state.event_bus.publish(Event::new(
                 EventType::BlockMined,

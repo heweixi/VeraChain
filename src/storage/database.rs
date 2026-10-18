@@ -225,6 +225,44 @@ impl Storage {
         Ok(())
     }
 
+    /// 原子提交区块:在同一事务内写入区块并删除其已打包的 pending 元数据。
+    ///
+    /// 消除 save_block + delete_pending_metadata 两步之间崩溃导致的不一致窗口:
+    /// 要么区块与 pending 删除一起生效,要么都回滚。
+    pub async fn commit_block(&self, block: &Block) -> Result<()> {
+        let data = serde_json::to_string(block)?;
+        let timestamp = block.timestamp.timestamp();
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO blocks (block_index, timestamp, previous_hash, merkle_root, nonce, difficulty, hash, data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(block.index)
+        .bind(timestamp)
+        .bind(&block.previous_hash)
+        .bind(&block.merkle_root)
+        .bind(block.nonce as i64)
+        .bind(block.difficulty as i32)
+        .bind(&block.hash)
+        .bind(&data)
+        .execute(&mut *tx)
+        .await?;
+
+        for entry in &block.metadata_list {
+            sqlx::query("DELETE FROM pending_metadata WHERE data_id = ?")
+                .bind(&entry.data_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// 获取区块
     pub async fn get_block(&self, index: i64) -> Result<Block> {
         let row: (String,) = sqlx::query_as("SELECT data FROM blocks WHERE block_index = ?")
@@ -665,6 +703,54 @@ mod tests {
             .await
             .unwrap();
         assert!(storage.get_pending_metadata().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_block_atomically_removes_pending() {
+        use crate::core::{Block, MetadataEntry};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+
+        // 先放入两条 pending。
+        for id in ["d1", "d2"] {
+            let entry = MetadataEntry {
+                data_id: id.to_string(),
+                data_size: 1,
+                created_at: Utc::now(),
+                modified_at: Utc::now(),
+                owner: "t".to_string(),
+                hashes: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+                parent_id: None,
+                tags: Vec::new(),
+            };
+            storage.save_pending_metadata(&entry).await.unwrap();
+        }
+        assert_eq!(storage.get_pending_metadata().await.unwrap().len(), 2);
+
+        // 构造一个包含 d1 的区块并原子提交。
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.metadata_list.push(MetadataEntry {
+            data_id: "d1".to_string(),
+            data_size: 1,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            owner: "t".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        });
+        block.hash = "h".repeat(16);
+
+        storage.commit_block(&block).await.unwrap();
+
+        // 区块已落库;d1 的 pending 被同事务删除,d2 保留。
+        assert_eq!(storage.get_block_count().await.unwrap(), 1);
+        let remaining = storage.get_pending_metadata().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].data_id, "d2");
     }
 
     #[tokio::test]
