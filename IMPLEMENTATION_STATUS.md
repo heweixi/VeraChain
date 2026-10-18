@@ -1,8 +1,9 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-08-31，代码进度更新至提交 `17e5e70`。本阶段源码已实现的内容尚未因 247 磁盘满而重新执行 cargo/Docker 运行验证；语言诊断和 diff 检查通过。
+> 核实日期:2026-10-18，代码进度更新至提交 `4cf84f8`(R5 跨链证明与锚定)。
+> R0/R1/R5 已在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy 验证并做 HTTP smoke；R2/R3/R4/R6/R7/R8 待推进。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
-> 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查；未在本次拆分操作中重新执行 cargo、Docker 或运行时 smoke test。
+> 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
 ## 一、总体结论
 
@@ -28,7 +29,9 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 注册/登录/刷新 token | ⚠️ | 基础路径存在；注册失败写库只记日志仍返回 201；refresh token 无轮换、撤销和设备会话管理 |
 | 元数据创建/查询 | ⚠️ | `src/api/handlers.rs` 只把新元数据加入内存 pending；查询主要扫描已加载区块，没有独立 metadata 表 |
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿写库失败仍返回成功，链恢复/验证完整性不足 |
-| Merkle proof | 🔺 | `get_proof` 只返回命中区块、root 等信息，不返回 sibling/path，也没有真正调用 Merkle proof 验证流程；不能视为完整 Merkle proof |
+| Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
+| 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
+| 节点签名身份 | ✅ `4cf84f8`/247 已验证 | `src/node_signing.rs`:ed25519 密钥对(生成/base64 种子恢复/签名/验签);配置 `DATACHAIN_NODE_SECRET` 持久化,未配置则启动随机生成并打印公钥 |
 | 版本 API | ⚠️ | 元数据写入 SQLite，但文件内容快照未接入主流程；历史文件被覆盖或删除后不能可靠还原 |
 | WebSocket 实时事件 | ⚠️代码已接线/待验证 | `AppState` 持有 `WsHub`，连接有 JWT/连接数/消息大小保护；业务事件现在可经 EventBus 广播，但频道过滤和运行时 smoke test仍待验证 |
 | EventBus/通知 | ✅代码已接线/待验证 | `src/api/notification.rs` 已由 server 创建并注入；注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件 |
@@ -54,7 +57,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 启动恢复 | ⚠️ | `src/cli/server.rs` 恢复 blocks/users/versions，但恢复时没有完整验证索引、previous hash、PoW、Merkle root |
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ⏳ | pending metadata 只在内存；进入 pending 后进程退出、尚未挖矿时数据会丢失 |
-| attestation/identity/key transactions | 🧩 | Block 字段存在，但签名验证、身份注册、密钥轮换、交易处理和持久化业务流程未接入 |
+| attestation/identity/key transactions | ⚠️ `4cf84f8` | 节点 ed25519 身份 + 跨链锚定签名/验签已接入(见 2.1 跨链锚定);密钥轮换、链上身份注册交易、密钥撤销仍未实现 |
 | P2P/节点同步/冲突解决 | ⚠️基础同步已实现/仍不完整 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks` 提供显式 peer 注册、认证拉取/导入、最长合法链选择和定时同步；没有自动发现、广播网络、共识或同长度分叉选择 |
 
 ### 2.4 存储、迁移与恢复
@@ -74,7 +77,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | 时间/数量策略 | ⚠️ | 策略和 engine 存在，但聚合通常扫描所有历史 metadata，不区分未聚合部分 |
-| 递归汇总 | 🔺 | `RecursiveStrategy` 有阈值判断，但 engine 始终生成 `level: 1`、空 `parent_summaries` 的单层 summary，没有父汇总合并 |
+| 递归汇总 | ✅ `4cf84f8`/247 已验证 | `aggregate(Recursive)` 走 `aggregate_recursive`:自底向上,未合并 summary 数达 `recursive_threshold`(min(count_threshold,8)≥2)即合并为 level+1 父 summary;父 `merkle_root=build_merkle_root(子 root)`、`metadata_count/total_size` 累加、`parent_summaries` 记子 id、子标记 `is_merged`。`should_aggregate` 按每 level 未合并数触发递归。单测覆盖单层合并/阈值不足/多层(level1→2→3) |
 | 内容寻址存储 | 🧩 | `src/versioning/storage.rs` 功能较完整，但 server/HTTP track 使用 VersionTracker，未接入 ContentStorage |
 | 版本差异 | ⚠️ | diff 读取当前路径文件，不是版本快照；文件被覆盖/删除后无法可靠比较历史内容 |
 | 文件路径安全 | 🔺 | HTTP track 接受任意 `file_path`，缺根目录 allowlist、大小限制、符号链接限制和内容类型限制 |

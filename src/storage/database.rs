@@ -683,6 +683,7 @@ mod tests {
             merkle_root: "root".to_string(),
             metadata_count: 1,
             parent_summaries: Vec::new(),
+            is_merged: false,
         };
 
         storage.save_aggregation(&summary).await.unwrap();
