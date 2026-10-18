@@ -58,7 +58,7 @@ DataChain Rust 已具备真实的 Axum HTTP 服务、SQLite/SQLx 基础存储、
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
 | attestation/identity/key transactions | ⚠️ `4cf84f8` | 节点 ed25519 身份 + 跨链锚定签名/验签已接入(见 2.1 跨链锚定);密钥轮换、链上身份注册交易、密钥撤销仍未实现 |
-| P2P/节点同步/冲突解决 | ⚠️基础同步已实现/仍不完整 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks` 提供显式 peer 注册、认证拉取/导入、最长合法链选择和定时同步；没有自动发现、广播网络、共识或同长度分叉选择 |
+| P2P/节点同步/冲突解决 | ⚠️ `R6`/247 双节点已验证 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks`:显式注册 + **主动广播**(挖矿后 `broadcast_blocks` 推新块给 peers)+ **认证 gossip 发现**(`exchange_peers` 从已知 peer 拉取 peer 列表并入,跳过自身)+ 种子 peer(DATACHAIN_P2P_SEED_PEERS)+ 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。**仍无共识、同长度分叉选择**(⚠️ 单一诚实源假设)。双节点 smoke:a 挖矿→b 经广播增长, 双向 exchange_peers 互相发现 |
 
 ### 2.4 存储、迁移与恢复
 

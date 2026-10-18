@@ -287,6 +287,12 @@ pub async fn mine_block(
                 EventType::BlockMined,
                 serde_json::to_value(&block).unwrap_or_else(|_| serde_json::json!({})),
             ));
+            // 挖矿成功后向已注册 peer 主动广播新区块(异步,不阻塞响应)。
+            let p2p = state.p2p.clone();
+            let broadcast_block = block.clone();
+            tokio::spawn(async move {
+                p2p.broadcast_blocks(vec![broadcast_block]).await;
+            });
             Ok((StatusCode::CREATED, Json(ApiResponse::success(block))))
         }
         Err(e) => Err((

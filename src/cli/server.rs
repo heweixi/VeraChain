@@ -117,8 +117,30 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     }));
     scheduler.start();
 
-    let p2p = crate::p2p::P2PService::new();
+    let p2p = crate::p2p::P2PService::with_node_id(config.chain_identity.node_id.clone());
     let rate_limiter = Arc::new(api::RateLimiter::default());
+
+    // 注册种子 peer(可选):环境变量 DATACHAIN_P2P_SEED_PEERS,逗号分隔,
+    // 每项格式 peer_id|base_url[|auth_token]。用于 P2P 广播/发现的初始连接点。
+    if let Ok(seeds) = std::env::var("DATACHAIN_P2P_SEED_PEERS") {
+        for item in seeds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let parts: Vec<&str> = item.split('|').collect();
+            if parts.len() < 2 {
+                tracing::warn!("忽略非法种子 peer 配置: {}", item);
+                continue;
+            }
+            let reg = crate::p2p::PeerRegistration {
+                peer_id: parts[0].to_string(),
+                base_url: parts[1].to_string(),
+                auth_token: parts.get(2).map(|t| t.to_string()),
+            };
+            match p2p.register_peer(reg) {
+                Ok(peer) => info!("已注册种子 peer: {} ({})", peer.peer_id, peer.base_url),
+                Err(e) => tracing::warn!("注册种子 peer {} 失败: {}", parts[0], e),
+            }
+        }
+    }
+
     let _p2p_sync_task = p2p.clone().start_sync_loop(chain.clone());
 
     // 构造节点签名身份与跨链锚定服务。
