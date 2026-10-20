@@ -67,7 +67,23 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         config.jwt.expire_hours,
         storage.clone(),
     );
-    let metadata_manager = create_metadata_manager(chain.clone());
+    let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
+
+    // 回填 metadata 查询投影(backlog #5):把已加载区块里的元数据幂等 upsert 进投影表。
+    // 代码级 reconcile 而非纯 SQL migration——历史元数据存于 blocks.data 的区块 JSON 中,
+    // 由已反序列化的 Block 对象回填最稳妥(避免依赖 SQLite JSON 扩展解析)。
+    // data_id upsert 幂等:重启重复回填无副作用。
+    {
+        let backfilled = storage
+            .backfill_metadata_from_blocks(&chain.get_all_blocks())
+            .await?;
+        info!(
+            "metadata 投影回填完成: {} 条(投影表共 {} 条)",
+            backfilled,
+            storage.metadata_projection_count().await.unwrap_or(-1)
+        );
+    }
+
     let version_tracker = create_version_tracker();
     let aggregation_engine = create_aggregation_engine(
         chain.clone(),

@@ -190,11 +190,15 @@ pub async fn get_metadata(
     State(state): State<AppState>,
     Path(data_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.metadata_manager.get_by_data_id(&data_id) {
-        Some(entry) => Ok(Json(ApiResponse::success(entry))),
-        None => Err((
+    match state.metadata_manager.get_by_data_id(&data_id).await {
+        Ok(Some(entry)) => Ok(Json(ApiResponse::success(entry))),
+        Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("metadata not found")),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
         )),
     }
 }
@@ -202,7 +206,8 @@ pub async fn get_metadata(
 pub async fn query_metadata(
     State(state): State<AppState>,
     Query(mut req): Query<QueryMetadataRequest>,
-) -> Json<PaginatedResponse<crate::core::MetadataEntry>> {
+) -> Result<Json<PaginatedResponse<crate::core::MetadataEntry>>, (StatusCode, Json<ApiResponse<()>>)>
+{
     if req.page == 0 {
         req.page = 1;
     }
@@ -210,13 +215,18 @@ pub async fn query_metadata(
         req.page_size = 20;
     }
 
-    let results = state.metadata_manager.query(&req);
-    Json(PaginatedResponse {
+    let results = state.metadata_manager.query(&req).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )
+    })?;
+    Ok(Json(PaginatedResponse {
         total: results.len(),
         data: results,
         page: req.page,
         page_size: req.page_size,
-    })
+    }))
 }
 
 // ==================== 区块链处理器 ====================
@@ -728,16 +738,23 @@ pub struct StatsResponse {
     pub versions: crate::versioning::VersionStatistics,
 }
 
-pub async fn get_stats(State(state): State<AppState>) -> Json<ApiResponse<StatsResponse>> {
+pub async fn get_stats(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<StatsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let chain = state.chain.get_chain_info();
-    let metadata = state.metadata_manager.get_statistics();
+    let metadata = state.metadata_manager.get_statistics().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )
+    })?;
     let versions = state.version_tracker.get_statistics();
 
-    Json(ApiResponse::success(StatsResponse {
+    Ok(Json(ApiResponse::success(StatsResponse {
         chain,
         metadata,
         versions,
-    }))
+    })))
 }
 
 // ==================== Attestation 处理器 (Task 19) ====================

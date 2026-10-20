@@ -58,7 +58,7 @@ async fn build_state(dsn: &str) -> AppState {
         auth_service.load_user(user);
     }
 
-    let metadata_manager = create_metadata_manager(chain.clone());
+    let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
     let version_tracker = {
         let dir = tempfile::tempdir().unwrap().keep();
         Arc::new(datachain::versioning::VersionTracker::new_with_content_dir(dir).unwrap())

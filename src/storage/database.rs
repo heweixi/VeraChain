@@ -56,6 +56,10 @@ impl Storage {
                 4,
                 include_str!("../../migrations/004_revoked_refresh_tokens.sql"),
             ),
+            (
+                5,
+                include_str!("../../migrations/005_metadata_projection.sql"),
+            ),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -151,6 +155,33 @@ impl Storage {
                 .bind(&entry.data_id)
                 .execute(&mut *tx)
                 .await?;
+
+            // 同事务写入 metadata 查询投影(只读副本,权威源仍是区块 metadata_list)。
+            // data_id upsert 保证幂等:重放/回填同一条目不会重复。
+            let entry_json = serde_json::to_string(entry)?;
+            let tags_json = serde_json::to_string(&entry.tags)?;
+            sqlx::query(
+                r#"
+                INSERT INTO metadata (data_id, owner, data_size, created_at, block_index, tags, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(data_id) DO UPDATE SET
+                    owner = excluded.owner,
+                    data_size = excluded.data_size,
+                    created_at = excluded.created_at,
+                    block_index = excluded.block_index,
+                    tags = excluded.tags,
+                    data = excluded.data
+                "#,
+            )
+            .bind(&entry.data_id)
+            .bind(&entry.owner)
+            .bind(entry.data_size)
+            .bind(entry.created_at.timestamp())
+            .bind(block.index)
+            .bind(&tags_json)
+            .bind(&entry_json)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -673,6 +704,116 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
+    // ==================== metadata 查询投影(backlog #5) ====================
+
+    /// 幂等 upsert 一条 metadata 投影。用于启动时回填历史区块元数据。
+    /// 与 commit_block 内的投影写入逻辑一致,data_id 冲突即更新。
+    pub async fn upsert_metadata_projection(
+        &self,
+        entry: &MetadataEntry,
+        block_index: i64,
+    ) -> Result<()> {
+        let entry_json = serde_json::to_string(entry)?;
+        let tags_json = serde_json::to_string(&entry.tags)?;
+        sqlx::query(
+            r#"
+            INSERT INTO metadata (data_id, owner, data_size, created_at, block_index, tags, data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(data_id) DO UPDATE SET
+                owner = excluded.owner,
+                data_size = excluded.data_size,
+                created_at = excluded.created_at,
+                block_index = excluded.block_index,
+                tags = excluded.tags,
+                data = excluded.data
+            "#,
+        )
+        .bind(&entry.data_id)
+        .bind(&entry.owner)
+        .bind(entry.data_size)
+        .bind(entry.created_at.timestamp())
+        .bind(block_index)
+        .bind(&tags_json)
+        .bind(&entry_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 从已加载区块回填 metadata 投影(代码级 reconcile)。幂等,返回回填条目数。
+    /// server 启动与 CLI 读命令前调用,确保投影覆盖历史上链元数据。
+    pub async fn backfill_metadata_from_blocks(&self, blocks: &[Block]) -> Result<usize> {
+        let mut n = 0usize;
+        for block in blocks {
+            for entry in &block.metadata_list {
+                self.upsert_metadata_projection(entry, block.index).await?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// 投影表当前行数(回填时用于判断/日志)。
+    pub async fn metadata_projection_count(&self) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM metadata")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
+    /// 按 data_id 从投影读取单条元数据。
+    pub async fn get_metadata_by_id(&self, data_id: &str) -> Result<Option<MetadataEntry>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT data FROM metadata WHERE data_id = ?")
+            .bind(data_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 按可选 owner / 时间范围过滤查询投影(过滤下推 SQL),按 created_at 升序返回。
+    /// tag 过滤与分页由上层(MetadataManager)在结果上做,保持投影表最小。
+    pub async fn query_metadata(
+        &self,
+        owner: Option<&str>,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
+    ) -> Result<Vec<MetadataEntry>> {
+        let mut sql = String::from("SELECT data FROM metadata WHERE 1=1");
+        if owner.is_some() {
+            sql.push_str(" AND owner = ?");
+        }
+        if start_ts.is_some() {
+            sql.push_str(" AND created_at >= ?");
+        }
+        if end_ts.is_some() {
+            sql.push_str(" AND created_at <= ?");
+        }
+        sql.push_str(" ORDER BY created_at ASC, data_id ASC");
+
+        let mut q = sqlx::query_as::<_, (String,)>(&sql);
+        if let Some(o) = owner {
+            q = q.bind(o.to_string());
+        }
+        if let Some(s) = start_ts {
+            q = q.bind(s);
+        }
+        if let Some(e) = end_ts {
+            q = q.bind(e);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
+    /// 读取全部投影元数据(统计/全量列举用)。
+    pub async fn get_all_metadata(&self) -> Result<Vec<MetadataEntry>> {
+        self.query_metadata(None, None, None).await
+    }
+
     /// 关闭存储
     pub async fn close(&self) {
         self.pool.close().await;
@@ -936,5 +1077,63 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!storage.is_jti_revoked("old").await.unwrap());
         assert!(storage.is_jti_revoked("fresh").await.unwrap());
+    }
+
+    /// backlog #5:commit_block 写 metadata 投影,query/get_by_id 命中;回填幂等。
+    #[tokio::test]
+    async fn metadata_projection_written_on_commit_and_queryable() {
+        use crate::core::{Block, MetadataEntry};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+
+        let mk = |data_id: &str, owner: &str, tags: Vec<String>| MetadataEntry {
+            data_id: data_id.to_string(),
+            data_size: 10,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            owner: owner.to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags,
+        };
+
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.hash = "h".repeat(16);
+        block
+            .metadata_list
+            .push(mk("m1", "alice", vec!["x".into()]));
+        block.metadata_list.push(mk("m2", "bob", vec!["y".into()]));
+
+        storage.commit_block(&block).await.unwrap();
+
+        // 投影写入:按 id / owner / 全量可查。
+        assert_eq!(storage.metadata_projection_count().await.unwrap(), 2);
+        assert_eq!(
+            storage
+                .get_metadata_by_id("m1")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner,
+            "alice"
+        );
+        assert!(storage.get_metadata_by_id("nope").await.unwrap().is_none());
+        let alice = storage
+            .query_metadata(Some("alice"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].data_id, "m1");
+        assert_eq!(storage.get_all_metadata().await.unwrap().len(), 2);
+
+        // 回填幂等:对同一区块再回填,计数不变。
+        let n = storage
+            .backfill_metadata_from_blocks(std::slice::from_ref(&block))
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(storage.metadata_projection_count().await.unwrap(), 2);
     }
 }

@@ -40,7 +40,7 @@ async fn build_state(dsn: &str) -> (AppState, Arc<datachain::storage::Storage>) 
         auth_service.load_user(user);
     }
 
-    let metadata_manager = create_metadata_manager(chain.clone());
+    let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
     let version_tracker = {
         // 版本内容快照目录用临时目录,避免污染工作区。
         let dir = tempfile::tempdir().unwrap().keep();

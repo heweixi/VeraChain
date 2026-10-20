@@ -4,23 +4,34 @@ use super::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::core::{Chain, MetadataEntry};
 use crate::crypto::HashEngine;
 use crate::error::Result;
+use crate::storage::Storage;
 
-/// 元数据管理器
+/// 元数据管理器。
+///
+/// 写路径(create)仍把元数据加入链的待打包队列——区块里的 metadata_list 是**权威事实源**。
+/// 读路径(query/get_*/statistics)改走 `metadata` 查询投影表(backlog #5),
+/// 由 `Storage::commit_block` 在元数据上链时同事务写入、启动时回填补齐,
+/// 避免每次查询都把整条链加载进内存做线性扫描。
+///
+/// 一致性边界:投影是只读副本,只覆盖**已上链**的元数据;尚在 pending(未挖矿)的
+/// 元数据不出现在查询结果中(与此前基于已加载区块扫描的行为一致)。
 pub struct MetadataManager {
     chain: Arc<Chain>,
+    storage: Arc<Storage>,
     hash_engine: HashEngine,
 }
 
 impl MetadataManager {
     /// 创建元数据管理器
-    pub fn new(chain: Arc<Chain>) -> Self {
+    pub fn new(chain: Arc<Chain>, storage: Arc<Storage>) -> Self {
         Self {
             chain,
+            storage,
             hash_engine: HashEngine::new(None),
         }
     }
 
-    /// 创建元数据
+    /// 创建元数据(写路径:加入链的待打包队列,权威源)。保持同步、行为不变。
     pub fn create(&self, req: &CreateMetadataRequest, username: &str) -> Result<MetadataEntry> {
         let owner = req.owner.clone().unwrap_or_else(|| username.to_string());
 
@@ -56,171 +67,107 @@ impl MetadataManager {
         self.create(req, username)
     }
 
-    /// 根据数据 ID 获取元数据
-    pub fn get_by_data_id(&self, data_id: &str) -> Option<MetadataEntry> {
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            for entry in &block.metadata_list {
-                if entry.data_id == data_id {
-                    return Some(entry.clone());
-                }
-            }
-        }
-        None
+    /// 根据数据 ID 获取元数据(读投影)。
+    pub async fn get_by_data_id(&self, data_id: &str) -> Result<Option<MetadataEntry>> {
+        self.storage.get_metadata_by_id(data_id).await
     }
 
-    /// 查询元数据
-    pub fn query(&self, req: &QueryMetadataRequest) -> Vec<MetadataEntry> {
-        let mut results = Vec::new();
+    /// 查询元数据(读投影)。owner / 时间范围下推 SQL;data_id / tag 过滤与分页在结果上做。
+    pub async fn query(&self, req: &QueryMetadataRequest) -> Result<Vec<MetadataEntry>> {
+        let mut results = self
+            .storage
+            .query_metadata(
+                req.owner.as_deref(),
+                req.start_time.map(|t| t.timestamp()),
+                req.end_time.map(|t| t.timestamp()),
+            )
+            .await?;
 
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            for entry in &block.metadata_list {
-                if self.match_entry(entry, req) {
-                    results.push(entry.clone());
-                }
-            }
+        if let Some(data_id) = &req.data_id {
+            results.retain(|e| &e.data_id == data_id);
+        }
+        if !req.tags.is_empty() {
+            results.retain(|e| req.tags.iter().any(|t| e.tags.contains(t)));
         }
 
         // 分页
-        let start = (req.page - 1) * req.page_size;
+        let start = (req.page.saturating_sub(1)) * req.page_size;
         if start >= results.len() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let end = (start + req.page_size).min(results.len());
-        results[start..end].to_vec()
+        Ok(results[start..end].to_vec())
     }
 
-    /// 匹配元数据条目
-    fn match_entry(&self, entry: &MetadataEntry, req: &QueryMetadataRequest) -> bool {
-        if let Some(data_id) = &req.data_id {
-            if &entry.data_id != data_id {
-                return false;
-            }
-        }
-
-        if let Some(owner) = &req.owner {
-            if &entry.owner != owner {
-                return false;
-            }
-        }
-
-        if let Some(start_time) = req.start_time {
-            if entry.created_at < start_time {
-                return false;
-            }
-        }
-
-        if let Some(end_time) = req.end_time {
-            if entry.created_at > end_time {
-                return false;
-            }
-        }
-
-        if !req.tags.is_empty() {
-            let has_any_tag = req.tags.iter().any(|t| entry.tags.contains(t));
-            if !has_any_tag {
-                return false;
-            }
-        }
-
-        true
+    /// 根据所有者获取元数据(读投影)。
+    pub async fn get_by_owner(&self, owner: &str) -> Result<Vec<MetadataEntry>> {
+        self.storage.query_metadata(Some(owner), None, None).await
     }
 
-    /// 根据所有者获取元数据
-    pub fn get_by_owner(&self, owner: &str) -> Vec<MetadataEntry> {
-        let mut results = Vec::new();
-
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            for entry in &block.metadata_list {
-                if entry.owner == owner {
-                    results.push(entry.clone());
-                }
-            }
-        }
-
-        results
+    /// 根据标签获取元数据(读投影 + 应用层 tag 过滤)。
+    pub async fn get_by_tags(&self, tags: &[String]) -> Result<Vec<MetadataEntry>> {
+        let all = self.storage.get_all_metadata().await?;
+        Ok(all
+            .into_iter()
+            .filter(|e| tags.iter().any(|t| e.tags.contains(t)))
+            .collect())
     }
 
-    /// 根据标签获取元数据
-    pub fn get_by_tags(&self, tags: &[String]) -> Vec<MetadataEntry> {
-        let mut results = Vec::new();
-
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            for entry in &block.metadata_list {
-                let has_any_tag = tags.iter().any(|t| entry.tags.contains(t));
-                if has_any_tag {
-                    results.push(entry.clone());
-                }
-            }
-        }
-
-        results
+    /// 获取所有元数据(读投影)。
+    pub async fn get_all(&self) -> Result<Vec<MetadataEntry>> {
+        self.storage.get_all_metadata().await
     }
 
-    /// 获取所有元数据
-    pub fn get_all(&self) -> Vec<MetadataEntry> {
-        let mut results = Vec::new();
+    /// 获取统计信息(读投影;pending_count 仍取自链的待打包队列)。
+    pub async fn get_statistics(&self) -> Result<MetadataStatistics> {
+        let entries = self.storage.get_all_metadata().await?;
 
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            results.extend(block.metadata_list.clone());
-        }
-
-        results
-    }
-
-    /// 获取统计信息
-    pub fn get_statistics(&self) -> MetadataStatistics {
-        let mut total_metadata = 0;
+        let mut total_metadata = 0usize;
         let mut total_size: i64 = 0;
         let mut owners = std::collections::HashMap::new();
         let mut tags = std::collections::HashMap::new();
 
-        let blocks = self.chain.get_all_blocks();
-        for block in blocks {
-            for entry in &block.metadata_list {
-                total_metadata += 1;
-                total_size += entry.data_size;
-                *owners.entry(entry.owner.clone()).or_insert(0) += 1;
-
-                for tag in &entry.tags {
-                    *tags.entry(tag.clone()).or_insert(0) += 1;
-                }
+        for entry in &entries {
+            total_metadata += 1;
+            total_size += entry.data_size;
+            *owners.entry(entry.owner.clone()).or_insert(0) += 1;
+            for tag in &entry.tags {
+                *tags.entry(tag.clone()).or_insert(0) += 1;
             }
         }
 
-        // Top owners
         let mut top_owners: Vec<_> = owners.into_iter().collect();
         top_owners.sort_by(|a, b| b.1.cmp(&a.1));
         top_owners.truncate(10);
 
-        // Top tags
         let mut top_tags: Vec<_> = tags.into_iter().collect();
         top_tags.sort_by(|a, b| b.1.cmp(&a.1));
         top_tags.truncate(10);
 
-        MetadataStatistics {
+        Ok(MetadataStatistics {
             total_metadata,
             total_size,
             unique_owners: top_owners.len(),
             pending_count: self.chain.get_pending_count(),
             top_owners,
             top_tags,
-        }
+        })
     }
 
-    /// 验证哈希
-    pub fn verify_hash(&self, data_id: &str, content: &[u8], algorithm: &str) -> bool {
-        if let Some(entry) = self.get_by_data_id(data_id) {
+    /// 验证哈希(读投影取条目)。
+    pub async fn verify_hash(
+        &self,
+        data_id: &str,
+        content: &[u8],
+        algorithm: &str,
+    ) -> Result<bool> {
+        if let Some(entry) = self.get_by_data_id(data_id).await? {
             if let Some(stored_hash) = entry.hashes.get(algorithm) {
                 let computed_hash = self.hash_engine.compute_hash(content, algorithm);
-                return &computed_hash == stored_hash;
+                return Ok(&computed_hash == stored_hash);
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -236,6 +183,6 @@ pub struct MetadataStatistics {
 }
 
 /// 创建共享的 MetadataManager 实例
-pub fn create_metadata_manager(chain: Arc<Chain>) -> Arc<MetadataManager> {
-    Arc::new(MetadataManager::new(chain))
+pub fn create_metadata_manager(chain: Arc<Chain>, storage: Arc<Storage>) -> Arc<MetadataManager> {
+    Arc::new(MetadataManager::new(chain, storage))
 }

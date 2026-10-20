@@ -72,7 +72,12 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
         chain.load_blocks(blocks);
     }
 
-    let manager = create_metadata_manager(chain);
+    // 回填 metadata 投影,确保读命令(list/get/query/stats)能命中历史上链元数据。
+    storage
+        .backfill_metadata_from_blocks(&chain.get_all_blocks())
+        .await?;
+
+    let manager = create_metadata_manager(chain, storage.clone());
 
     match action {
         MetadataAction::Add {
@@ -122,7 +127,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
                 page_size,
             };
 
-            let results = manager.query(&req);
+            let results = manager.query(&req).await?;
             println!("元数据列表 (第 {} 页)", page);
             println!("==========");
 
@@ -136,7 +141,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
                 );
             }
         }
-        MetadataAction::Get { data_id } => match manager.get_by_data_id(&data_id) {
+        MetadataAction::Get { data_id } => match manager.get_by_data_id(&data_id).await? {
             Some(entry) => {
                 println!("元数据详情");
                 println!("==========");
@@ -175,7 +180,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
                 page_size: 50,
             };
 
-            let results = manager.query(&req);
+            let results = manager.query(&req).await?;
             println!("查询结果: {} 条", results.len());
 
             for entry in results {
@@ -186,7 +191,7 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
             }
         }
         MetadataAction::Stats => {
-            let stats = manager.get_statistics();
+            let stats = manager.get_statistics().await?;
             println!("元数据统计");
             println!("==========");
             println!("总数量: {}", stats.total_metadata);
