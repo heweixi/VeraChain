@@ -1,5 +1,11 @@
 # DataChain Rust 流程说明(基于现有代码)
 
+> 图片版: `docs/FLOW.png`(位图) / `docs/FLOW.svg`(矢量,放大看字段细节),
+> 源定义 `docs/FLOW.mmd`(Mermaid);重新生成:
+> `npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/FLOW.mmd -o docs/FLOW.png -b white`。
+
+![DataChain 完整流程图](./FLOW.png)
+
 > 最后核实:2026-10-18,对应提交 `4a8c025`(R0-R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1)。
 > 本文仅描述**已实现并经 247 验证**的行为;未实现的 L2(多外链锚定)/L3(锚定进展回写)/
 > L4(失信切换)/L5(封存重启) 不在此图内,见 `IMPLEMENTATION_STATUS.md` 第四节后续建议。

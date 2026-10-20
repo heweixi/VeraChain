@@ -1,0 +1,69 @@
+%% DataChain Rust 完整流程图(基于现有代码,提交 4a8c025)
+%% 渲染: npx -y @mermaid-js/mermaid-cli -i docs/FLOW.mmd -o docs/FLOW.png
+flowchart TB
+    client["客户端 / CLI"]
+
+    subgraph ROUTER["Axum Router"]
+        pub_r["公开路由<br/>/health<br/>/auth/register<br/>/auth/login<br/>/auth/refresh"]
+        auth_mw["auth_middleware<br/>校验 Bearer JWT 到 Claims<br/>required_permission(method,path) RBAC"]
+        prot_r["保护路由 /api/v1/**"]
+    end
+    client --> pub_r
+    client --> auth_mw --> prot_r
+
+    %% ===== 链路 A: 元数据创建 → 挖矿 → 查询 =====
+    subgraph LA["链路 A 元数据"]
+        a1["POST /api/v1/metadata<br/>CreateMetadataRequest{data_size,owner?,<br/>hashes,metadata,parent_id,tags,content?}"]
+        a2["MetadataManager::create<br/>生成 MetadataEntry{data_id=uuid,data_size,<br/>created_at,modified_at,owner,hashes,<br/>metadata,parent_id,tags}"]
+        a3["chain.add_metadata → pending<br/>Storage::save_pending_metadata<br/>pending_metadata(data_id PK, data=JSON)"]
+        aq["GET /api/v1/metadata?owner=&tags=<br/>Storage::query_metadata<br/>SELECT data WHERE owner=? AND created_at BETWEEN<br/>→ 应用层过滤 tag/分页"]
+        a1 --> a2 --> a3
+    end
+
+    %% ===== 链路 B: 链上身份 L1 =====
+    subgraph LB["链路 B 链上身份 L1"]
+        b1["POST /identity/key-transaction (RBAC BlockMine)<br/>KeyTransactionRequest{tx_type,target_key,<br/>role,label,signed_by,signature,reason}"]
+        b2["build_verified_key_transaction<br/>register 须自签(signed_by==target_key)<br/>verify_base64(signed_by, signing_payload, signature)<br/>signing_payload = tx_type|target_key|role|label|signed_by"]
+        b3["chain.add_key_transaction → pending_key_tx<br/>KeyTransactionEntry{...,timestamp=服务端now}"]
+        bq["GET /identity/keys (RBAC BlockRead)<br/>replay_key_set(all blocks)<br/>register→insert active / revoke→remove<br/>→ Vec KeyRecord"]
+        b1 --> b2 --> b3
+    end
+
+    %% ===== 挖矿 + Chain + Block =====
+    subgraph CHAIN["Chain 内存 + 挖矿"]
+        chain_state["Chain{blocks:Vec Block,<br/>pending:Vec MetadataEntry,<br/>pending_key_tx:Vec KeyTx}"]
+        mine["POST /chain/mine → Chain::mine_block<br/>取 pending(≤block_size)+全部 pending_key_tx"]
+        block["Block{index,timestamp,previous_hash,<br/>metadata_list,key_transactions,nonce,difficulty,hash}<br/>mine(): merkle_root=build_merkle_root(<br/>metadata.map SHA256(data_id) ++ key_tx.map leaf_hash)<br/>PoW nonce++ 直到 hash 前缀 difficulty 个0<br/>挖后 identity_snapshot_hash=<br/>compute_identity_snapshot_hash(replay_key_set(all))"]
+        chain_state --> mine --> block
+    end
+    a3 --> chain_state
+    b3 --> chain_state
+
+    %% ===== 持久化 =====
+    subgraph DB["SQLite (SQLx)"]
+        commit["Storage::commit_block 单事务<br/>INSERT blocks(block_index,timestamp,previous_hash,<br/>merkle_root,nonce,difficulty,hash,data=整块JSON)<br/>FOR metadata: DELETE pending_metadata<br/>+ UPSERT metadata(data_id PK,owner,data_size,<br/>created_at,block_index,tags,data)"]
+        tables["其他表: users / versions / aggregations<br/>schema_migrations / anchor_outbox<br/>revoked_refresh_tokens / metadata(投影)"]
+    end
+    block --> commit --> tables
+    commit --> aq
+    commit --> bq
+
+    %% ===== 挖矿后扇出 =====
+    commit --> ev["EventBus→WsHub<br/>BlockMined → WS block_added"]
+    commit --> p2p["P2PService broadcast_blocks→peers<br/>exchange_peers 发现 / sync_peer 最长链替换"]
+
+    %% ===== 链路 C: 数据锚定 R5 =====
+    subgraph LC["链路 C 数据锚定 R5 (单外链)"]
+        c1["POST /crosschain/anchor/:data_id (RBAC BlockMine)<br/>查 data_id 所在 block + MerkleProof"]
+        c2["AnchorService::enqueue_anchor<br/>ChainAnchor{anchor_id,source_chain_id,source_node_id,<br/>target_chain_id,data_id,block_hash,merkle_root,<br/>proof(leaf,leaf_index,siblings,sibling_is_left,root),created_at}<br/>sign_base64(signing_payload)<br/>payload=anchor_id|src_chain|src_node|tgt_chain|<br/>data_id|block_hash|merkle_root|proof.root"]
+        c3["Storage::enqueue_anchor<br/>anchor_outbox(anchor_id PK,target_chain_id,data_id,<br/>signed=JSON,status=pending,attempts=0,receipt)"]
+        c4["worker 每30s process_pending<br/>connector.deliver→HttpAttestationConnector<br/>POST anchor_endpoint(Bearer token)<br/>成功→AnchorReceipt{anchor_id,target_chain_id,<br/>target_ref,confirmed_at} status=confirmed<br/>失败→attempts+1, ≥8→failed"]
+        cq["GET /crosschain/anchor/status/:anchor_id"]
+        c1 --> c2 --> c3 --> c4 --> cq
+    end
+    block -.data_id 来自已上链区块.-> c1
+    c4 ==>|单条外链| ext["外部认证链 / attestation 服务"]
+
+    classDef note fill:#fff3cd,stroke:#d39e00,color:#333;
+    note1["权威根: 区块+merkle_root+PoW<br/>投影表/outbox/回执均为派生或旁路<br/>identity_snapshot_hash 不进 PoW、不进锚定 payload<br/>merkle_root 只覆盖本区块;可信根靠外链锚定(内部不共识)<br/>L2 多外链/L3 进展回写/L4 失信切换/L5 封存重启 未实现"]:::note
+    DB --- note1
