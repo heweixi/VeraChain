@@ -1,7 +1,12 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `b239df6`(backlog #5 metadata 查询投影表)。
-> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 集成测试)、#3(refresh token 持久化)、#6(纯 migration 驱动)、#5(metadata 查询投影表)已补并在 247 验证。
+> 核实日期:2026-10-18，代码进度更新至提交 `5bf05c8`(跨链认证网 L1 链上身份最小版)。
+> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4/#3/#6/#5 及跨链认证网 L1 已补并在 247 验证。
+>
+> **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
+> 可信根来自把数据 merkle_root 与身份快照**锚定到多条外部去中心化公共链**,由外链不可篡改性
+> 为 DataChain 数据/身份背书。外链→本链的认证走正常上链路径(无特殊逻辑)。分层:L0 单链锚定(R5✅)
+> → L1 链上身份(✅ `5bf05c8`)→ L2 多外链锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
 > 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
@@ -21,7 +26,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ R7 测试:55 单测 + 4 集成测试(`tests/api_integration.rs`:health/401/RBAC 越权/SQLite 重启恢复),双节点 smoke 验证广播/发现。
 
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
-- ⚠️ P2P 无共识、无同长度分叉选择(单一诚实源假设);无跨链密钥轮换与链上身份注册交易。
+- ⚠️ P2P 内部无共识、无同长度分叉选择——这是**有意设计**(见认证网主线:可信根在外链锚定,非内部自证),非缺陷。链上身份注册/撤销已由 L1 接入(`5bf05c8`);密钥轮换状态机、多外链锚定(L2)、回执回写(L3)、失信切换(L4)、自身封存重启(L5)待后续。
 - ✅ refresh token 持久化 + token-family 复用检测已补(见 `1124baa`/247 lib 62+集成 12 passed):撤销落 SQLite(重启不失忆)、复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。WebSocket 收发自动化集成测试已补(`97eeee5`/8 passed)。
 - 🔺 WebSocket 频道(`/ws/chain`、`/ws/metadata`、`/ws/aggregation`)当前都订阅同一 `WsHub` 的**全量广播**,服务端 `handle_channel_socket` 不按频道过滤;任何 EventBus 事件会推给所有频道客户端。真正的频道隔离(如 `/ws/chain` 只收 chain 事件)未实现,属已知遗留(非 backlog #4 范围,#4 只验证"频道客户端能收到广播")。
 - ✅ metadata 查询投影表已接入(`b239df6`):独立 `metadata` 表作为只读查询投影(权威源仍是区块 metadata_list),commit_block 同事务 upsert、启动/CLI 代码级回填,读路径走 SQL 不再扫链。注册失败写库返回语义已在 #3 收敛为 500。仍未做:tag 关联表、pending 联合查询(最小版有意不做)。
@@ -66,7 +71,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 启动恢复 | ⚠️ | `src/cli/server.rs` 恢复 blocks/users/versions，但恢复时没有完整验证索引、previous hash、PoW、Merkle root |
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
-| attestation/identity/key transactions | ⚠️ `4cf84f8` | 节点 ed25519 身份 + 跨链锚定签名/验签已接入(见 2.1 跨链锚定);密钥轮换、链上身份注册交易、密钥撤销仍未实现 |
+| attestation/identity/key transactions | ⚠️ `5bf05c8`/247 已验证 | 链上身份最小版(L1)已接入:`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。**仍未做**:密钥轮换状态机、Merkle 身份树、pending key_tx 持久化(仅内存,重启丢未打包交易,幂等可重提);attestation 仍只在 verify_content 读、无专门提交流程 |
 | P2P/节点同步/冲突解决 | ⚠️ `R6`/247 双节点已验证 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks`:显式注册 + **主动广播**(挖矿后 `broadcast_blocks` 推新块给 peers)+ **认证 gossip 发现**(`exchange_peers` 从已知 peer 拉取 peer 列表并入,跳过自身)+ 种子 peer(DATACHAIN_P2P_SEED_PEERS)+ 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。**仍无共识、同长度分叉选择**(⚠️ 单一诚实源假设)。双节点 smoke:a 挖矿→b 经广播增长, 双向 exchange_peers 互相发现 |
 
 ### 2.4 存储、迁移与恢复
@@ -117,7 +122,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ #4 WebSocket 收发自动化集成测试 — `97eeee5` 247 `cargo test --test websocket_integration` 8 passed。
 - ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。
 - P2P 共识与分叉选择(当前为单一诚实源假设)。
-- 跨链密钥轮换与链上身份注册交易。
+- ✅ 链上身份注册/撤销(认证网 L1) — `5bf05c8` key-transaction 验签+进 merkle+密钥集重放+快照哈希。
+- 跨链认证网后续: L2 多外链锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计);密钥轮换状态机(完整版身份)。
 - 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
 - ✅ #6 纯 migration 驱动 — `13ded24` 移除 init_tables 兜底,建表事实源唯一化,旧库升级回归测试通过。回滚(自动 down)/数据回填按用户确认有意推迟。
 - ✅ #5 独立 metadata 查询表 — `b239df6` migration 005 投影表 + commit_block 同事务 upsert + 代码级回填 reconcile,读路径走 SQL(lib 64 含投影测试)。tag 关联表/pending 联合查询为最小版有意不做。

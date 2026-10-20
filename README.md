@@ -1,7 +1,7 @@
 # DataChain Rust
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
-> 最后核实:2026-10-18(进度至 R7 + backlog #4/#3/#6/#5,提交 `b239df6`;#5=metadata 查询投影表)。
+> 最后核实:2026-10-18(进度至 R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1 链上身份,提交 `5bf05c8`)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -182,6 +182,17 @@ datachain version diff <v1> <v2>
 | GET | /api/v1/chain/info | 获取链信息 |
 | POST | /api/v1/chain/mine | 挖掘新区块 |
 | POST | /api/v1/chain/validate | 验证链完整性 |
+
+### 链上身份(认证网 L1)
+
+> 密钥交易经 ed25519 验签后进待打包队列,下次挖矿随区块上链并进入 merkle_root 受 PoW 保护;
+> 当前有效密钥集由重放 key_transactions 得出。register 需自签(signed_by==target_key)。
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | /api/v1/identity/key-transaction | 提交密钥交易(register/revoke) |
+| GET | /api/v1/identity/keys | 当前有效密钥集 |
+| GET | /api/v1/identity/keys/:public_key | 单个公钥状态 |
 
 ### 版本
 
