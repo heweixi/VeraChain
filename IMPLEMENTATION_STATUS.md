@@ -1,8 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `97eeee5`(backlog #4 WebSocket 集成测试)。
-> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 实时事件集成测试)已补并在 247 验证。
-> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)。
+> 核实日期:2026-10-18，代码进度更新至提交 `1124baa`(backlog #3 refresh token 持久化)。
+> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 集成测试)、#3(refresh token 持久化)已补并在 247 验证。
+> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
@@ -22,7 +22,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
 - ⚠️ P2P 无共识、无同长度分叉选择(单一诚实源假设);无跨链密钥轮换与链上身份注册交易。
-- ⚠️ refresh token 轮换未补(WebSocket 收发自动化集成测试已补,见 `97eeee5`/247 8 passed)。
+- ✅ refresh token 持久化 + token-family 复用检测已补(见 `1124baa`/247 lib 62+集成 12 passed):撤销落 SQLite(重启不失忆)、复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。WebSocket 收发自动化集成测试已补(`97eeee5`/8 passed)。
 - 🔺 WebSocket 频道(`/ws/chain`、`/ws/metadata`、`/ws/aggregation`)当前都订阅同一 `WsHub` 的**全量广播**,服务端 `handle_channel_socket` 不按频道过滤;任何 EventBus 事件会推给所有频道客户端。真正的频道隔离(如 `/ws/chain` 只收 chain 事件)未实现,属已知遗留(非 backlog #4 范围,#4 只验证"频道客户端能收到广播")。
 - ⚠️ 元数据仍以内存 pending + 区块 JSON 为主,无独立 metadata 查询表;注册失败写库的返回语义待收敛。
 - ⚠️ 旧 `init_tables` 幂等建表作为兼容兜底与 migration 并存,未纯 migration 驱动。
@@ -34,7 +34,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | 健康检查 | ✅ | `src/api/handlers.rs` 的 `health_check`；Docker healthcheck 请求 `/health` |
-| 注册/登录/刷新 token | ⚠️ | 基础路径存在；注册失败写库只记日志仍返回 201；refresh token 无轮换、撤销和设备会话管理 |
+| 注册/登录/刷新 token | ✅ `1124baa`/247 已验证 | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。设备会话管理仍未做(单 family 不区分设备) |
 | 元数据创建/查询 | ⚠️ | `src/api/handlers.rs` 只把新元数据加入内存 pending；查询主要扫描已加载区块，没有独立 metadata 表 |
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误);链恢复/验证完整性仍待加强(见启动恢复项) |
 | Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
@@ -49,7 +49,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
-| JWT access/refresh | ⚠️ | `src/auth/jwt.rs` 可生成/验证；缺 issuer/audience 强校验、撤销、轮换和设备会话管理；secret 安全前置已在 `fe93939` 接入，待编译验证 |
+| JWT access/refresh | ✅ `1124baa`/247 已验证 | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。仍缺:设备会话管理、access token 即时吊销(受 JWT 无状态固有限制,整族撤销对已签发 access 有最长一个 access 有效期的滞后) |
 | 用户持久化 | ⚠️ | 启动可从 SQLite 加载；运行中注册写库失败仍成功返回，运行中资料/密码管理 API 未完整提供 |
 | 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
 | RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
@@ -96,7 +96,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
 - ✅ 集成测试共 12 passed:`tests/api_integration.rs`(4,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 user 创建 anchor 403 / 读 proof 200 / admin anchor 200 pending、SQLite 重启恢复区块与用户,247 验证 4 passed)+ `tests/websocket_integration.rs`(8,真实 axum 服务 TcpListener + tokio-tungstenite 客户端真实握手/帧收发:握手鉴权、EventBus 广播三类事件、16KiB 消息上限、256 连接上限,247 验证 8 passed,`97eeee5`)。
 - ✅ 核心算法 + 新增能力单测共 55 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p)。
-- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试);refresh token 轮换自动化集成测试仍待补。WebSocket 收发自动化集成测试已补(见上 `97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
+- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 收发自动化集成测试已补(`97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
 ## 四、开发进度与后续建议
@@ -115,11 +115,11 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ### 后续建议(backlog,非当前目标)
 
 - ✅ #4 WebSocket 收发自动化集成测试 — `97eeee5` 247 `cargo test --test websocket_integration` 8 passed。
+- ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。
 - P2P 共识与分叉选择(当前为单一诚实源假设)。
 - 跨链密钥轮换与链上身份注册交易。
-- refresh token 轮换。
 - 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
-- 独立 metadata 查询表;注册失败写库返回语义收敛。
+- 独立 metadata 查询表(注册失败写库返回语义已在 #3 顺带收敛为 500)。
 - 纯 migration 驱动(移除 init_tables 兼容兜底);回滚/数据回填迁移。
 
 ## 五、独立仓库维护约定

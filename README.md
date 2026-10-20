@@ -1,7 +1,7 @@
 # DataChain Rust
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
-> 最后核实:2026-10-18(进度至 R7 + backlog #4 WebSocket 集成测试,提交 `97eeee5`)。
+> 最后核实:2026-10-18(进度至 R7 + backlog #4 WebSocket 集成测试 + #3 refresh token 持久化,提交 `1124baa`)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -15,10 +15,12 @@
 > - R7 集成测试 `tests/api_integration.rs`(health/401/RBAC 越权/SQLite 重启恢复)。
 > - backlog #4 WebSocket 实时事件集成测试 `tests/websocket_integration.rs`(握手鉴权/EventBus 广播/
 >   16KiB 消息上限/256 连接上限),`97eeee5` 247 验证 8 passed。
-> - 共 55 单测 + 12 集成测试(api 4 + websocket 8)通过。
+> - backlog #3 refresh token 持久化 + token-family 复用检测 `1124baa`:撤销落 SQLite(重启不失忆)、
+>   复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。
+> - 共 62 单测 + 12 集成测试(api 4 + websocket 8)通过。
 >
-> ⚠️ 仍未实现:P2P 共识与同长度分叉选择(单一诚实源假设)、密钥轮换/链上身份注册、
-> refresh token 轮换、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播,服务端不按频道过滤)。
+> ⚠️ 仍未实现:P2P 共识与同长度分叉选择(单一诚实源假设)、跨链密钥轮换/链上身份注册、
+> WebSocket 频道隔离(`/ws/chain` 等当前为全量广播,服务端不按频道过滤)、设备会话管理。
 > 具体以 `IMPLEMENTATION_STATUS.md` 为准。
 
 数据追溯区块链系统 - Rust 实现
