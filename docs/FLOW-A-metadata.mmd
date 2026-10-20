@@ -1,0 +1,20 @@
+%% 链路 A:元数据创建 → 挖矿上链 → 查询(带字段/计算)
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px"},"flowchart":{"nodeSpacing":55,"rankSpacing":65}}}%%
+flowchart TB
+    a1["① POST /api/v1/metadata<br/>CreateMetadataRequest {<br/>data_size, owner?, hashes,<br/>metadata, parent_id, tags, content? }"]:::api
+    a2["MetadataManager::create<br/>MetadataEntry {<br/>data_id = uuid(服务端生成),<br/>data_size, created_at, modified_at,<br/>owner, hashes, metadata, parent_id, tags }"]:::svc
+    a3["chain.add_metadata → pending<br/>Storage::save_pending_metadata<br/>pending_metadata(data_id PK, data=JSON)"]:::core
+    a4["② POST /api/v1/chain/mine<br/>Chain::mine_block<br/>取 pending(≤block_size) + 全部 pending_key_tx"]:::svc
+    a5["Block.mine()<br/>merkle_root = build_merkle_root(<br/>metadata.map SHA256(data_id)<br/>++ key_tx.map leaf_hash)<br/>PoW: nonce++ 直到 hash 前缀 difficulty 个 0"]:::core
+    a6["Storage::commit_block 单事务<br/>INSERT blocks(... data=整块JSON)<br/>FOR metadata: DELETE pending_metadata<br/>+ UPSERT metadata 投影(data_id PK, owner,<br/>data_size, created_at, block_index, tags, data)"]:::db
+    a7["EventBus.publish(BlockMined)<br/>→ WS block_added<br/>P2P broadcast_blocks → peers"]:::out
+    aq["③ GET /api/v1/metadata?owner=&tags=<br/>Storage::query_metadata<br/>SELECT data WHERE owner=? AND created_at BETWEEN<br/>→ 应用层过滤 tag / 分页 → Vec&lt;MetadataEntry&gt;"]:::api
+
+    a1 --> a2 --> a3 --> a4 --> a5 --> a6 --> a7
+    a6 -.投影可查.-> aq
+
+    classDef api fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f;
+    classDef svc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+    classDef core fill:#dcfce7,stroke:#22c55e,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#f59e0b,color:#78350f;
+    classDef out fill:#fce7f3,stroke:#ec4899,color:#831843;

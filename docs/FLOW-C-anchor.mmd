@@ -1,0 +1,27 @@
+%% 链路 C:数据锚定 R5(现有单外链) —— 发起 → outbox → worker 投递 → 回执(带字段/计算)
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px"},"flowchart":{"nodeSpacing":55,"rankSpacing":65}}}%%
+flowchart TB
+    c1["① POST /api/v1/crosschain/anchor/:data_id (RBAC: BlockMine)<br/>遍历 chain.blocks 找 data_id 所在 block + 其 MerkleProof"]:::api
+    c2["AnchorService::enqueue_anchor<br/>ChainAnchor {<br/>anchor_id=uuid, source_chain_id, source_node_id,<br/>target_chain_id, data_id, block_hash, merkle_root,<br/>proof{leaf, leaf_index, siblings, sibling_is_left, root},<br/>created_at }"]:::svc
+    c3["签名 = NodeIdentity.sign_base64(signing_payload)<br/>signing_payload = anchor_id|source_chain_id|source_node_id|<br/>target_chain_id|data_id|block_hash|merkle_root|proof.root<br/>→ SignedChainAnchor { anchor, public_key, signature }"]:::svc
+    c4["Storage::enqueue_anchor<br/>anchor_outbox(anchor_id PK, target_chain_id, data_id,<br/>signed=JSON, status=pending, attempts=0, receipt)"]:::db
+    c5["② 后台 worker 每 30s process_pending<br/>list_pending_anchors(32)<br/>connector.deliver → HttpAttestationConnector<br/>POST anchor_endpoint (Bearer anchor_auth_token)"]:::out
+    c6ok["成功 → AnchorReceipt {<br/>anchor_id, target_chain_id, target_ref, confirmed_at }<br/>mark_anchor_confirmed(status=confirmed)"]:::core
+    c6err["失败 → attempts+1<br/>attempts ≥ 8 ? status=failed : pending<br/>mark_anchor_attempt(last_error)"]:::err
+    ext["外部认证链 / attestation 服务(单条)"]:::ext
+    cq["③ GET /api/v1/crosschain/anchor/status/:anchor_id<br/>{ anchor_id, target_chain_id, data_id, status, attempts, last_error, receipt }"]:::api
+
+    c1 --> c2 --> c3 --> c4 --> c5
+    c5 --> ext
+    c5 --> c6ok
+    c5 --> c6err
+    c6ok --> cq
+    c6err -.重试.-> c5
+
+    classDef api fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f;
+    classDef svc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+    classDef core fill:#dcfce7,stroke:#22c55e,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#f59e0b,color:#78350f;
+    classDef out fill:#fce7f3,stroke:#ec4899,color:#831843;
+    classDef err fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+    classDef ext fill:#e8e8e8,stroke:#888,color:#222;

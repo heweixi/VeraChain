@@ -1,10 +1,28 @@
 # DataChain Rust 流程说明(基于现有代码)
 
-> 图片版: `docs/FLOW.png`(位图) / `docs/FLOW.svg`(矢量,放大看字段细节),
-> 源定义 `docs/FLOW.mmd`(Mermaid);重新生成:
-> `npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/FLOW.mmd -o docs/FLOW.png -b white`。
+> 图片与源定义(Mermaid)。重新生成(需 node):
+> `npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/<名>.mmd -o docs/<名>.png -b white -s 3 -p docs/.puppeteer.json`
+>
+> - 架构总览:`docs/FLOW.png`(源 `FLOW.mmd`)——只画模块与数据流向
+> - 链路 A 元数据:`docs/FLOW-A-metadata.png`(源 `FLOW-A-metadata.mmd`)——带字段/计算
+> - 链路 B 链上身份 L1:`docs/FLOW-B-identity.png`(源 `FLOW-B-identity.mmd`)
+> - 链路 C 数据锚定 R5:`docs/FLOW-C-anchor.png`(源 `FLOW-C-anchor.mmd`)
 
-![DataChain 完整流程图](./FLOW.png)
+### 架构总览
+
+![DataChain 架构总览](./FLOW.png)
+
+### 链路 A:元数据
+
+![元数据链路](./FLOW-A-metadata.png)
+
+### 链路 B:链上身份 L1
+
+![链上身份链路](./FLOW-B-identity.png)
+
+### 链路 C:数据锚定 R5
+
+![数据锚定链路](./FLOW-C-anchor.png)
 
 > 最后核实:2026-10-18,对应提交 `4a8c025`(R0-R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1)。
 > 本文仅描述**已实现并经 247 验证**的行为;未实现的 L2(多外链锚定)/L3(锚定进展回写)/

@@ -1,0 +1,18 @@
+%% 链路 B:链上身份 L1 —— 注册/撤销 → 挖矿 → 重放查询(带字段/计算)
+%%{init: {"theme":"base","themeVariables":{"fontSize":"15px"},"flowchart":{"nodeSpacing":55,"rankSpacing":65}}}%%
+flowchart TB
+    b1["① POST /api/v1/identity/key-transaction (RBAC: BlockMine)<br/>KeyTransactionRequest {<br/>tx_type: register|revoke, target_key(base64),<br/>role, label, signed_by(base64), signature(base64), reason }"]:::api
+    b2["identity::build_verified_key_transaction(req, now_ts)<br/>校验 tx_type ∈ {register,revoke}; target_key/signed_by 非空<br/>register 必须自签 (signed_by == target_key)<br/>verify_base64(signed_by, signing_payload, signature)<br/>signing_payload = tx_type|target_key|role|label|signed_by<br/>(不含 timestamp)"]:::svc
+    b2err["验签失败 → 400<br/>无 BlockMine 权限 → 403(中间件拦在验签前)"]:::err
+    b3["chain.add_key_transaction → pending_key_tx<br/>KeyTransactionEntry { ...req, timestamp = now_ts(服务端盖) }<br/>→ 202 Accepted { tx_type, target_key, signed_by, timestamp, status:pending }"]:::core
+    b4["② 挖矿(同链路 A)<br/>key_transactions 并入 Block 并进 merkle_root<br/>leaf_hash = SHA256(tx_type|target_key|role|label|signed_by)"]:::core
+    bq["③ GET /api/v1/identity/keys (RBAC: BlockRead)<br/>replay_key_set(chain.get_all_blocks())<br/>FOR block.key_transactions:<br/>register → insert(KeyRecord{public_key,role,label,registered_at,active})<br/>revoke → remove<br/>→ Vec&lt;KeyRecord&gt; (BTreeMap 按公钥排序)"]:::api
+
+    b1 --> b2
+    b2 -. 不通过 .-> b2err
+    b2 --> b3 --> b4 --> bq
+
+    classDef api fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f;
+    classDef svc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+    classDef core fill:#dcfce7,stroke:#22c55e,color:#14532d;
+    classDef err fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;

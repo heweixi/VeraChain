@@ -1,69 +1,44 @@
-%% DataChain Rust 完整流程图(基于现有代码,提交 4a8c025)
-%% 渲染: npx -y @mermaid-js/mermaid-cli -i docs/FLOW.mmd -o docs/FLOW.png
+%% DataChain Rust 架构总览(精简,只画模块与数据流向;字段见分链路图 FLOW-A/B/C)
+%% 渲染: npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/FLOW.mmd -o docs/FLOW.png -b white -s 3
+%%{init: {"theme":"base","themeVariables":{"fontSize":"16px"},"flowchart":{"nodeSpacing":60,"rankSpacing":70,"curve":"basis"}}}%%
 flowchart TB
-    client["客户端 / CLI"]
+    client(["客户端 / CLI"]):::ext
 
-    subgraph ROUTER["Axum Router"]
-        pub_r["公开路由<br/>/health<br/>/auth/register<br/>/auth/login<br/>/auth/refresh"]
-        auth_mw["auth_middleware<br/>校验 Bearer JWT 到 Claims<br/>required_permission(method,path) RBAC"]
-        prot_r["保护路由 /api/v1/**"]
+    subgraph API["API 层 (Axum)"]
+        direction LR
+        pubr["公开路由<br/>health / register / login / refresh"]:::api
+        mw["auth_middleware<br/>JWT → Claims + RBAC"]:::api
     end
-    client --> pub_r
-    client --> auth_mw --> prot_r
+    client --> pubr
+    client --> mw
 
-    %% ===== 链路 A: 元数据创建 → 挖矿 → 查询 =====
-    subgraph LA["链路 A 元数据"]
-        a1["POST /api/v1/metadata<br/>CreateMetadataRequest{data_size,owner?,<br/>hashes,metadata,parent_id,tags,content?}"]
-        a2["MetadataManager::create<br/>生成 MetadataEntry{data_id=uuid,data_size,<br/>created_at,modified_at,owner,hashes,<br/>metadata,parent_id,tags}"]
-        a3["chain.add_metadata → pending<br/>Storage::save_pending_metadata<br/>pending_metadata(data_id PK, data=JSON)"]
-        aq["GET /api/v1/metadata?owner=&tags=<br/>Storage::query_metadata<br/>SELECT data WHERE owner=? AND created_at BETWEEN<br/>→ 应用层过滤 tag/分页"]
-        a1 --> a2 --> a3
-    end
+    mw --> MD["元数据<br/>MetadataManager"]:::svc
+    mw --> ID["链上身份 L1<br/>identity"]:::svc
+    mw --> MINE["挖矿<br/>chain/mine"]:::svc
+    mw --> ANCH["数据锚定 R5<br/>AnchorService"]:::svc
 
-    %% ===== 链路 B: 链上身份 L1 =====
-    subgraph LB["链路 B 链上身份 L1"]
-        b1["POST /identity/key-transaction (RBAC BlockMine)<br/>KeyTransactionRequest{tx_type,target_key,<br/>role,label,signed_by,signature,reason}"]
-        b2["build_verified_key_transaction<br/>register 须自签(signed_by==target_key)<br/>verify_base64(signed_by, signing_payload, signature)<br/>signing_payload = tx_type|target_key|role|label|signed_by"]
-        b3["chain.add_key_transaction → pending_key_tx<br/>KeyTransactionEntry{...,timestamp=服务端now}"]
-        bq["GET /identity/keys (RBAC BlockRead)<br/>replay_key_set(all blocks)<br/>register→insert active / revoke→remove<br/>→ Vec KeyRecord"]
-        b1 --> b2 --> b3
-    end
+    MD -->|create 入 pending| CHAIN
+    ID -->|key-tx 入 pending_key_tx| CHAIN
+    CHAIN["Chain 内存<br/>blocks / pending / pending_key_tx"]:::core
+    MINE --> CHAIN
+    CHAIN -->|mine_block + PoW| BLOCK["Block<br/>merkle_root(metadata++key_tx)<br/>identity_snapshot_hash"]:::core
+    BLOCK -->|commit_block 单事务| DB[("SQLite<br/>blocks / metadata投影 / users<br/>versions / aggregations<br/>anchor_outbox / revoked_refresh")]:::db
 
-    %% ===== 挖矿 + Chain + Block =====
-    subgraph CHAIN["Chain 内存 + 挖矿"]
-        chain_state["Chain{blocks:Vec Block,<br/>pending:Vec MetadataEntry,<br/>pending_key_tx:Vec KeyTx}"]
-        mine["POST /chain/mine → Chain::mine_block<br/>取 pending(≤block_size)+全部 pending_key_tx"]
-        block["Block{index,timestamp,previous_hash,<br/>metadata_list,key_transactions,nonce,difficulty,hash}<br/>mine(): merkle_root=build_merkle_root(<br/>metadata.map SHA256(data_id) ++ key_tx.map leaf_hash)<br/>PoW nonce++ 直到 hash 前缀 difficulty 个0<br/>挖后 identity_snapshot_hash=<br/>compute_identity_snapshot_hash(replay_key_set(all))"]
-        chain_state --> mine --> block
-    end
-    a3 --> chain_state
-    b3 --> chain_state
+    MD -.读投影.-> DB
+    ID -.读 replay_key_set.-> BLOCK
+    DB --> EV["EventBus → WS 推送"]:::out
+    DB --> P2P["P2P 广播/发现/最长链"]:::out
+    BLOCK -.data_id.-> ANCH
+    ANCH -->|签名+outbox| DB
+    ANCH -->|worker 每30s 投递| EXT["外部认证链<br/>(单外链)"]:::ext
 
-    %% ===== 持久化 =====
-    subgraph DB["SQLite (SQLx)"]
-        commit["Storage::commit_block 单事务<br/>INSERT blocks(block_index,timestamp,previous_hash,<br/>merkle_root,nonce,difficulty,hash,data=整块JSON)<br/>FOR metadata: DELETE pending_metadata<br/>+ UPSERT metadata(data_id PK,owner,data_size,<br/>created_at,block_index,tags,data)"]
-        tables["其他表: users / versions / aggregations<br/>schema_migrations / anchor_outbox<br/>revoked_refresh_tokens / metadata(投影)"]
-    end
-    block --> commit --> tables
-    commit --> aq
-    commit --> bq
+    NOTE["权威根 = 区块 + merkle_root + PoW<br/>投影/outbox/回执为派生或旁路<br/>可信根靠外链锚定(内部不共识)<br/>L2多外链/L3回写/L4切换/L5封存 未实现"]:::note
+    DB -.- NOTE
 
-    %% ===== 挖矿后扇出 =====
-    commit --> ev["EventBus→WsHub<br/>BlockMined → WS block_added"]
-    commit --> p2p["P2PService broadcast_blocks→peers<br/>exchange_peers 发现 / sync_peer 最长链替换"]
-
-    %% ===== 链路 C: 数据锚定 R5 =====
-    subgraph LC["链路 C 数据锚定 R5 (单外链)"]
-        c1["POST /crosschain/anchor/:data_id (RBAC BlockMine)<br/>查 data_id 所在 block + MerkleProof"]
-        c2["AnchorService::enqueue_anchor<br/>ChainAnchor{anchor_id,source_chain_id,source_node_id,<br/>target_chain_id,data_id,block_hash,merkle_root,<br/>proof(leaf,leaf_index,siblings,sibling_is_left,root),created_at}<br/>sign_base64(signing_payload)<br/>payload=anchor_id|src_chain|src_node|tgt_chain|<br/>data_id|block_hash|merkle_root|proof.root"]
-        c3["Storage::enqueue_anchor<br/>anchor_outbox(anchor_id PK,target_chain_id,data_id,<br/>signed=JSON,status=pending,attempts=0,receipt)"]
-        c4["worker 每30s process_pending<br/>connector.deliver→HttpAttestationConnector<br/>POST anchor_endpoint(Bearer token)<br/>成功→AnchorReceipt{anchor_id,target_chain_id,<br/>target_ref,confirmed_at} status=confirmed<br/>失败→attempts+1, ≥8→failed"]
-        cq["GET /crosschain/anchor/status/:anchor_id"]
-        c1 --> c2 --> c3 --> c4 --> cq
-    end
-    block -.data_id 来自已上链区块.-> c1
-    c4 ==>|单条外链| ext["外部认证链 / attestation 服务"]
-
+    classDef ext fill:#e8e8e8,stroke:#888,color:#222;
+    classDef api fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f;
+    classDef svc fill:#ede9fe,stroke:#8b5cf6,color:#4c1d95;
+    classDef core fill:#dcfce7,stroke:#22c55e,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#f59e0b,color:#78350f;
+    classDef out fill:#fce7f3,stroke:#ec4899,color:#831843;
     classDef note fill:#fff3cd,stroke:#d39e00,color:#333;
-    note1["权威根: 区块+merkle_root+PoW<br/>投影表/outbox/回执均为派生或旁路<br/>identity_snapshot_hash 不进 PoW、不进锚定 payload<br/>merkle_root 只覆盖本区块;可信根靠外链锚定(内部不共识)<br/>L2 多外链/L3 进展回写/L4 失信切换/L5 封存重启 未实现"]:::note
-    DB --- note1
