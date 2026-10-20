@@ -1,7 +1,7 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `1124baa`(backlog #3 refresh token 持久化)。
-> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 集成测试)、#3(refresh token 持久化)已补并在 247 验证。
+> 核实日期:2026-10-18，代码进度更新至提交 `13ded24`(backlog #6 纯 migration 驱动)。
+> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4(WebSocket 集成测试)、#3(refresh token 持久化)、#6(纯 migration 驱动)已补并在 247 验证。
 > 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
@@ -25,7 +25,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ refresh token 持久化 + token-family 复用检测已补(见 `1124baa`/247 lib 62+集成 12 passed):撤销落 SQLite(重启不失忆)、复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。WebSocket 收发自动化集成测试已补(`97eeee5`/8 passed)。
 - 🔺 WebSocket 频道(`/ws/chain`、`/ws/metadata`、`/ws/aggregation`)当前都订阅同一 `WsHub` 的**全量广播**,服务端 `handle_channel_socket` 不按频道过滤;任何 EventBus 事件会推给所有频道客户端。真正的频道隔离(如 `/ws/chain` 只收 chain 事件)未实现,属已知遗留(非 backlog #4 范围,#4 只验证"频道客户端能收到广播")。
 - ⚠️ 元数据仍以内存 pending + 区块 JSON 为主,无独立 metadata 查询表;注册失败写库的返回语义待收敛。
-- ⚠️ 旧 `init_tables` 幂等建表作为兼容兜底与 migration 并存,未纯 migration 驱动。
+- ✅ 建表已纯 migration 驱动(`13ded24`):移除 init_tables 与 migration 重叠的兜底,事实源唯一收敛到 migrations/;旧库升级安全性有回归测试。回滚为 up-only 约定(无自动 down)、backfill 推迟到首个真实场景,属有意的范围收敛而非遗漏。
 
 ## 二、需求/设计与实现对照
 
@@ -75,7 +75,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 |---|---|---|
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
 | 独立 metadata/aggregation/events 表 | ⏳ | 当前没有对应表；相关数据主要留在内存或 block JSON 中 |
-| SQLx 版本迁移 | ⚠️基础已实现/待验证 | `migrations/001_base.sql`、`002_pending_aggregations.sql` + `schema_migrations` 已接入；旧 `IF NOT EXISTS` 初始化仍保留为兼容兜底，尚无回滚/数据回填迁移 |
+| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~004` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚与数据回填迁移**(有意收敛:当前无真实场景,backfill 待 #5 metadata 表引入真实范例) |
 | 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
 | 聚合持久化 | ⏳ | `AggregationEngine` 的 summaries 只在 `RwLock<Vec<_>>`，重启后列表和计数丢失 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
@@ -119,8 +119,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - P2P 共识与分叉选择(当前为单一诚实源假设)。
 - 跨链密钥轮换与链上身份注册交易。
 - 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
-- 独立 metadata 查询表(注册失败写库返回语义已在 #3 顺带收敛为 500)。
-- 纯 migration 驱动(移除 init_tables 兼容兜底);回滚/数据回填迁移。
+- ✅ #6 纯 migration 驱动 — `13ded24` 移除 init_tables 兜底,建表事实源唯一化,旧库升级回归测试通过。回滚(自动 down)/数据回填按用户确认有意推迟。
+- 独立 metadata 查询表(注册失败写库返回语义已在 #3 顺带收敛为 500);届时引入首个数据回填(backfill)migration 作为范例。
+- (可选)自动 down 回滚机制:当前 up-only + 手动回滚约定,无真实场景暂不实现。
 
 ## 五、独立仓库维护约定
 
