@@ -40,6 +40,13 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     if path.starts_with("/api/v1/crosschain/") {
         return Some(Permission::BlockRead);
     }
+    // 链上身份:提交密钥交易属特权写(进区块),按 BlockMine;查询密钥集按 BlockRead。
+    if method == Method::POST && path == "/api/v1/identity/key-transaction" {
+        return Some(Permission::BlockMine);
+    }
+    if path.starts_with("/api/v1/identity/") {
+        return Some(Permission::BlockRead);
+    }
     if path == "/api/v1/versions/track" {
         return Some(Permission::VersionTrack);
     }

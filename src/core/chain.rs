@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::block::{Block, MetadataEntry};
+use super::block::{Block, KeyTransactionEntry, MetadataEntry};
 use crate::error::{DataChainError, Result};
 
 /// 区块链
@@ -11,6 +11,8 @@ pub struct Chain {
     difficulty: u32,
     block_size: usize,
     pending: RwLock<Vec<MetadataEntry>>,
+    /// 待打包的密钥交易(backlog L1)。与元数据 pending 并列,下次挖矿并入区块。
+    pending_key_tx: RwLock<Vec<KeyTransactionEntry>>,
 }
 
 impl Chain {
@@ -21,6 +23,38 @@ impl Chain {
             difficulty,
             block_size,
             pending: RwLock::new(Vec::new()),
+            pending_key_tx: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// 加入一条待打包密钥交易。
+    pub fn add_key_transaction(&self, tx: KeyTransactionEntry) {
+        self.pending_key_tx.write().push(tx);
+    }
+
+    /// 待打包密钥交易数量。
+    pub fn get_pending_key_tx_count(&self) -> usize {
+        self.pending_key_tx.read().len()
+    }
+
+    /// 加载待打包密钥交易(从存储恢复)。
+    pub fn load_pending_key_tx(&self, txs: Vec<KeyTransactionEntry>) {
+        *self.pending_key_tx.write() = txs;
+    }
+
+    /// 为最新区块写入 identity_snapshot_hash(backlog L1)。
+    ///
+    /// snapshot_hash 是派生自 key_transactions(已进 merkle_root 受保护)的当前身份集摘要,
+    /// **不参与** PoW 区块哈希,故挖矿后填入不会使区块 hash 失配。仅当 index/hash 匹配
+    /// 给定区块时更新,返回是否更新成功;调用方据此保证内存与持久化副本一致。
+    pub fn set_latest_identity_snapshot(&self, block: &Block, snapshot_hash: &str) -> bool {
+        let mut blocks = self.blocks.write();
+        match blocks.last_mut() {
+            Some(latest) if latest.index == block.index && latest.hash == block.hash => {
+                latest.identity_snapshot_hash = snapshot_hash.to_string();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -129,6 +163,13 @@ impl Chain {
         let mut restored = block.metadata_list.clone();
         restored.append(&mut *pending);
         *pending = restored;
+        drop(pending);
+
+        // 一并回滚密钥交易,放回待打包队列头部,保持与元数据回滚一致的语义。
+        let mut pending_key_tx = self.pending_key_tx.write();
+        let mut restored_tx = block.key_transactions.clone();
+        restored_tx.append(&mut *pending_key_tx);
+        *pending_key_tx = restored_tx;
         true
     }
 
@@ -140,9 +181,10 @@ impl Chain {
         }
 
         let mut pending = self.pending.write();
-        if pending.is_empty() {
+        let mut pending_key_tx = self.pending_key_tx.write();
+        if pending.is_empty() && pending_key_tx.is_empty() {
             return Err(DataChainError::AggregationFailed(
-                "no pending metadata".to_string(),
+                "no pending metadata or key transactions".to_string(),
             ));
         }
 
@@ -155,6 +197,10 @@ impl Chain {
             new_block.add_metadata(entry);
         }
 
+        // 并入全部待打包密钥交易(backlog L1);它们会进入 merkle_root 受哈希保护。
+        new_block.key_transactions = pending_key_tx.drain(..).collect();
+
+        drop(pending_key_tx);
         drop(pending);
         drop(blocks);
 

@@ -113,6 +113,26 @@ pub struct KeyTransactionEntry {
     pub reason: String,
 }
 
+impl KeyTransactionEntry {
+    /// 规范化签名/哈希负载:固定字段顺序拼接,不含 signature 本身,确保确定性。
+    /// 提交方对该字节串签名;验签与 merkle 叶子都基于它,保证可复现。
+    pub fn signing_payload(&self) -> Vec<u8> {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.tx_type, self.target_key, self.role, self.label, self.signed_by, self.timestamp
+        )
+        .into_bytes()
+    }
+
+    /// merkle 叶子 = SHA256(规范化负载)的十六进制。
+    pub fn leaf_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_payload());
+        hex::encode(hasher.finalize())
+    }
+}
+
 impl Block {
     /// 创建新区块
     pub fn new(index: i64, previous_hash: String, difficulty: u32) -> Self {
@@ -154,18 +174,26 @@ impl Block {
         )
     }
 
-    /// 计算 Merkle 根
+    /// 计算 Merkle 根。
+    ///
+    /// 叶子集合 = 元数据叶子 ++ 密钥交易叶子(backlog L1,选项 X):
+    /// - 元数据叶子 = SHA256(data_id)(BLOCK_HASH_SPEC 第10节 v1,三版本一致)
+    /// - 密钥交易叶子 = SHA256(规范化 key_tx)(见 `KeyTransactionEntry::leaf_hash`)
+    ///
+    /// 把 key_transactions 纳入 merkle_root,使身份/密钥交易与数据同等受区块哈希与
+    /// PoW 保护,并可随 merkle_root 被外链锚定验证。向后兼容:key_transactions 为空时
+    /// 不追加任何叶子,既有仅含元数据的区块 merkle_root 不变。
     pub fn calculate_merkle_root(&self) -> String {
-        if self.metadata_list.is_empty() {
+        if self.metadata_list.is_empty() && self.key_transactions.is_empty() {
             return String::new();
         }
 
-        // 叶子 = SHA256(data_id)(BLOCK_HASH_SPEC 第10节 v1,三版本一致)
-        let hashes: Vec<String> = self
+        let mut hashes: Vec<String> = self
             .metadata_list
             .iter()
             .map(|entry| super::metadata_leaf_hash(&entry.data_id))
             .collect();
+        hashes.extend(self.key_transactions.iter().map(|tx| tx.leaf_hash()));
 
         build_merkle_root(&hashes)
     }
@@ -225,5 +253,50 @@ mod tests {
         let mut block = Block::new(0, "0".to_string(), 2);
         block.mine();
         assert!(block.is_valid());
+    }
+
+    fn sample_key_tx(target: &str) -> KeyTransactionEntry {
+        KeyTransactionEntry {
+            tx_type: "register".to_string(),
+            target_key: target.to_string(),
+            role: "node".to_string(),
+            label: String::new(),
+            signed_by: target.to_string(),
+            signature: "sig".to_string(),
+            timestamp: 100,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn key_transactions_enter_merkle_root_and_block_valid() {
+        // 仅含密钥交易(无元数据)的区块:merkle_root 非空,挖矿后校验通过。
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.key_transactions.push(sample_key_tx("pk-a"));
+        block.mine();
+        assert!(
+            !block.merkle_root.is_empty(),
+            "key_tx 应产生非空 merkle_root"
+        );
+        assert!(block.is_valid());
+    }
+
+    #[test]
+    fn empty_block_merkle_root_unchanged_backward_compatible() {
+        // 向后兼容:既无元数据也无密钥交易时 merkle_root 仍为空。
+        let block = Block::new(1, "0".repeat(64), 2);
+        assert_eq!(block.calculate_merkle_root(), "");
+    }
+
+    #[test]
+    fn key_tx_leaf_hash_is_deterministic_and_signature_independent() {
+        // 叶子哈希基于规范化负载(不含 signature),同内容不同签名叶子一致。
+        let mut a = sample_key_tx("pk-a");
+        let mut b = sample_key_tx("pk-a");
+        a.signature = "sigA".to_string();
+        b.signature = "sigB".to_string();
+        assert_eq!(a.leaf_hash(), b.leaf_hash());
+        let c = sample_key_tx("pk-b");
+        assert_ne!(a.leaf_hash(), c.leaf_hash());
     }
 }

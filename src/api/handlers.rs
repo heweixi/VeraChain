@@ -291,7 +291,16 @@ pub async fn mine_block(
     }
 
     match state.chain.mine_block() {
-        Ok(block) => {
+        Ok(mut block) => {
+            // 挖矿后计算当前身份集快照哈希并写入区块头(backlog L1)。
+            // snapshot_hash 派生自已进 merkle 的 key_transactions,不参与 PoW 哈希,
+            // 故此处填入不影响区块 hash;同步更新链内副本,保证与持久化一致。
+            let key_set = crate::identity::replay_key_set(&state.chain.get_all_blocks());
+            let snapshot = crate::identity::compute_identity_snapshot_hash(&key_set);
+            if !snapshot.is_empty() {
+                block.identity_snapshot_hash = snapshot.clone();
+                state.chain.set_latest_identity_snapshot(&block, &snapshot);
+            }
             // 在同一事务内原子提交区块并删除对应 pending;失败时回滚内存区块与 pending 队列。
             if let Err(e) = state.storage.commit_block(&block).await {
                 state.chain.rollback_mined_block(&block);
@@ -947,6 +956,59 @@ pub async fn get_node_identity(
         "node_id": identity.node_id(),
         "public_key": identity.public_key_base64(),
     })))
+}
+
+// ==================== 链上身份处理器 (backlog L1) ====================
+
+/// 提交一条密钥交易(register/revoke)。验签通过后进入待打包队列,下次挖矿上链。
+pub async fn submit_key_transaction(
+    State(state): State<AppState>,
+    Json(req): Json<crate::identity::KeyTransactionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let now = chrono::Utc::now().timestamp();
+    match crate::identity::build_verified_key_transaction(&req, now) {
+        Ok(entry) => {
+            state.chain.add_key_transaction(entry.clone());
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::success(serde_json::json!({
+                    "tx_type": entry.tx_type,
+                    "target_key": entry.target_key,
+                    "signed_by": entry.signed_by,
+                    "timestamp": entry.timestamp,
+                    "status": "pending",
+                }))),
+            ))
+        }
+        // 验签失败/非法请求 => 400(客户端凭证/输入问题),不是服务端故障。
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(e.to_string())),
+        )),
+    }
+}
+
+/// 查询当前有效密钥集(重放链上 key_transactions)。
+pub async fn list_identity_keys(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<crate::identity::KeyRecord>>> {
+    let set = crate::identity::replay_key_set(&state.chain.get_all_blocks());
+    Json(ApiResponse::success(set.into_values().collect()))
+}
+
+/// 查询单个公钥的当前状态。
+pub async fn get_identity_key(
+    State(state): State<AppState>,
+    Path(public_key): Path<String>,
+) -> Result<Json<ApiResponse<crate::identity::KeyRecord>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let set = crate::identity::replay_key_set(&state.chain.get_all_blocks());
+    match set.get(&public_key) {
+        Some(rec) => Ok(Json(ApiResponse::success(rec.clone()))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("public key not found or revoked")),
+        )),
+    }
 }
 
 /// 获取内容的 Merkle 证明

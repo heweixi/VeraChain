@@ -77,6 +77,15 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/crosschain/identity",
             get(handlers::get_node_identity),
         )
+        .route(
+            "/api/v1/identity/key-transaction",
+            post(handlers::submit_key_transaction),
+        )
+        .route("/api/v1/identity/keys", get(handlers::list_identity_keys))
+        .route(
+            "/api/v1/identity/keys/:public_key",
+            get(handlers::get_identity_key),
+        )
         .route("/api/v1/chain/info", get(handlers::get_chain_info))
         .route("/api/v1/chain/mine", post(handlers::mine_block))
         .route("/api/v1/chain/validate", post(handlers::validate_chain))
