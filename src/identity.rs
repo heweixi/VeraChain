@@ -187,9 +187,10 @@ mod tests {
     fn register_requires_valid_self_signature() {
         let id = NodeIdentity::generate("n1");
         let req = signed_request(TX_REGISTER, &id, "node");
-        // 注意:签名用 timestamp=0 的负载,故验证也必须用 now_ts=0。
-        let entry = build_verified_key_transaction(&req, 0).unwrap();
+        // timestamp 不参与签名,故服务端用任意 now_ts(这里 123)都能验签通过。
+        let entry = build_verified_key_transaction(&req, 123).unwrap();
         assert_eq!(entry.tx_type, TX_REGISTER);
+        assert_eq!(entry.timestamp, 123, "服务端应独立盖 timestamp");
     }
 
     #[test]

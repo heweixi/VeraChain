@@ -14,7 +14,7 @@ use tower::ServiceExt;
 use datachain::aggregation::{create_aggregation_engine, create_scheduler};
 use datachain::api::{self, AppState, EventBus, NotificationService, WsHub};
 use datachain::auth::{create_auth_service, RegisterRequest, Role};
-use datachain::core::create_chain;
+use datachain::core::{create_chain, KeyTransactionEntry};
 use datachain::crosschain::AnchorService;
 use datachain::metadata::create_metadata_manager;
 use datachain::node_signing::NodeIdentity;
@@ -273,4 +273,198 @@ async fn sqlite_restart_recovers_blocks_and_users() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 跨链认证网 L1:链上身份端到端(注册→挖矿→查询→撤销→查询 + RBAC + 验签)
+// ---------------------------------------------------------------------------
+
+/// 用给定身份对规范化负载签名,构造 key-transaction 请求体。
+/// 规范化负载必须与服务端 `KeyTransactionEntry::signing_payload` 一致(不含 timestamp)。
+fn signed_key_tx_body(tx_type: &str, id: &NodeIdentity, role: &str) -> Value {
+    let pk = id.public_key_base64();
+    let probe = KeyTransactionEntry {
+        tx_type: tx_type.to_string(),
+        target_key: pk.clone(),
+        role: role.to_string(),
+        label: "node-a".to_string(),
+        signed_by: pk.clone(),
+        signature: String::new(),
+        timestamp: 0,
+        reason: String::new(),
+    };
+    let signature = id.sign_base64(&probe.signing_payload());
+    serde_json::json!({
+        "tx_type": tx_type,
+        "target_key": pk,
+        "role": role,
+        "label": "node-a",
+        "signed_by": pk,
+        "signature": signature,
+        "reason": ""
+    })
+}
+
+#[tokio::test]
+async fn identity_register_mine_query_revoke_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+
+    let id = NodeIdentity::generate("node-a");
+    let pk = id.public_key_base64();
+
+    // 1) 提交 register key-transaction(自签),应被接受(202)。
+    let resp = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&token),
+            signed_key_tx_body("register", &id, "node"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "合法自签 register 应被接受"
+    );
+
+    // 2) 挖矿把 key-tx 打包进区块。
+    let resp = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let mined = body_json(resp).await;
+    // 区块应带非空 identity_snapshot_hash(当前有有效密钥)。
+    assert!(
+        mined["data"]["identity_snapshot_hash"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "挖矿后应写入非空 identity_snapshot_hash"
+    );
+
+    // 3) GET /identity/keys 应出现该公钥且 active。
+    let resp = router
+        .clone()
+        .oneshot(get("/api/v1/identity/keys", Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let keys = body_json(resp).await;
+    let arr = keys["data"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "应有一个有效密钥");
+    assert_eq!(arr[0]["public_key"], pk);
+    assert_eq!(arr[0]["status"], "active");
+
+    // 单个查询命中。
+    let resp = router
+        .clone()
+        .oneshot(get(
+            &format!("/api/v1/identity/keys/{}", urlencoding(&pk)),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4) 提交 revoke(自签)→ 挖矿 → GET /keys 应为空。
+    let resp = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&token),
+            signed_key_tx_body("revoke", &id, "node"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let resp = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = router
+        .clone()
+        .oneshot(get("/api/v1/identity/keys", Some(&token)))
+        .await
+        .unwrap();
+    let keys = body_json(resp).await;
+    assert_eq!(
+        keys["data"].as_array().unwrap().len(),
+        0,
+        "revoke 挖矿后有效密钥集应为空"
+    );
+}
+
+#[tokio::test]
+async fn identity_invalid_signature_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+
+    let id = NodeIdentity::generate("node-a");
+    let mut body = signed_key_tx_body("register", &id, "node");
+    body["signature"] = Value::String("AAAAinvalidsig".to_string());
+
+    let resp = router
+        .oneshot(post("/api/v1/identity/key-transaction", Some(&token), body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "无效签名应被拒(400)"
+    );
+}
+
+#[tokio::test]
+async fn identity_key_tx_requires_blockmine_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    seed_user(&state, "guest", "guestpass123", Role::Guest).await;
+    let router = api::create_router(state);
+    let guest_token = login(router.clone(), "guest", "guestpass123").await;
+
+    let id = NodeIdentity::generate("node-a");
+    // guest 无 BlockMine 权限,提交 key-tx 应 403(被 RBAC 中间件拦在验签之前)。
+    let resp = router
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&guest_token),
+            signed_key_tx_body("register", &id, "node"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "guest 提交 key-tx 应 403"
+    );
+}
+
+/// 最小 URL 编码:base64 公钥可能含 '/' '+' '=',路径段需编码。
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }

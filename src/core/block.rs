@@ -114,12 +114,15 @@ pub struct KeyTransactionEntry {
 }
 
 impl KeyTransactionEntry {
-    /// 规范化签名/哈希负载:固定字段顺序拼接,不含 signature 本身,确保确定性。
-    /// 提交方对该字节串签名;验签与 merkle 叶子都基于它,保证可复现。
+    /// 规范化签名/哈希负载:固定字段顺序拼接,不含 signature 与 timestamp,确保确定性。
+    ///
+    /// **不含 timestamp** 是有意为之:timestamp 由服务端在接收时盖(记录用),客户端提交前
+    /// 无法预知,若纳入签名则客户端无法对其签名、服务端验签必然失败。故签名只覆盖语义字段
+    /// (类型/目标公钥/角色/标签/发起方),timestamp 作为服务端记录的元信息不参与签名与叶子。
     pub fn signing_payload(&self) -> Vec<u8> {
         format!(
-            "{}|{}|{}|{}|{}|{}",
-            self.tx_type, self.target_key, self.role, self.label, self.signed_by, self.timestamp
+            "{}|{}|{}|{}|{}",
+            self.tx_type, self.target_key, self.role, self.label, self.signed_by
         )
         .into_bytes()
     }
