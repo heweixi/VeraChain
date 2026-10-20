@@ -1,7 +1,7 @@
 # DataChain Rust
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
-> 最后核实:2026-10-18(进度至 R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1 链上身份,提交 `5bf05c8`)。
+> 最后核实:2026-10-18(进度至 R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1 链上身份含端到端测试,提交 `8b5ecf1`)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、

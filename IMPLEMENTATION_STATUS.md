@@ -1,6 +1,6 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `5bf05c8`(跨链认证网 L1 链上身份最小版)。
+> 核实日期:2026-10-18，代码进度更新至提交 `8b5ecf1`(跨链认证网 L1 完成:含端到端集成测试)。
 > R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4/#3/#6/#5 及跨链认证网 L1 已补并在 247 验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
@@ -71,7 +71,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 启动恢复 | ⚠️ | `src/cli/server.rs` 恢复 blocks/users/versions，但恢复时没有完整验证索引、previous hash、PoW、Merkle root |
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
-| attestation/identity/key transactions | ⚠️ `5bf05c8`/247 已验证 | 链上身份最小版(L1)已接入:`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。**仍未做**:密钥轮换状态机、Merkle 身份树、pending key_tx 持久化(仅内存,重启丢未打包交易,幂等可重提);attestation 仍只在 verify_content 读、无专门提交流程 |
+| attestation/identity/key transactions | ⚠️ `8b5ecf1`/247 端到端已验证 | 链上身份最小版(L1)已接入并经端到端集成测试(register→挖矿→查询→撤销链路真实可用):`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。签名负载不含 timestamp(服务端独立盖,`8b5ecf1` 修复)。**仍未做**:密钥轮换状态机、Merkle 身份树、pending key_tx 持久化(仅内存,重启丢未打包交易,幂等可重提);attestation 仍只在 verify_content 读、无专门提交流程 |
 | P2P/节点同步/冲突解决 | ⚠️ `R6`/247 双节点已验证 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks`:显式注册 + **主动广播**(挖矿后 `broadcast_blocks` 推新块给 peers)+ **认证 gossip 发现**(`exchange_peers` 从已知 peer 拉取 peer 列表并入,跳过自身)+ 种子 peer(DATACHAIN_P2P_SEED_PEERS)+ 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。**仍无共识、同长度分叉选择**(⚠️ 单一诚实源假设)。双节点 smoke:a 挖矿→b 经广播增长, 双向 exchange_peers 互相发现 |
 
 ### 2.4 存储、迁移与恢复
@@ -99,7 +99,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ✅ 集成测试共 12 passed:`tests/api_integration.rs`(4,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 user 创建 anchor 403 / 读 proof 200 / admin anchor 200 pending、SQLite 重启恢复区块与用户,247 验证 4 passed)+ `tests/websocket_integration.rs`(8,真实 axum 服务 TcpListener + tokio-tungstenite 客户端真实握手/帧收发:握手鉴权、EventBus 广播三类事件、16KiB 消息上限、256 连接上限,247 验证 8 passed,`97eeee5`)。
+- ✅ 集成测试共 15 passed:`tests/api_integration.rs`(7,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 anchor、SQLite 重启恢复,**+ L1 链上身份端到端 3 个**:register 自签→挖矿(断言非空 identity_snapshot_hash)→GET /keys active→revoke→挖矿→keys 空、无效签名 400、guest 提交 key-tx 403)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限,`97eeee5`)。247 验证 `8b5ecf1`。
 - ✅ 核心算法 + 新增能力单测共 55 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p)。
 - ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 收发自动化集成测试已补(`97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
