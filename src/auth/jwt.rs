@@ -1,9 +1,6 @@
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::Arc;
 
 use super::Role;
 use crate::error::{DataChainError, Result};
@@ -33,18 +30,22 @@ pub struct RefreshClaims {
     pub sub: String, // user_id
     pub token_type: String,
     pub jti: String,
+    /// token-family 标识：同一登录链路轮换出的刷新令牌共享同一 family_id，
+    /// 用于复用检测时整族撤销。#[serde(default)] 软兼容无该字段的存量令牌
+    /// （旧令牌反序列化为空串）。
+    #[serde(default)]
+    pub family_id: String,
     pub exp: i64,
     pub iat: i64,
     pub iss: String,
     pub aud: String,
 }
 
-/// JWT 处理器
+/// JWT 处理器（纯编解码，不持有撤销状态；撤销信息落库于 Storage）。
 pub struct JwtHandler {
     secret: String,
     access_expire_hours: u64,
     refresh_expire_days: u64,
-    revoked_refresh: Arc<RwLock<HashSet<String>>>,
 }
 
 impl JwtHandler {
@@ -54,8 +55,12 @@ impl JwtHandler {
             secret,
             access_expire_hours,
             refresh_expire_days: 7,
-            revoked_refresh: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// 刷新令牌有效期（秒）。供撤销表哨兵行推导 TTL，避免魔法数。
+    pub fn refresh_expire_secs(&self) -> i64 {
+        self.refresh_expire_days as i64 * 24 * 3600
     }
 
     fn validation(&self) -> Validation {
@@ -93,8 +98,8 @@ impl JwtHandler {
         .map_err(|_| DataChainError::Internal("Failed to generate token".to_string()))
     }
 
-    /// 生成刷新令牌
-    pub fn generate_refresh_token(&self, user_id: &str) -> Result<String> {
+    /// 生成刷新令牌。family_id 由调用方指定：登录时新建，轮换时沿用原族。
+    pub fn generate_refresh_token(&self, user_id: &str, family_id: &str) -> Result<String> {
         let now = Utc::now();
         let exp = now + Duration::days(self.refresh_expire_days as i64);
 
@@ -102,6 +107,7 @@ impl JwtHandler {
             sub: user_id.to_string(),
             token_type: "refresh".to_string(),
             jti: uuid::Uuid::new_v4().to_string(),
+            family_id: family_id.to_string(),
             exp: exp.timestamp(),
             iat: now.timestamp(),
             iss: "datachain".to_string(),
@@ -131,8 +137,9 @@ impl JwtHandler {
         Ok(token_data.claims)
     }
 
-    /// 验证刷新令牌
-    pub fn verify_refresh_token(&self, token: &str) -> Result<String> {
+    /// 解码并校验刷新令牌（签名、iss、aud、token_type），返回完整 claims。
+    /// 不查撤销状态——撤销判定由调用方结合 Storage 完成。
+    pub fn parse_refresh_claims(&self, token: &str) -> Result<RefreshClaims> {
         let token_data = decode::<RefreshClaims>(
             token,
             &DecodingKey::from_secret(self.secret.as_bytes()),
@@ -143,36 +150,23 @@ impl JwtHandler {
             _ => DataChainError::InvalidToken,
         })?;
 
-        if token_data.claims.token_type != "refresh"
-            || self.revoked_refresh.read().contains(&token_data.claims.jti)
-        {
+        if token_data.claims.token_type != "refresh" {
             return Err(DataChainError::InvalidToken);
         }
 
-        Ok(token_data.claims.sub)
+        Ok(token_data.claims)
     }
 
-    /// 撤销已使用的刷新令牌，防止 refresh token 重放。
-    pub fn revoke_refresh_token(&self, token: &str) -> Result<()> {
-        let token_data = decode::<RefreshClaims>(
-            token,
-            &DecodingKey::from_secret(self.secret.as_bytes()),
-            &self.validation(),
-        )
-        .map_err(|_| DataChainError::InvalidToken)?;
-        self.revoked_refresh.write().insert(token_data.claims.jti);
-        Ok(())
-    }
-
-    /// 生成令牌对
+    /// 生成令牌对。family_id 由调用方指定（登录新建 / 轮换沿用）。
     pub fn generate_token_pair(
         &self,
         user_id: &str,
         username: &str,
         role: Role,
+        family_id: &str,
     ) -> Result<TokenPair> {
         let access_token = self.generate_access_token(user_id, username, role)?;
-        let refresh_token = self.generate_refresh_token(user_id)?;
+        let refresh_token = self.generate_refresh_token(user_id, family_id)?;
         let expires_at = Utc::now() + Duration::hours(self.access_expire_hours as i64);
 
         Ok(TokenPair {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::{JwtHandler, LoginRequest, LoginResponse, RegisterRequest, Role, User};
 use crate::crypto::{hash_password, verify_password};
 use crate::error::{DataChainError, Result};
+use crate::storage::Storage;
 
 /// 认证服务
 pub struct AuthService {
@@ -12,16 +13,18 @@ pub struct AuthService {
     username_index: RwLock<HashMap<String, String>>, // username -> user_id
     email_index: RwLock<HashMap<String, String>>, // email -> user_id
     jwt_handler: JwtHandler,
+    storage: Arc<Storage>,
 }
 
 impl AuthService {
     /// 创建认证服务
-    pub fn new(jwt_secret: String, jwt_expire_hours: u64) -> Self {
+    pub fn new(jwt_secret: String, jwt_expire_hours: u64, storage: Arc<Storage>) -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
             email_index: RwLock::new(HashMap::new()),
             jwt_handler: JwtHandler::new(jwt_secret, jwt_expire_hours),
+            storage,
         }
     }
 
@@ -105,10 +108,16 @@ impl AuthService {
             users.insert(user.user_id.clone(), user.clone());
         }
 
-        // 生成令牌
-        let token_pair =
-            self.jwt_handler
-                .generate_token_pair(&user.user_id, &user.username, user.role)?;
+        // 生成令牌；登录新建 token-family。
+        // 注意：login 不向撤销表写入任何记录，新 family 的令牌默认有效，
+        // 进程重启后仍有效直至过期——设计上可接受。
+        let family_id = uuid::Uuid::new_v4().to_string();
+        let token_pair = self.jwt_handler.generate_token_pair(
+            &user.user_id,
+            &user.username,
+            user.role,
+            &family_id,
+        )?;
 
         Ok(LoginResponse {
             token: token_pair.access_token,
@@ -124,10 +133,52 @@ impl AuthService {
         self.jwt_handler.verify_access_token(token)
     }
 
-    /// 刷新令牌
-    pub fn refresh_token(&self, refresh_token: &str) -> Result<LoginResponse> {
-        let user_id = self.jwt_handler.verify_refresh_token(refresh_token)?;
-        self.jwt_handler.revoke_refresh_token(refresh_token)?;
+    /// 刷新令牌。
+    ///
+    /// 采用 token-family 复用检测 + 抢占式撤销收口并发双花：
+    /// 1. 解码校验签名/iss/aud/token_type；
+    /// 2. 若该 jti 已被撤销，或其所属 family 已被整体撤销 => 判定为复用攻击，
+    ///    撤销整个 family 并返回 TokenReuseDetected；
+    /// 3. 否则对旧 jti 做抢占式撤销（数据库主键唯一性）：
+    ///    - 抢占成功 => 本请求独占该旧 token，签发同一 family 的新令牌对；
+    ///    - 抢占失败（jti 已存在）=> 说明被并发请求/之前的轮换先消费，属并发双花，
+    ///      撤销整个 family 并返回 TokenReuseDetected。
+    ///
+    /// 第 2 步的 is_jti_revoked / is_family_revoked 与第 3 步的 revoke_refresh 之间
+    /// 本身存在 TOCTOU 窗口，但最终以第 3 步的主键抢占为准绳：即便两个并发请求
+    /// 都通过了第 2 步检查，也只有一个能在第 3 步抢占成功，另一个必然失败并触发整族撤销。
+    ///
+    /// 存量退化说明：存量旧 token（family_id 为空串）命中复用时，因无 family 标识，
+    /// 只能退化为「单 jti 失效」而非整族失效。这是升级过渡期的已知弱化（旧 token 签发时
+    /// 尚无 family 概念），并非安全绕过——过渡期结束、旧 token 全部过期后自然消失。
+    pub async fn refresh_token(&self, refresh_token: &str) -> Result<LoginResponse> {
+        let claims = self.jwt_handler.parse_refresh_claims(refresh_token)?;
+        let user_id = claims.sub.clone();
+        let family_id = claims.family_id.clone();
+        // 哨兵行 TTL 取自刷新令牌有效期，避免魔法数（见 Storage::revoke_family）。
+        let ttl_secs = self.jwt_handler.refresh_expire_secs();
+
+        // 复用检测：jti 已撤销 或 family 已整体撤销。
+        // family_id 可能为空（存量旧令牌），此时跳过 family 级判定。
+        let jti_revoked = self.storage.is_jti_revoked(&claims.jti).await?;
+        let family_revoked = if family_id.is_empty() {
+            false
+        } else {
+            self.storage.is_family_revoked(&user_id, &family_id).await?
+        };
+        if jti_revoked || family_revoked {
+            if !family_id.is_empty() {
+                self.storage
+                    .revoke_family(
+                        &user_id,
+                        &family_id,
+                        Some("refresh token reuse detected"),
+                        ttl_secs,
+                    )
+                    .await?;
+            }
+            return Err(DataChainError::TokenReuseDetected);
+        }
 
         let user = {
             let users = self.users.read();
@@ -137,9 +188,46 @@ impl AuthService {
                 .ok_or(DataChainError::UserNotFound(user_id.clone()))?
         };
 
-        let token_pair =
-            self.jwt_handler
-                .generate_token_pair(&user.user_id, &user.username, user.role)?;
+        // 抢占式撤销旧 jti：以主键唯一性收口并发双花。
+        // 返回 false => 该 jti 已被另一并发请求/之前的轮换消费 => 复用/并发双花。
+        let claimed = self
+            .storage
+            .revoke_refresh(
+                &claims.jti,
+                &user_id,
+                &family_id,
+                Some("rotated"),
+                claims.exp,
+            )
+            .await?;
+        if !claimed {
+            // 抢占失败：旧 token 已被消费。整族撤销并判定复用。
+            // 存量 token（family_id 为空）无族可撤，退化为单 jti 失效（上面已落库）。
+            if !family_id.is_empty() {
+                self.storage
+                    .revoke_family(
+                        &user_id,
+                        &family_id,
+                        Some("refresh token double-spend detected"),
+                        ttl_secs,
+                    )
+                    .await?;
+            }
+            return Err(DataChainError::TokenReuseDetected);
+        }
+
+        // 存量旧令牌无 family_id，轮换时补发一个新 family，令后续轮换可被追踪。
+        let next_family_id = if family_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            family_id
+        };
+        let token_pair = self.jwt_handler.generate_token_pair(
+            &user.user_id,
+            &user.username,
+            user.role,
+            &next_family_id,
+        )?;
 
         Ok(LoginResponse {
             token: token_pair.access_token,
@@ -229,6 +317,142 @@ impl AuthService {
 }
 
 /// 创建共享的 AuthService 实例
-pub fn create_auth_service(jwt_secret: String, jwt_expire_hours: u64) -> Arc<AuthService> {
-    Arc::new(AuthService::new(jwt_secret, jwt_expire_hours))
+pub fn create_auth_service(
+    jwt_secret: String,
+    jwt_expire_hours: u64,
+    storage: Arc<Storage>,
+) -> Arc<AuthService> {
+    Arc::new(AuthService::new(jwt_secret, jwt_expire_hours, storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::LoginRequest;
+
+    async fn build_service() -> Arc<AuthService> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("auth.sqlite");
+        let storage = crate::storage::create_storage(path.to_str().unwrap())
+            .await
+            .unwrap();
+        create_auth_service("test-secret".to_string(), 24, storage)
+    }
+
+    fn register_login(service: &AuthService) -> LoginResponse {
+        let req = RegisterRequest {
+            username: "alice".to_string(),
+            password: "password123".to_string(),
+            email: "alice@example.com".to_string(),
+            role: None,
+        };
+        service.register(&req).unwrap();
+        service
+            .login(&LoginRequest {
+                username: "alice".to_string(),
+                password: "password123".to_string(),
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_and_invalidates_old_token() {
+        let service = build_service().await;
+        let login = register_login(&service);
+
+        // 正常轮换成功，拿到新刷新令牌。
+        let rotated = service.refresh_token(&login.refresh_token).await.unwrap();
+        assert_ne!(rotated.refresh_token, login.refresh_token);
+
+        // 用轮换后的新令牌可继续刷新。
+        let rotated2 = service.refresh_token(&rotated.refresh_token).await.unwrap();
+        assert_ne!(rotated2.refresh_token, rotated.refresh_token);
+    }
+
+    #[tokio::test]
+    async fn reusing_old_refresh_token_triggers_family_revocation() {
+        let service = build_service().await;
+        let login = register_login(&service);
+
+        // 第一次轮换：旧 token 被撤销。
+        let rotated = service.refresh_token(&login.refresh_token).await.unwrap();
+
+        // 复用已被撤销的旧 token => 判定为复用攻击。
+        let reuse = service.refresh_token(&login.refresh_token).await;
+        assert!(matches!(reuse, Err(DataChainError::TokenReuseDetected)));
+
+        // 复用检测会整族撤销：此前合法的 rotated token 也随之失效。
+        let after = service.refresh_token(&rotated.refresh_token).await;
+        assert!(matches!(after, Err(DataChainError::TokenReuseDetected)));
+    }
+
+    /// 并发双花回归测试：同一 refresh token 被两个请求同时消费。
+    ///
+    /// 证明 revoke_refresh 的抢占语义收口了 TOCTOU：即便两个并发请求都可能
+    /// 通过 is_jti_revoked 检查，数据库主键唯一性也只允许其中一个抢占成功并
+    /// 签发新令牌对，另一个必然得到 TokenReuseDetected，且触发整族撤销。
+    /// 一个旧 token 绝不可能兑换出两对有效新令牌。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_double_spend_yields_single_success() {
+        let service = build_service().await;
+        let login = register_login(&service);
+
+        let token_a = login.refresh_token.clone();
+        let token_b = login.refresh_token.clone();
+        let svc_a = service.clone();
+        let svc_b = service.clone();
+
+        // 两个任务并发用同一个旧 refresh token 轮换。
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { svc_a.refresh_token(&token_a).await }),
+            tokio::spawn(async move { svc_b.refresh_token(&token_b).await }),
+        );
+        let ra = ra.unwrap();
+        let rb = rb.unwrap();
+
+        // 恰好一个成功、一个被判定为复用/双花。
+        let ok_count = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+        let reuse_count = [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Err(DataChainError::TokenReuseDetected)))
+            .count();
+        assert_eq!(ok_count, 1, "并发双花必须恰好只有一个请求成功");
+        assert_eq!(reuse_count, 1, "另一个请求必须被判定为 TokenReuseDetected");
+
+        // 抢占失败一侧已触发整族撤销：成功一侧拿到的新 token 也应随之失效，
+        // 证明旧 token 的并发双花不会留下任何可继续使用的有效令牌。
+        let winner = match (ra, rb) {
+            (Ok(w), _) | (_, Ok(w)) => w,
+            _ => panic!("并发双花应恰有一方成功"),
+        };
+        let after = service.refresh_token(&winner.refresh_token).await;
+        assert!(
+            matches!(after, Err(DataChainError::TokenReuseDetected)),
+            "双花触发整族撤销后，胜出方的新 token 也应失效"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_survives_service_restart() {
+        // 同一 Storage 支撑两个 AuthService 实例，模拟进程重启后撤销状态仍在。
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("auth.sqlite");
+        let storage = crate::storage::create_storage(path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let service1 = create_auth_service("s".to_string(), 24, storage.clone());
+        let login = register_login(&service1);
+        let rotated = service1.refresh_token(&login.refresh_token).await.unwrap();
+
+        // 新建一个 AuthService（不共享内存撤销状态，仅共享 Storage）。
+        let service2 = create_auth_service("s".to_string(), 24, storage.clone());
+        // service2 需要有该用户才能走到用户查找；从存储无用户，这里直接复用 service1 验证撤销表持久化。
+        // 对 service2 复用旧 token 应被撤销表拦截。
+        let reuse = service2.refresh_token(&login.refresh_token).await;
+        assert!(matches!(reuse, Err(DataChainError::TokenReuseDetected)));
+        // rotated 仍是该 family 的有效 token，但 family 已因复用被撤销。
+        let after = service2.refresh_token(&rotated.refresh_token).await;
+        assert!(matches!(after, Err(DataChainError::TokenReuseDetected)));
+    }
 }

@@ -53,7 +53,7 @@ async fn build_state(dsn: &str) -> AppState {
         chain.load_blocks(blocks);
     }
 
-    let auth_service = create_auth_service(JWT_SECRET.to_string(), 24);
+    let auth_service = create_auth_service(JWT_SECRET.to_string(), 24, storage.clone());
     for user in storage.get_all_users().await.unwrap() {
         auth_service.load_user(user);
     }

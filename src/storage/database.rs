@@ -52,6 +52,10 @@ impl Storage {
                 include_str!("../../migrations/002_pending_aggregations.sql"),
             ),
             (3, include_str!("../../migrations/003_anchor_outbox.sql")),
+            (
+                4,
+                include_str!("../../migrations/004_revoked_refresh_tokens.sql"),
+            ),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -175,6 +179,22 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
+        // 已撤销的刷新令牌（旧库兼容兜底，正式建表见 migration 004）。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS revoked_refresh_tokens (
+                jti TEXT PRIMARY KEY NOT NULL,
+                user_id TEXT NOT NULL,
+                family_id TEXT NOT NULL,
+                reason TEXT,
+                expires_at INTEGER NOT NULL,
+                revoked_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // 创建索引
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
             .execute(&self.pool)
@@ -196,6 +216,21 @@ impl Storage {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_anchor_outbox_status ON anchor_outbox(status)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_user_id ON revoked_refresh_tokens(user_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_family_id ON revoked_refresh_tokens(family_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_expires_at ON revoked_refresh_tokens(expires_at)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -661,6 +696,124 @@ impl Storage {
         }
     }
 
+    // ==================== 刷新令牌撤销（refresh token 持久化） ====================
+
+    /// family 撤销哨兵行使用的 jti 约定前缀。该 jti 不对应真实令牌，
+    /// 仅代表「整个 family 已被废止」。
+    fn family_sentinel_jti(family_id: &str) -> String {
+        format!("family:{}", family_id)
+    }
+
+    /// 抢占式撤销单个刷新令牌 jti：以 jti 为主键 `INSERT ... ON CONFLICT DO NOTHING`。
+    ///
+    /// 返回值区分并发语义：
+    /// - `true`  = 本次调用成功写入（抢占成功，调用方可安全签发新令牌对）；
+    /// - `false` = 该 jti 已存在（主键冲突，说明已被并发请求或之前的轮换消费）。
+    ///
+    /// 用数据库主键唯一性收口「检查-写入」之间的 TOCTOU 窗口：两个并发请求
+    /// 用同一旧 refresh token 轮换时，只有一个能抢到插入，另一个得到 false，
+    /// 从而被判定为复用/并发双花，避免一个旧 token 兑换出两对新令牌。
+    pub async fn revoke_refresh(
+        &self,
+        jti: &str,
+        user_id: &str,
+        family_id: &str,
+        reason: Option<&str>,
+        expires_at: i64,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens
+                (jti, user_id, family_id, reason, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(jti) DO NOTHING
+            "#,
+        )
+        .bind(jti)
+        .bind(user_id)
+        .bind(family_id)
+        .bind(reason)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        // rows_affected == 0 表示 jti 已存在、本次未抢占成功。
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 查询某 jti 是否已被撤销。
+    pub async fn is_jti_revoked(&self, jti: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM revoked_refresh_tokens WHERE jti = ?")
+                .bind(jti)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// 撤销整个 family：写入/更新一条哨兵行代表该 family 被整体废止。
+    /// 后续任何属于该 family 的 jti 都应经 is_family_revoked 判定为已撤销。
+    ///
+    /// `ttl_secs` 由调用方传入刷新令牌有效期（见 `JwtHandler::refresh_expire_secs`），
+    /// 哨兵行 expires_at = now + ttl_secs + 1 天余量。哨兵行只需覆盖「该 family
+    /// 任何未过期 refresh token 的最长剩余寿命」，超过该寿命后族内所有 token 都已
+    /// 自然过期、无法再用于轮换，哨兵行可被 purge 安全清理。
+    /// 不再用 365 天魔法数，避免 refresh 有效期调大时 purge 误删哨兵行导致撤销失忆。
+    pub async fn revoke_family(
+        &self,
+        user_id: &str,
+        family_id: &str,
+        reason: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        // 哨兵行是幂等的（同一 family 重复撤销无害），忽略抢占成功与否的返回值。
+        let sentinel_jti = Self::family_sentinel_jti(family_id);
+        let sentinel_expires = now + ttl_secs + 24 * 3600;
+        let now_ts = now;
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens
+                (jti, user_id, family_id, reason, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(jti) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                reason = excluded.reason,
+                revoked_at = excluded.revoked_at
+            "#,
+        )
+        .bind(&sentinel_jti)
+        .bind(user_id)
+        .bind(family_id)
+        .bind(reason)
+        .bind(sentinel_expires)
+        .bind(now_ts)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 查询某 family 是否已被整体撤销（哨兵行存在即视为撤销）。
+    pub async fn is_family_revoked(&self, user_id: &str, family_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM revoked_refresh_tokens WHERE user_id = ? AND jti = ?")
+                .bind(user_id)
+                .bind(Self::family_sentinel_jti(family_id))
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// 清理已过期的撤销记录，返回删除行数。
+    pub async fn purge_expired_refresh(&self, now_ts: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM revoked_refresh_tokens WHERE expires_at < ?")
+            .bind(now_ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 关闭存储
     pub async fn close(&self) {
         self.pool.close().await;
@@ -782,5 +935,73 @@ mod tests {
             "summary-1"
         );
         assert_eq!(storage.get_all_aggregations().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoked_refresh_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+
+        let exp = Utc::now().timestamp() + 3600;
+        assert!(!storage.is_jti_revoked("jti-1").await.unwrap());
+
+        // 首次抢占成功返回 true。
+        let first = storage
+            .revoke_refresh("jti-1", "user-1", "fam-1", Some("rotated"), exp)
+            .await
+            .unwrap();
+        assert!(first, "首次撤销应抢占成功");
+        assert!(storage.is_jti_revoked("jti-1").await.unwrap());
+
+        // 抢占语义：对同一 jti 的第二次撤销返回 false（主键冲突，未抢占成功），
+        // 这是收口并发双花的关键——旧 token 只能被消费一次。
+        let second = storage
+            .revoke_refresh("jti-1", "user-1", "fam-1", Some("rotated"), exp)
+            .await
+            .unwrap();
+        assert!(!second, "重复撤销同一 jti 应返回 false（抢占失败）");
+        assert!(storage.is_jti_revoked("jti-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoke_family_marks_whole_family() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+
+        assert!(!storage.is_family_revoked("user-1", "fam-1").await.unwrap());
+        // ttl_secs 用 7 天（与默认 refresh_expire_days 一致）。
+        let ttl = 7 * 24 * 3600;
+        storage
+            .revoke_family("user-1", "fam-1", Some("reuse"), ttl)
+            .await
+            .unwrap();
+        assert!(storage.is_family_revoked("user-1", "fam-1").await.unwrap());
+        // 不同 family / 用户不受影响。
+        assert!(!storage.is_family_revoked("user-1", "fam-2").await.unwrap());
+        assert!(!storage.is_family_revoked("user-2", "fam-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn purge_expired_refresh_removes_stale_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+
+        let now = Utc::now().timestamp();
+        storage
+            .revoke_refresh("old", "u", "f", None, now - 100)
+            .await
+            .unwrap();
+        storage
+            .revoke_refresh("fresh", "u", "f", None, now + 3600)
+            .await
+            .unwrap();
+
+        let removed = storage.purge_expired_refresh(now).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(!storage.is_jti_revoked("old").await.unwrap());
+        assert!(storage.is_jti_revoked("fresh").await.unwrap());
     }
 }

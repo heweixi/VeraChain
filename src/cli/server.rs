@@ -62,7 +62,11 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("已加载 {} 条待打包元数据", chain.get_pending_count());
 
     // 创建服务
-    let auth_service = create_auth_service(config.jwt.secret.clone(), config.jwt.expire_hours);
+    let auth_service = create_auth_service(
+        config.jwt.secret.clone(),
+        config.jwt.expire_hours,
+        storage.clone(),
+    );
     let metadata_manager = create_metadata_manager(chain.clone());
     let version_tracker = create_version_tracker();
     let aggregation_engine = create_aggregation_engine(
@@ -75,6 +79,16 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     let users = storage.get_all_users().await?;
     for user in users {
         auth_service.load_user(user);
+    }
+
+    // 清理已过期的刷新令牌撤销记录，避免撤销表无限增长。
+    match storage
+        .purge_expired_refresh(chrono::Utc::now().timestamp())
+        .await
+    {
+        Ok(n) if n > 0 => info!("已清理 {} 条过期的刷新令牌撤销记录", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("清理过期刷新令牌撤销记录失败: {}", e),
     }
 
     // 加载版本

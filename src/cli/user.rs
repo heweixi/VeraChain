@@ -42,7 +42,11 @@ pub enum UserAction {
 /// 运行用户命令
 pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<()> {
     let storage = create_storage(&config.database.dsn).await?;
-    let auth_service = create_auth_service(config.jwt.secret.clone(), config.jwt.expire_hours);
+    let auth_service = create_auth_service(
+        config.jwt.secret.clone(),
+        config.jwt.expire_hours,
+        storage.clone(),
+    );
 
     // 加载用户
     let users = storage.get_all_users().await?;

@@ -139,12 +139,20 @@ pub async fn refresh_token(
     State(state): State<AppState>,
     Json(req): Json<RefreshTokenRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.auth_service.refresh_token(&req.refresh_token) {
+    match state.auth_service.refresh_token(&req.refresh_token).await {
         Ok(resp) => Ok(Json(ApiResponse::success(resp))),
-        Err(e) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::error(e.to_string())),
-        )),
+        Err(e) => {
+            // 区分 HTTP 语义：令牌无效/过期/复用等客户端凭证问题 => 401；
+            // 底层数据库/存储故障 => 500，避免把服务端故障伪装成鉴权失败而掩盖问题。
+            let status = match e {
+                crate::error::DataChainError::DatabaseError(_)
+                | crate::error::DataChainError::StorageError(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::UNAUTHORIZED,
+            };
+            Err((status, Json(ApiResponse::error(e.to_string()))))
+        }
     }
 }
 

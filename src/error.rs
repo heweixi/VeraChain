@@ -29,6 +29,9 @@ pub enum DataChainError {
     #[error("令牌已过期")]
     TokenExpired,
 
+    #[error("检测到刷新令牌复用,该登录会话已被撤销")]
+    TokenReuseDetected,
+
     #[error("权限不足")]
     PermissionDenied,
 
