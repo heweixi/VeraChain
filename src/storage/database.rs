@@ -74,164 +74,23 @@ impl Storage {
         Ok(())
     }
 
-    /// 初始化表（保留幂等建表作为旧数据库兼容兜底）。
+    /// 初始化表结构:纯 migration 驱动。
+    ///
+    /// 建表/建索引的唯一事实源是 `migrations/NNN_*.sql`(经 `apply_migrations` 按
+    /// `schema_migrations` 版本号顺序执行)。此处不再保留 `CREATE TABLE IF NOT EXISTS`
+    /// 兜底——此前兜底与 migration 完全重叠(001~004 已覆盖 blocks/users/versions/
+    /// pending_metadata/aggregations/anchor_outbox/revoked_refresh_tokens 全部表与索引),
+    /// 两套逻辑并存只会带来漂移风险。
+    ///
+    /// 旧库兼容性:migration 全部为幂等 `CREATE TABLE/INDEX IF NOT EXISTS`。即便某个
+    /// 旧库此前仅靠兜底建过表、`schema_migrations` 为空,升级时 apply_migrations 会从
+    /// version 0 重跑所有迁移,已存在的表/索引被 IF NOT EXISTS 跳过,不会丢表或报错。
+    ///
+    /// 回滚约定:当前 migration 只前进(up-only),无自动 down。需要回滚时手动操作数据库;
+    /// 需要数据回填(backfill)的迁移将在首次出现真实场景时(如独立 metadata 查询表)
+    /// 作为带数据变换的 migration 引入。
     async fn init_tables(&self) -> Result<()> {
         self.apply_migrations().await?;
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_index INTEGER UNIQUE NOT NULL,
-                timestamp INTEGER NOT NULL,
-                previous_hash TEXT NOT NULL,
-                merkle_root TEXT NOT NULL,
-                nonce INTEGER NOT NULL,
-                difficulty INTEGER NOT NULL,
-                hash TEXT UNIQUE NOT NULL,
-                data TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT UNIQUE NOT NULL,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                role TEXT NOT NULL,
-                public_key TEXT,
-                created_at DATETIME NOT NULL,
-                last_login DATETIME,
-                is_active INTEGER DEFAULT 1,
-                metadata TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                version_id TEXT UNIQUE NOT NULL,
-                timestamp DATETIME NOT NULL,
-                file_path TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                author TEXT NOT NULL,
-                message TEXT,
-                parent_version TEXT
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // pending 和 aggregation 使用完整 JSON 保存领域对象，避免改变现有公开模型。
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS pending_metadata (
-                data_id TEXT PRIMARY KEY NOT NULL,
-                data TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS aggregations (
-                summary_id TEXT PRIMARY KEY NOT NULL,
-                created_at DATETIME NOT NULL,
-                data TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // 跨链锚定 outbox（旧库兼容兜底，正式建表见 migration 003）。
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS anchor_outbox (
-                anchor_id TEXT PRIMARY KEY NOT NULL,
-                target_chain_id TEXT NOT NULL,
-                data_id TEXT NOT NULL,
-                signed TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                receipt TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // 已撤销的刷新令牌（旧库兼容兜底，正式建表见 migration 004）。
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS revoked_refresh_tokens (
-                jti TEXT PRIMARY KEY NOT NULL,
-                user_id TEXT NOT NULL,
-                family_id TEXT NOT NULL,
-                reason TEXT,
-                expires_at INTEGER NOT NULL,
-                revoked_at INTEGER NOT NULL
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // 创建索引
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_blocks_index ON blocks(block_index)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_versions_file_path ON versions(file_path)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_aggregations_created_at ON aggregations(created_at)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_anchor_outbox_status ON anchor_outbox(status)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_user_id ON revoked_refresh_tokens(user_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_family_id ON revoked_refresh_tokens(family_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_revoked_refresh_expires_at ON revoked_refresh_tokens(expires_at)",
-        )
-        .execute(&self.pool)
-        .await?;
-
         Ok(())
     }
 
@@ -935,6 +794,80 @@ mod tests {
             "summary-1"
         );
         assert_eq!(storage.get_all_aggregations().await.unwrap().len(), 1);
+    }
+
+    /// 旧库升级安全性(backlog #6):移除 init_tables 兜底后,确认"仅靠旧兜底建过表、
+    /// schema_migrations 为空"的历史库经纯 migration 驱动打开时不丢表、不报错、数据保留。
+    #[tokio::test]
+    async fn legacy_db_without_schema_migrations_upgrades_safely() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let dsn = path.to_str().unwrap();
+
+        // 1) 构造"旧库":直接用底层连接建一张 blocks 表并插入一行,
+        //    故意不建 schema_migrations(模拟 migration 机制引入前、仅靠兜底建表的库)。
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite:{}?mode=rwc", dsn))
+                .await
+                .unwrap();
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_index INTEGER UNIQUE NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    previous_hash TEXT NOT NULL,
+                    merkle_root TEXT NOT NULL,
+                    nonce INTEGER NOT NULL,
+                    difficulty INTEGER NOT NULL,
+                    hash TEXT UNIQUE NOT NULL,
+                    data TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO blocks (block_index, timestamp, previous_hash, merkle_root, nonce, difficulty, hash, data) \
+                 VALUES (0, 0, '', 'root', 0, 0, 'legacy-hash', '{}')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            // 确认旧库此时没有 schema_migrations。
+            let has_sm: Option<(String,)> = sqlx::query_as(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            assert!(has_sm.is_none(), "旧库不应有 schema_migrations");
+            pool.close().await;
+        }
+
+        // 2) 用新代码(纯 migration 驱动)打开同一个库文件。
+        let storage = Storage::new(dsn).await.unwrap();
+
+        // 3) 旧数据保留:原 blocks 行仍在,未丢表、未清空。
+        assert_eq!(
+            storage.get_block_count().await.unwrap(),
+            1,
+            "旧库升级后原有区块应保留"
+        );
+
+        // 4) migration 新增的表(如 users)可正常使用:插入并读回。
+        let user = User::new(
+            "upgrade-tester".to_string(),
+            "hash".to_string(),
+            "u@legacy.local".to_string(),
+            crate::auth::Role::User,
+        );
+        storage.save_user(&user).await.unwrap();
+        assert_eq!(storage.get_all_users().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
