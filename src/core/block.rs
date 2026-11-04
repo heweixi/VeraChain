@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::merkle::build_merkle_root;
+use crate::catalog::CatalogRecord;
 
 /// 元数据条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +81,9 @@ pub struct Block {
     pub attestations: Vec<SignedAttestation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_transactions: Vec<KeyTransactionEntry>,
+    /// Subject/Revision/Artifact/Claim 的完整语义记录；每条以 leaf_hash 进入 merkle_root。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalog_records: Vec<CatalogRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_registry: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -152,6 +156,7 @@ impl Block {
             version_info: None,
             attestations: Vec::new(),
             key_transactions: Vec::new(),
+            catalog_records: Vec::new(),
             identity_registry: None,
             identity_snapshot_hash: String::new(),
         }
@@ -179,15 +184,19 @@ impl Block {
 
     /// 计算 Merkle 根。
     ///
-    /// 叶子集合 = 元数据叶子 ++ 密钥交易叶子(backlog L1,选项 X):
+    /// 叶子集合 = 元数据叶子 ++ 密钥交易叶子 ++ 语义目录记录叶子：
     /// - 元数据叶子 = SHA256(data_id)(BLOCK_HASH_SPEC 第10节 v1,三版本一致)
     /// - 密钥交易叶子 = SHA256(规范化 key_tx)(见 `KeyTransactionEntry::leaf_hash`)
+    /// - 目录记录叶子 = SHA256(完整规范化 Subject/Revision/Artifact/Claim 语义)
     ///
-    /// 把 key_transactions 纳入 merkle_root,使身份/密钥交易与数据同等受区块哈希与
-    /// PoW 保护,并可随 merkle_root 被外链锚定验证。向后兼容:key_transactions 为空时
-    /// 不追加任何叶子,既有仅含元数据的区块 merkle_root 不变。
+    /// 目录记录解决 legacy metadata 叶子只承诺 data_id 的限制；新版本、构建物与认证
+    /// 声明的完整内容均进入 Merkle 承诺。向后兼容:catalog_records 为空时不追加叶子，
+    /// 已有区块的 merkle_root 不变。
     pub fn calculate_merkle_root(&self) -> String {
-        if self.metadata_list.is_empty() && self.key_transactions.is_empty() {
+        if self.metadata_list.is_empty()
+            && self.key_transactions.is_empty()
+            && self.catalog_records.is_empty()
+        {
             return String::new();
         }
 
@@ -197,6 +206,7 @@ impl Block {
             .map(|entry| super::metadata_leaf_hash(&entry.data_id))
             .collect();
         hashes.extend(self.key_transactions.iter().map(|tx| tx.leaf_hash()));
+        hashes.extend(self.catalog_records.iter().map(|record| record.leaf_hash()));
 
         build_merkle_root(&hashes)
     }
@@ -301,5 +311,30 @@ mod tests {
         assert_eq!(a.leaf_hash(), b.leaf_hash());
         let c = sample_key_tx("pk-b");
         assert_ne!(a.leaf_hash(), c.leaf_hash());
+    }
+
+    #[test]
+    fn semantic_catalog_record_enters_merkle_root() {
+        use crate::catalog::{CatalogPayload, CatalogRecord, Subject};
+
+        let record = CatalogRecord {
+            record_id: "record-1".to_string(),
+            payload: CatalogPayload::Subject(Subject {
+                subject_id: "repo-example".to_string(),
+                subject_type: "repository".to_string(),
+                display_name: "Example".to_string(),
+                source_ref: String::new(),
+            }),
+            issuer_identity: "issuer".to_string(),
+            issuer_key: "public-key".to_string(),
+            signature: "signature".to_string(),
+            recorded_at: 1,
+        };
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.catalog_records.push(record.clone());
+        let expected_root = record.leaf_hash();
+        block.mine();
+        assert_eq!(block.merkle_root, expected_root);
+        assert!(block.is_valid());
     }
 }

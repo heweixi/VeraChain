@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::aggregation::AggregationSummary;
 use crate::auth::User;
+use crate::catalog::{CatalogPayload, CatalogRecord};
 use crate::core::{Block, MetadataEntry};
 use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
 use crate::error::{DataChainError, Result};
@@ -59,6 +60,10 @@ impl Storage {
             (
                 5,
                 include_str!("../../migrations/005_metadata_projection.sql"),
+            ),
+            (
+                6,
+                include_str!("../../migrations/006_catalog_semantic_records.sql"),
             ),
         ];
         for (version, sql) in migrations {
@@ -182,6 +187,96 @@ impl Storage {
             .bind(&entry_json)
             .execute(&mut *tx)
             .await?;
+        }
+
+        // 同事务持久化语义目录记录并更新查询投影。记录本身已在 block.catalog_records
+        // 并进入 merkle_root，是权威事实；catalog_* 表仅加速查询。
+        for record in &block.catalog_records {
+            let record_json = serde_json::to_string(record)?;
+            sqlx::query("DELETE FROM pending_catalog_records WHERE record_id = ?")
+                .bind(&record.record_id)
+                .execute(&mut *tx)
+                .await?;
+
+            match &record.payload {
+                CatalogPayload::Subject(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_subjects (subject_id, subject_type, display_name, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(subject_id) DO NOTHING",
+                    )
+                    .bind(&v.subject_id)
+                    .bind(&v.subject_type)
+                    .bind(&v.display_name)
+                    .bind(&v.source_ref)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                CatalogPayload::Revision(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_revisions (revision_id, subject_id, content_hash, parent_revision_id, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(revision_id) DO NOTHING",
+                    )
+                    .bind(&v.revision_id)
+                    .bind(&v.subject_id)
+                    .bind(&v.content_hash)
+                    .bind(&v.parent_revision_id)
+                    .bind(&v.source_ref)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                CatalogPayload::Artifact(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_artifacts (artifact_id, revision_id, artifact_hash, configuration_hash, platform, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING",
+                    )
+                    .bind(&v.artifact_id)
+                    .bind(&v.revision_id)
+                    .bind(&v.artifact_hash)
+                    .bind(&v.configuration_hash)
+                    .bind(&v.platform)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                CatalogPayload::Claim(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_claims (claim_id, subject_id, revision_id, artifact_id, category, status, evidence_ref, observed_at, effective_from, effective_to, supersedes_claim_id, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(claim_id) DO NOTHING",
+                    )
+                    .bind(&v.claim_id)
+                    .bind(&v.subject_id)
+                    .bind(&v.revision_id)
+                    .bind(&v.artifact_id)
+                    .bind(&v.category)
+                    .bind(&v.status)
+                    .bind(&v.evidence_ref)
+                    .bind(v.observed_at)
+                    .bind(v.effective_from)
+                    .bind(v.effective_to)
+                    .bind(&v.supersedes_claim_id)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
 
         tx.commit().await?;
@@ -812,6 +907,86 @@ impl Storage {
     /// 读取全部投影元数据(统计/全量列举用)。
     pub async fn get_all_metadata(&self) -> Result<Vec<MetadataEntry>> {
         self.query_metadata(None, None, None).await
+    }
+
+    // ==================== 可验证语义目录(Subject/Revision/Artifact/Claim) ====================
+
+    /// 保存待打包目录记录。提交 API 先落库、后入内存队列，避免进程重启丢失已接受记录。
+    pub async fn save_pending_catalog_record(&self, record: &CatalogRecord) -> Result<()> {
+        let data = serde_json::to_string(record)?;
+        sqlx::query(
+            "INSERT INTO pending_catalog_records (record_id, data, created_at) VALUES (?, ?, ?) ON CONFLICT(record_id) DO NOTHING",
+        )
+        .bind(&record.record_id)
+        .bind(data)
+        .bind(record.recorded_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 恢复所有待打包目录记录。
+    pub async fn get_pending_catalog_records(&self) -> Result<Vec<CatalogRecord>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM pending_catalog_records ORDER BY created_at ASC, record_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
+    /// 从 Subject 查询投影读取一条记录。
+    pub async fn get_catalog_subject(&self, subject_id: &str) -> Result<Option<CatalogRecord>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data FROM catalog_subjects WHERE subject_id = ?")
+                .bind(subject_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((data,)) => Ok(Some(serde_json::from_str(&data)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 按 subject 查询其不可变版本，按记录时间升序。
+    pub async fn get_catalog_revisions(&self, subject_id: &str) -> Result<Vec<CatalogRecord>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM catalog_revisions WHERE subject_id = ? ORDER BY recorded_at ASC, revision_id ASC",
+        )
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
+    /// 按 revision 查询构建/配置变体，按记录时间升序。
+    pub async fn get_catalog_artifacts(&self, revision_id: &str) -> Result<Vec<CatalogRecord>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM catalog_artifacts WHERE revision_id = ? ORDER BY recorded_at ASC, artifact_id ASC",
+        )
+        .bind(revision_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
+    }
+
+    /// 读取某 subject 的认证声明。Claim 保留完整历史，不在此处删除 withdrawn/superseded。
+    pub async fn get_catalog_claims(&self, subject_id: &str) -> Result<Vec<CatalogRecord>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT data FROM catalog_claims WHERE subject_id = ? ORDER BY observed_at ASC, claim_id ASC",
+        )
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .collect()
     }
 
     /// 关闭存储

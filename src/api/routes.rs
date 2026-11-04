@@ -86,6 +86,27 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/identity/keys/:public_key",
             get(handlers::get_identity_key),
         )
+        // 可验证语义目录:对象→版本→构建变体 + 带证据的认证声明
+        .route(
+            "/api/v1/catalog/records",
+            post(handlers::submit_catalog_record),
+        )
+        .route(
+            "/api/v1/catalog/subjects/:subject_id",
+            get(handlers::get_catalog_subject),
+        )
+        .route(
+            "/api/v1/catalog/subjects/:subject_id/revisions",
+            get(handlers::get_catalog_revisions),
+        )
+        .route(
+            "/api/v1/catalog/revisions/:revision_id/artifacts",
+            get(handlers::get_catalog_artifacts),
+        )
+        .route(
+            "/api/v1/catalog/subjects/:subject_id/claims",
+            get(handlers::get_catalog_claims),
+        )
         .route("/api/v1/chain/info", get(handlers::get_chain_info))
         .route("/api/v1/chain/mine", post(handlers::mine_block))
         .route("/api/v1/chain/validate", post(handlers::validate_chain))

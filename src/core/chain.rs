@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use super::block::{Block, KeyTransactionEntry, MetadataEntry};
+use crate::catalog::CatalogRecord;
 use crate::error::{DataChainError, Result};
 
 /// 区块链
@@ -13,6 +14,8 @@ pub struct Chain {
     pending: RwLock<Vec<MetadataEntry>>,
     /// 待打包的密钥交易(backlog L1)。与元数据 pending 并列,下次挖矿并入区块。
     pending_key_tx: RwLock<Vec<KeyTransactionEntry>>,
+    /// 待打包的完整语义目录记录(Subject/Revision/Artifact/Claim)。
+    pending_catalog_records: RwLock<Vec<CatalogRecord>>,
 }
 
 impl Chain {
@@ -24,6 +27,7 @@ impl Chain {
             block_size,
             pending: RwLock::new(Vec::new()),
             pending_key_tx: RwLock::new(Vec::new()),
+            pending_catalog_records: RwLock::new(Vec::new()),
         }
     }
 
@@ -40,6 +44,35 @@ impl Chain {
     /// 加载待打包密钥交易(从存储恢复)。
     pub fn load_pending_key_tx(&self, txs: Vec<KeyTransactionEntry>) {
         *self.pending_key_tx.write() = txs;
+    }
+
+    /// 加入一条待打包语义目录记录。
+    pub fn add_catalog_record(&self, record: CatalogRecord) {
+        self.pending_catalog_records.write().push(record);
+    }
+
+    /// 待打包语义目录记录数量。
+    pub fn get_pending_catalog_record_count(&self) -> usize {
+        self.pending_catalog_records.read().len()
+    }
+
+    /// 从持久化存储恢复待打包语义目录记录。
+    pub fn load_pending_catalog_records(&self, records: Vec<CatalogRecord>) {
+        *self.pending_catalog_records.write() = records;
+    }
+
+    /// 检查一个稳定语义标识是否已在已上链或待打包目录记录中出现。
+    /// 提交 Subject/Revision/Artifact/Claim 前用它保证主标识唯一，并允许同批依赖关系。
+    pub fn has_catalog_record(&self, record_type: &str, primary_id: &str) -> bool {
+        let committed = self.blocks.read().iter().any(|block| {
+            block.catalog_records.iter().any(|record| {
+                record.record_type() == record_type && record.payload.primary_id() == primary_id
+            })
+        });
+        committed
+            || self.pending_catalog_records.read().iter().any(|record| {
+                record.record_type() == record_type && record.payload.primary_id() == primary_id
+            })
     }
 
     /// 为最新区块写入 identity_snapshot_hash(backlog L1)。
@@ -170,6 +203,12 @@ impl Chain {
         let mut restored_tx = block.key_transactions.clone();
         restored_tx.append(&mut *pending_key_tx);
         *pending_key_tx = restored_tx;
+        drop(pending_key_tx);
+
+        let mut pending_catalog = self.pending_catalog_records.write();
+        let mut restored_catalog = block.catalog_records.clone();
+        restored_catalog.append(&mut *pending_catalog);
+        *pending_catalog = restored_catalog;
         true
     }
 
@@ -182,9 +221,10 @@ impl Chain {
 
         let mut pending = self.pending.write();
         let mut pending_key_tx = self.pending_key_tx.write();
-        if pending.is_empty() && pending_key_tx.is_empty() {
+        let mut pending_catalog = self.pending_catalog_records.write();
+        if pending.is_empty() && pending_key_tx.is_empty() && pending_catalog.is_empty() {
             return Err(DataChainError::AggregationFailed(
-                "no pending metadata or key transactions".to_string(),
+                "no pending metadata, key transactions, or catalog records".to_string(),
             ));
         }
 
@@ -199,7 +239,10 @@ impl Chain {
 
         // 并入全部待打包密钥交易(backlog L1);它们会进入 merkle_root 受哈希保护。
         new_block.key_transactions = pending_key_tx.drain(..).collect();
+        // 并入完整语义目录记录;其 leaf_hash 覆盖完整 Subject/Revision/Artifact/Claim 内容。
+        new_block.catalog_records = pending_catalog.drain(..).collect();
 
+        drop(pending_catalog);
         drop(pending_key_tx);
         drop(pending);
         drop(blocks);

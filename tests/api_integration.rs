@@ -14,6 +14,7 @@ use tower::ServiceExt;
 use datachain::aggregation::{create_aggregation_engine, create_scheduler};
 use datachain::api::{self, AppState, EventBus, NotificationService, WsHub};
 use datachain::auth::{create_auth_service, RegisterRequest, Role};
+use datachain::catalog::{Artifact, CatalogPayload, CatalogRecord, Claim, Revision, Subject};
 use datachain::core::{create_chain, KeyTransactionEntry};
 use datachain::crosschain::AnchorService;
 use datachain::metadata::create_metadata_manager;
@@ -467,4 +468,217 @@ fn urlencoding(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 可验证语义目录：Subject → Revision → Artifact + 带证据 Claim
+// ---------------------------------------------------------------------------
+
+fn signed_catalog_body(payload: CatalogPayload, issuer: &NodeIdentity) -> Value {
+    let issuer_key = issuer.public_key_base64();
+    let issuer_identity = "issuer:node-a";
+    let signature = issuer.sign_base64(&CatalogRecord::request_signing_payload(
+        &payload,
+        issuer_identity,
+        &issuer_key,
+    ));
+    serde_json::json!({
+        "payload": serde_json::to_value(payload).unwrap(),
+        "issuer_identity": issuer_identity,
+        "issuer_key": issuer_key,
+        "signature": signature,
+    })
+}
+
+async fn mine_catalog_record(router: axum::Router, token: &str) {
+    let response = router
+        .oneshot(post("/api/v1/chain/mine", Some(token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn catalog_subject_revision_artifact_claim_are_signed_committed_and_queryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("catalog.sqlite");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let admin_token = login(router.clone(), "admin", "adminpass123").await;
+
+    // 认证者必须先成为已上链的有效身份，才可签发目录记录或 Claim。
+    let issuer = NodeIdentity::generate("catalog-issuer");
+    let identity_response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&admin_token),
+            signed_key_tx_body("register", &issuer, "auditor"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(identity_response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &admin_token).await;
+
+    let subject = CatalogPayload::Subject(Subject {
+        subject_id: "repo-example".to_string(),
+        subject_type: "repository".to_string(),
+        display_name: "Example Repository".to_string(),
+        source_ref: "https://example.invalid/repo".to_string(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&admin_token),
+            signed_catalog_body(subject, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &admin_token).await;
+
+    let response = router
+        .clone()
+        .oneshot(get(
+            "/api/v1/catalog/subjects/repo-example",
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let subject_response = body_json(response).await;
+    assert_eq!(subject_response["data"]["payload"]["type"], "subject");
+    assert_eq!(
+        subject_response["data"]["payload"]["subject_id"],
+        "repo-example"
+    );
+
+    let revision = CatalogPayload::Revision(Revision {
+        revision_id: "repo-example-v1".to_string(),
+        subject_id: "repo-example".to_string(),
+        content_hash: "sha256:source-v1".to_string(),
+        parent_revision_id: String::new(),
+        source_ref: "refs/tags/v1.0.0".to_string(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&admin_token),
+            signed_catalog_body(revision, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &admin_token).await;
+
+    let artifact = CatalogPayload::Artifact(Artifact {
+        artifact_id: "repo-example-v1-linux".to_string(),
+        revision_id: "repo-example-v1".to_string(),
+        artifact_hash: "sha256:artifact-linux".to_string(),
+        configuration_hash: "sha256:release-config".to_string(),
+        platform: "linux-x86_64".to_string(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&admin_token),
+            signed_catalog_body(artifact, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &admin_token).await;
+
+    let claim = CatalogPayload::Claim(Claim {
+        claim_id: "claim-example-v1-risk".to_string(),
+        subject_id: "repo-example".to_string(),
+        revision_id: "repo-example-v1".to_string(),
+        artifact_id: "repo-example-v1-linux".to_string(),
+        category: "risk.vulnerability".to_string(),
+        status: "confirmed".to_string(),
+        evidence_ref: "sha256:security-report-v1".to_string(),
+        observed_at: 1_700_000_000,
+        effective_from: Some(1_700_000_000),
+        effective_to: None,
+        supersedes_claim_id: String::new(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&admin_token),
+            signed_catalog_body(claim, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &admin_token).await;
+
+    let revisions = router
+        .clone()
+        .oneshot(get(
+            "/api/v1/catalog/subjects/repo-example/revisions",
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    let revisions = body_json(revisions).await;
+    assert_eq!(revisions["data"].as_array().unwrap().len(), 1);
+
+    let artifacts = router
+        .clone()
+        .oneshot(get(
+            "/api/v1/catalog/revisions/repo-example-v1/artifacts",
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    let artifacts = body_json(artifacts).await;
+    assert_eq!(artifacts["data"].as_array().unwrap().len(), 1);
+
+    let claims = router
+        .oneshot(get(
+            "/api/v1/catalog/subjects/repo-example/claims",
+            Some(&admin_token),
+        ))
+        .await
+        .unwrap();
+    let claims = body_json(claims).await;
+    assert_eq!(claims["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        claims["data"][0]["payload"]["category"],
+        "risk.vulnerability"
+    );
+}
+
+#[tokio::test]
+async fn catalog_rejects_unknown_issuer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("catalog-invalid.sqlite");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let issuer = NodeIdentity::generate("unregistered-issuer");
+
+    let subject = CatalogPayload::Subject(Subject {
+        subject_id: "blocked-subject".to_string(),
+        subject_type: "article".to_string(),
+        display_name: "Blocked Subject".to_string(),
+        source_ref: String::new(),
+    });
+    // 数学签名有效，但公钥尚未登记为链上身份，必须拒绝。
+    let response = router
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&token),
+            signed_catalog_body(subject, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

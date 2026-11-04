@@ -47,6 +47,13 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     if path.starts_with("/api/v1/identity/") {
         return Some(Permission::BlockRead);
     }
+    // 语义目录:提交记录会进入区块,需 BlockMine;对象/版本/声明查询按 BlockRead。
+    if method == Method::POST && path == "/api/v1/catalog/records" {
+        return Some(Permission::BlockMine);
+    }
+    if path.starts_with("/api/v1/catalog/") {
+        return Some(Permission::BlockRead);
+    }
     if path == "/api/v1/versions/track" {
         return Some(Permission::VersionTrack);
     }

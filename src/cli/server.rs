@@ -61,6 +61,14 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     chain.load_pending(pending_to_load);
     info!("已加载 {} 条待打包元数据", chain.get_pending_count());
 
+    // 恢复已被接受但尚未打包的完整语义目录记录(subject/revision/artifact/claim)。
+    let pending_catalog_records = storage.get_pending_catalog_records().await?;
+    chain.load_pending_catalog_records(pending_catalog_records);
+    info!(
+        "已加载 {} 条待打包语义目录记录",
+        chain.get_pending_catalog_record_count()
+    );
+
     // 创建服务
     let auth_service = create_auth_service(
         config.jwt.secret.clone(),

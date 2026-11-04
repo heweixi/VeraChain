@@ -1011,6 +1011,207 @@ pub async fn get_identity_key(
     }
 }
 
+/// 提交完整语义目录记录(Subject/Revision/Artifact/Claim)。
+///
+/// 记录必须由已上链、当前有效的身份公钥签名。先持久化 pending 记录后入 Chain 内存队列，
+/// 下次正常挖矿时进入 block.catalog_records 与 merkle_root；不另起特殊区块。
+pub async fn submit_catalog_record(
+    State(state): State<AppState>,
+    Json(req): Json<crate::catalog::CatalogRecordRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let record =
+        crate::catalog::CatalogRecord::from_verified_request(req, chrono::Utc::now().timestamp())
+            .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    // 签名数学正确还不够：签发公钥必须是本链当前有效身份，才能形成可追溯认证来源。
+    let active_keys = crate::identity::replay_key_set(&state.chain.get_all_blocks());
+    if !active_keys.contains_key(&record.issuer_key) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::error(
+                "catalog issuer key is not an active on-chain identity",
+            )),
+        ));
+    }
+
+    let record_type = record.record_type();
+    let primary_id = record.payload.primary_id().to_string();
+    if state.chain.has_catalog_record(record_type, &primary_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("catalog primary id already exists")),
+        ));
+    }
+
+    // 关系完整性：允许引用同一待打包批次中的前置记录，但拒绝悬空关系。
+    match &record.payload {
+        crate::catalog::CatalogPayload::Subject(_) => {}
+        crate::catalog::CatalogPayload::Revision(v) => {
+            if !state.chain.has_catalog_record("subject", &v.subject_id) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error("referenced subject does not exist")),
+                ));
+            }
+            if !v.parent_revision_id.is_empty()
+                && !state
+                    .chain
+                    .has_catalog_record("revision", &v.parent_revision_id)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error(
+                        "referenced parent revision does not exist",
+                    )),
+                ));
+            }
+        }
+        crate::catalog::CatalogPayload::Artifact(v) => {
+            if !state.chain.has_catalog_record("revision", &v.revision_id) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error("referenced revision does not exist")),
+                ));
+            }
+        }
+        crate::catalog::CatalogPayload::Claim(v) => {
+            let subject_ok =
+                v.subject_id.is_empty() || state.chain.has_catalog_record("subject", &v.subject_id);
+            let revision_ok = v.revision_id.is_empty()
+                || state.chain.has_catalog_record("revision", &v.revision_id);
+            let artifact_ok = v.artifact_id.is_empty()
+                || state.chain.has_catalog_record("artifact", &v.artifact_id);
+            if !(subject_ok && revision_ok && artifact_ok) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error(
+                        "claim references an unknown catalog object",
+                    )),
+                ));
+            }
+            if !v.supersedes_claim_id.is_empty()
+                && !state
+                    .chain
+                    .has_catalog_record("claim", &v.supersedes_claim_id)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error("superseded claim does not exist")),
+                ));
+            }
+        }
+    }
+
+    // 先持久化，失败时不入内存队列；重启后 server 会从 pending_catalog_records 恢复。
+    state
+        .storage
+        .save_pending_catalog_record(&record)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+    state.chain.add_catalog_record(record.clone());
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::success(serde_json::json!({
+            "record_id": record.record_id,
+            "record_type": record.record_type(),
+            "primary_id": primary_id,
+            "status": "pending",
+        }))),
+    ))
+}
+
+/// 查询一个逻辑对象及其初始登记记录。
+pub async fn get_catalog_subject(
+    State(state): State<AppState>,
+    Path(subject_id): Path<String>,
+) -> Result<Json<ApiResponse<crate::catalog::CatalogRecord>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.storage.get_catalog_subject(&subject_id).await {
+        Ok(Some(record)) => Ok(Json(ApiResponse::success(record))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("catalog subject not found")),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )),
+    }
+}
+
+/// 查询逻辑对象的全部已上链不可变版本。
+pub async fn get_catalog_revisions(
+    State(state): State<AppState>,
+    Path(subject_id): Path<String>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::catalog::CatalogRecord>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    state
+        .storage
+        .get_catalog_revisions(&subject_id)
+        .await
+        .map(|records| Json(ApiResponse::success(records)))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })
+}
+
+/// 查询一个不可变版本的构建/配置变体。
+pub async fn get_catalog_artifacts(
+    State(state): State<AppState>,
+    Path(revision_id): Path<String>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::catalog::CatalogRecord>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    state
+        .storage
+        .get_catalog_artifacts(&revision_id)
+        .await
+        .map(|records| Json(ApiResponse::success(records)))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })
+}
+
+/// 查询逻辑对象全部认证声明历史（含 withdrawn/superseded，追溯不丢历史）。
+pub async fn get_catalog_claims(
+    State(state): State<AppState>,
+    Path(subject_id): Path<String>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::catalog::CatalogRecord>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    state
+        .storage
+        .get_catalog_claims(&subject_id)
+        .await
+        .map(|records| Json(ApiResponse::success(records)))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })
+}
+
 /// 获取内容的 Merkle 证明
 #[derive(Serialize)]
 pub struct ProofResponse {

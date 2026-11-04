@@ -10,6 +10,7 @@
 pub mod aggregation;
 pub mod api;
 pub mod auth;
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod core;
