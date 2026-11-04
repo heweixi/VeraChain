@@ -6,12 +6,10 @@
 //! 因此本套测试启动真实服务(TcpListener 绑定随机端口)+ tokio-tungstenite 客户端,
 //! 对握手鉴权、EventBus 广播收消息、连接数上限、消息大小上限做自动化断言。
 //!
-//! 频道隔离说明(已知遗留,不在 backlog #4 范围):
-//! 当前 /ws/chain、/ws/metadata、/ws/aggregation 三个频道都只是订阅同一个 WsHub 的
-//! **全量广播**(`hub.subscribe()`),服务端 `handle_channel_socket` 并不按频道做任何过滤,
-//! 任何经 EventBus 发布的事件都会推给所有连着的频道客户端。因此本套测试里对频道的断言
-//! 是"频道客户端能收到广播事件",而**不是**"频道隔离"(即 /ws/chain 只收 chain 事件)。
-//! 真正的按频道过滤属于尚未实现的已知遗留,后续若做服务端过滤需另起 backlog。
+//! 频道隔离说明:
+//! `/ws` 继续接收全部业务事件；`/ws/chain` 仅接收 `block_added`、`chain_validated`，
+//! `/ws/metadata` 仅接收 `metadata_added`，`/ws/aggregation` 仅接收 `aggregation`。
+//! `version_tracked` 和未映射的未来业务消息只投递到通用 `/ws`。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +23,7 @@ use tokio_tungstenite::tungstenite::http::StatusCode as WsStatus;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 
 use datachain::aggregation::{create_aggregation_engine, create_scheduler};
-use datachain::api::{self, AppState, EventBus, NotificationService, WsHub};
+use datachain::api::{self, AppState, Event, EventBus, EventType, NotificationService, WsHub};
 use datachain::auth::{create_auth_service, RegisterRequest, Role};
 use datachain::core::create_chain;
 use datachain::crosschain::AnchorService;
@@ -202,6 +200,25 @@ where
         .flatten()
 }
 
+/// 在指定窗口内断言连接未收到文本消息。
+async fn assert_no_text_within<S>(ws: &mut S, within: Duration, channel: &str)
+where
+    S: StreamExt<Item = Result<TMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let no_text = async {
+        while let Some(frame) = ws.next().await {
+            match frame {
+                Ok(TMessage::Text(text)) => {
+                    panic!("{channel} 不应收到文本消息,却收到: {text}");
+                }
+                Ok(TMessage::Close(_)) | Err(_) => return,
+                Ok(_) => continue,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(within, no_text).await;
+}
+
 // ---------------------------------------------------------------------------
 // 验收点 1:WS 握手必须带有效 JWT
 // ---------------------------------------------------------------------------
@@ -338,6 +355,140 @@ async fn event_bus_metadata_and_aggregation_broadcast() {
     let a = next_text(&mut ws).await.expect("应收到 aggregation");
     assert_eq!(a["type"], "aggregation");
     assert_eq!(a["data"]["count"], 7);
+}
+
+#[tokio::test]
+async fn event_bus_events_are_isolated_to_specialized_ws_channels() {
+    let server = start_server().await;
+    seed_user(&server.state, "wsuser", "wspass123456", Role::User).await;
+    let token = login_token(&server.addr, "wsuser", "wspass123456").await;
+
+    let (mut ws_default, _) = connect_async(ws_request(&server.addr, "/ws", Some(&token)))
+        .await
+        .unwrap();
+    let (mut ws_chain, _) = connect_async(ws_request(&server.addr, "/ws/chain", Some(&token)))
+        .await
+        .unwrap();
+    let (mut ws_metadata, _) =
+        connect_async(ws_request(&server.addr, "/ws/metadata", Some(&token)))
+            .await
+            .unwrap();
+    let (mut ws_aggregation, _) =
+        connect_async(ws_request(&server.addr, "/ws/aggregation", Some(&token)))
+            .await
+            .unwrap();
+
+    assert_eq!(next_text(&mut ws_default).await.unwrap()["type"], "pong");
+    assert_eq!(next_text(&mut ws_chain).await.unwrap()["type"], "subscribe");
+    assert_eq!(
+        next_text(&mut ws_metadata).await.unwrap()["type"],
+        "subscribe"
+    );
+    assert_eq!(
+        next_text(&mut ws_aggregation).await.unwrap()["type"],
+        "subscribe"
+    );
+
+    server
+        .state
+        .event_bus
+        .publish_block_mined(serde_json::json!({"event_id": "block-mined"}));
+    let message = next_text(&mut ws_default)
+        .await
+        .expect("通用频道应收到 block_added");
+    assert_eq!(message["type"], "block_added");
+    assert_eq!(message["data"]["event_id"], "block-mined");
+    let message = next_text(&mut ws_chain)
+        .await
+        .expect("链频道应收到 block_added");
+    assert_eq!(message["type"], "block_added");
+    assert_eq!(message["data"]["event_id"], "block-mined");
+    assert_no_text_within(&mut ws_metadata, Duration::from_millis(200), "/ws/metadata").await;
+    assert_no_text_within(
+        &mut ws_aggregation,
+        Duration::from_millis(200),
+        "/ws/aggregation",
+    )
+    .await;
+
+    server.state.event_bus.publish(Event::new(
+        EventType::ChainValidated,
+        serde_json::json!({"event_id": "chain-validated"}),
+    ));
+    let message = next_text(&mut ws_default)
+        .await
+        .expect("通用频道应收到 chain_validated");
+    assert_eq!(message["type"], "chain_validated");
+    assert_eq!(message["data"]["event_id"], "chain-validated");
+    let message = next_text(&mut ws_chain)
+        .await
+        .expect("链频道应收到 chain_validated");
+    assert_eq!(message["type"], "chain_validated");
+    assert_eq!(message["data"]["event_id"], "chain-validated");
+    assert_no_text_within(&mut ws_metadata, Duration::from_millis(200), "/ws/metadata").await;
+    assert_no_text_within(
+        &mut ws_aggregation,
+        Duration::from_millis(200),
+        "/ws/aggregation",
+    )
+    .await;
+
+    server
+        .state
+        .event_bus
+        .publish_metadata_created(serde_json::json!({"event_id": "metadata-created"}));
+    let message = next_text(&mut ws_default)
+        .await
+        .expect("通用频道应收到 metadata_added");
+    assert_eq!(message["type"], "metadata_added");
+    assert_eq!(message["data"]["event_id"], "metadata-created");
+    let message = next_text(&mut ws_metadata)
+        .await
+        .expect("元数据频道应收到 metadata_added");
+    assert_eq!(message["type"], "metadata_added");
+    assert_eq!(message["data"]["event_id"], "metadata-created");
+    assert_no_text_within(&mut ws_chain, Duration::from_millis(200), "/ws/chain").await;
+    assert_no_text_within(
+        &mut ws_aggregation,
+        Duration::from_millis(200),
+        "/ws/aggregation",
+    )
+    .await;
+
+    server
+        .state
+        .event_bus
+        .publish_aggregation_done(serde_json::json!({"event_id": "aggregation-done"}));
+    let message = next_text(&mut ws_default)
+        .await
+        .expect("通用频道应收到 aggregation");
+    assert_eq!(message["type"], "aggregation");
+    assert_eq!(message["data"]["event_id"], "aggregation-done");
+    let message = next_text(&mut ws_aggregation)
+        .await
+        .expect("汇总频道应收到 aggregation");
+    assert_eq!(message["type"], "aggregation");
+    assert_eq!(message["data"]["event_id"], "aggregation-done");
+    assert_no_text_within(&mut ws_chain, Duration::from_millis(200), "/ws/chain").await;
+    assert_no_text_within(&mut ws_metadata, Duration::from_millis(200), "/ws/metadata").await;
+
+    server.state.event_bus.publish(Event::new(
+        EventType::VersionTracked,
+        serde_json::json!({"event_id": "version-tracked"}),
+    ));
+    let message = next_text(&mut ws_default)
+        .await
+        .expect("通用频道应收到 version_tracked");
+    assert_eq!(message["type"], "version_tracked");
+    assert_eq!(message["data"]["event_id"], "version-tracked");
+    assert_no_text_within(&mut ws_chain, Duration::from_millis(200), "/ws/chain").await;
+    assert_no_text_within(&mut ws_metadata, Duration::from_millis(200), "/ws/metadata").await;
+    assert_no_text_within(
+        &mut ws_aggregation,
+        Duration::from_millis(200),
+        "/ws/aggregation",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

@@ -66,6 +66,17 @@ const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 /// 单进程最大 WebSocket 连接数,防止无界连接耗尽资源。
 const MAX_WS_CLIENTS: usize = 256;
 
+fn channel_accepts_message(channel: &str, msg_type: &MessageType) -> bool {
+    matches!(
+        (channel, msg_type),
+        (
+            "chain",
+            MessageType::BlockAdded | MessageType::ChainValidated
+        ) | ("metadata", MessageType::MetadataAdded)
+            | ("aggregation", MessageType::Aggregation)
+    )
+}
+
 /// WebSocket Hub - 管理所有连接
 pub struct WsHub {
     /// 广播发送器
@@ -365,9 +376,10 @@ async fn handle_channel_socket(
             event = events.recv() => {
                 match event {
                     Ok(event) => {
-                        // 专用频道接收事件总线广播；事件可通过 payload/channel 再由客户端过滤。
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            let _ = sender.send(Message::Text(json)).await;
+                        if channel_accepts_message(&channel, &event.msg_type) {
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = sender.send(Message::Text(json)).await;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {

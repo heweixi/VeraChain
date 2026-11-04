@@ -67,7 +67,7 @@
 
 ![数据锚定链路](./FLOW-C-anchor.png)
 
-> 最后核实:2026-10-18,对应最新代码为本次提交（Claim 信任策略与有效结论 resolver）。
+> 最后核实:2026-11-05。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 > 本文仅描述**已实现并经 247 验证**的行为;未实现的 L2(多外链锚定)/L3(锚定进展回写)/
 > L4(失信切换)/L5(封存重启) 不在此图内,见 `IMPLEMENTATION_STATUS.md` 第四节后续建议。
 > 状态变化时需按 `.kiro/steering/doc-maintenance.md` 同步更新本文与核实提交。
@@ -127,8 +127,8 @@
    ┌────────────────────┐              ┌──────────────────────────┐      ┌──────────────────────────┐
    │ EventBus→WsHub      │              │ P2PService (单向出)       │      │ AnchorService 后台 worker │
    │ WebSocket 推送      │              │ broadcast_blocks →peers  │      │ 每30s process_pending    │
-   │ /ws /ws/chain 等    │              │ exchange_peers 发现      │      │ outbox→connector.deliver │
-   │ (全量广播,无频道过滤)│              │ sync_peer 最长链替换      │      │ →单外链→AnchorReceipt    │
+   │ /ws 保持全量；专用频道 │              │ exchange_peers 发现      │      │ outbox→connector.deliver │
+   │ 按静态事件映射过滤      │              │ sync_peer 最长链替换      │      │ →单外链→AnchorReceipt    │
    └────────────────────┘              └──────────────────────────┘      └──────────────────────────┘
 ```
 
@@ -240,6 +240,7 @@
   无多外链、无"锚定进展回写本链"(L2/L3 待做)。
 - **metadata 查询走投影表**(backlog #5):`metadata` 表是只读查询投影,
   commit_block 同事务 upsert + 启动/CLI 代码级回填;权威源仍是区块 `metadata_list`。
+- **WebSocket 频道为静态映射**：`/ws` 接收全部业务事件；`/ws/chain` 仅接收 `block_added`、`chain_validated`；`/ws/metadata` 仅接收 `metadata_added`；`/ws/aggregation` 仅接收 `aggregation`。`version_tracked` 与未来未映射事件仅进入 `/ws`。不提供动态订阅或频道级授权；URL、JWT、全局 256 连接上限、16KiB 行为和 `WsMessage` JSON schema 未改变。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - **投影表 / outbox / 回执都是派生或旁路**;区块 + merkle_root + PoW 是唯一权威。
 - **pending_key_tx 仅内存**(L1 最小版):进程重启丢失未打包的密钥交易,register/revoke 幂等可重提。
 

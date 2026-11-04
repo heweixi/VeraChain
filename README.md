@@ -3,7 +3,7 @@
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
 > 基于现有代码的完整流程图(模块级 + 带数据字段)见 `docs/FLOW.md`。
 > 跨链认证网、可验证语义目录与后续路线图见 `docs/CERTIFICATION_NETWORK.md`。
-> 最后核实:2026-10-18(进度至 Claim 信任策略与有效结论 resolver，本次提交)。
+> 最后核实:2026-11-05。本次 WebSocket 频道隔离:静态事件映射已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -15,17 +15,16 @@
 >   anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` 端点。
 > - R6 P2P 区块广播 + 认证 gossip 发现 + 种子 peer(双节点 smoke 验证)。
 > - R7 集成测试 `tests/api_integration.rs`(health/401/RBAC 越权/SQLite 重启恢复)。
-> - backlog #4 WebSocket 实时事件集成测试 `tests/websocket_integration.rs`(握手鉴权/EventBus 广播/
->   16KiB 消息上限/256 连接上限),`97eeee5` 247 验证 8 passed。
+> - WebSocket 频道隔离 `tests/websocket_integration.rs`：`/ws` 接收全部业务事件；`/ws/chain` 仅接收 `block_added`、`chain_validated`；`/ws/metadata` 仅接收 `metadata_added`；`/ws/aggregation` 仅接收 `aggregation`；`version_tracked` 与未来未映射事件仅进入 `/ws`。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 > - backlog #3 refresh token 持久化 + token-family 复用检测 `1124baa`:撤销落 SQLite(重启不失忆)、
 >   复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。
 > - 跨链认证网 L1 链上身份:公钥登记/撤销、ed25519 验签、身份快照摘要，身份交易进入 Merkle 根。
 > - 可验证语义目录 `d97cd94`:Subject→Revision→Artifact + 带签名/证据/时间范围/覆盖关系的 Claim；
 >   完整语义进入区块 Merkle 根，持久化待打包队列与查询投影；`/api/v1/catalog/*` 端点。
-> - 共 75 单测 + 17 集成测试(api 9 + websocket 8)通过。
+> - 共 78 单测 + 19 集成测试(api 10 + websocket 9)，合计 97 passed/0 failed。
 >
 > ⚠️ 当前仍未实现:多外链批次认证、外链认证阶段回写本链、外链失信切换、人工封存后新链启用、
-> Claim 集中分类字典与认证机构治理、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播)、设备会话管理。
+> Claim 集中分类字典与认证机构治理、设备会话管理。
 > Claim 当前有效结论已按配置的可信认证者、分类授权、权重、有效时间和覆盖关系解析；未配置可信认证者时默认不产生可信结论。
 > P2P 内部不做去中心化共识是有意设计，可信根逐步由外部认证链锚定提供。
 > 具体以 `IMPLEMENTATION_STATUS.md` 为准。
@@ -44,7 +43,7 @@
 - **跨链锚定**: 完整 Merkle proof、ed25519 节点签名、ChainAnchor/回执、outbox 重试投递
 - **P2P 同步**: 显式注册 + 区块广播 + 认证 gossip 发现 + 最长合法链替换
 - **RESTful API**: HTTP 接口(认证/元数据/区块/版本/聚合/跨链/P2P)
-- **WebSocket**: 实时事件推送(JWT 认证;当前各频道为全量广播,服务端频道隔离未实现)
+- **WebSocket**: 实时事件推送(JWT 认证；静态频道映射；`/ws` 接收全部业务事件，专用频道仅接收各自映射的事件；不提供动态订阅或频道级授权)
 
 ## 项目结构
 
@@ -240,15 +239,16 @@ datachain version diff <v1> <v2>
 
 ### WebSocket
 
-> 注意:以下频道当前均订阅同一 Hub 的**全量广播**,服务端不按频道过滤;
-> 订阅 `/ws/chain` 仍会收到 metadata/aggregation 等全部事件。频道隔离为已知遗留(见 `IMPLEMENTATION_STATUS.md`)。
+> 频道按静态事件映射过滤，不是动态订阅，也不提供频道级授权。`/ws` 保持接收全部业务事件；
+> `version_tracked` 和未来未映射事件仅投递到 `/ws`。URL、JWT、全局 256 连接上限、16KiB 行为及 `WsMessage` JSON schema 均未改变。
+> 验证证据:本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 
 | 路径 | 描述 |
 |------|------|
-| /ws | 通用 WebSocket(JWT 认证,全量事件) |
-| /ws/chain | 区块链事件(当前实为全量广播) |
-| /ws/metadata | 元数据事件(当前实为全量广播) |
-| /ws/aggregation | 汇总事件(当前实为全量广播) |
+| /ws | 通用 WebSocket(JWT 认证，全部业务事件) |
+| /ws/chain | 静态映射：`block_added`、`chain_validated` |
+| /ws/metadata | 静态映射：`metadata_added` |
+| /ws/aggregation | 静态映射：`aggregation` |
 
 ## 配置说明
 

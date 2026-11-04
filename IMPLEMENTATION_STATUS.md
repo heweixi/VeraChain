@@ -1,6 +1,6 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至本次提交（Claim 信任策略与有效结论 resolver）。
+> 核实日期:2026-11-05。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 > R0-R7、backlog #3/#4/#5/#6、认证网 L1、可验证语义目录与 Claim resolver 已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
@@ -28,7 +28,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
 - ⚠️ P2P 内部无共识、无同长度分叉选择——这是**有意设计**(见认证网主线:可信根在外链锚定,非内部自证),非缺陷。链上身份注册/撤销已由 L1 接入(`5bf05c8`);密钥轮换状态机、多外链锚定(L2)、回执回写(L3)、失信切换(L4)、自身封存重启(L5)待后续。
 - ✅ refresh token 持久化 + token-family 复用检测已补(见 `1124baa`/247 lib 62+集成 12 passed):撤销落 SQLite(重启不失忆)、复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。WebSocket 收发自动化集成测试已补(`97eeee5`/8 passed)。
-- 🔺 WebSocket 频道(`/ws/chain`、`/ws/metadata`、`/ws/aggregation`)当前都订阅同一 `WsHub` 的**全量广播**,服务端 `handle_channel_socket` 不按频道过滤;任何 EventBus 事件会推给所有频道客户端。真正的频道隔离(如 `/ws/chain` 只收 chain 事件)未实现,属已知遗留(非 backlog #4 范围,#4 只验证"频道客户端能收到广播")。
+- ✅ WebSocket 频道隔离:服务端按静态事件映射过滤。`/ws` 接收全部业务事件；`/ws/chain` 仅接收 `block_added`、`chain_validated`；`/ws/metadata` 仅接收 `metadata_added`；`/ws/aggregation` 仅接收 `aggregation`；`version_tracked` 和未来未映射事件仅进入 `/ws`。这不是动态订阅或频道级授权。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ metadata 查询投影表已接入(`b239df6`):独立 `metadata` 表作为只读查询投影(权威源仍是区块 metadata_list),commit_block 同事务 upsert、启动/CLI 代码级回填,读路径走 SQL 不再扫链。注册失败写库返回语义已在 #3 收敛为 500。仍未做:tag 关联表、pending 联合查询(最小版有意不做)。
 - ✅ 建表已纯 migration 驱动(`13ded24`):移除 init_tables 与 migration 重叠的兜底,事实源唯一收敛到 migrations/;旧库升级安全性有回归测试。回滚为 up-only 约定(无自动 down)、backfill 推迟到首个真实场景,属有意的范围收敛而非遗漏。
 
@@ -47,8 +47,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
 | 节点签名身份 | ✅ `4cf84f8`/247 已验证 | `src/node_signing.rs`:ed25519 密钥对(生成/base64 种子恢复/签名/验签);配置 `DATACHAIN_NODE_SECRET` 持久化,未配置则启动随机生成并打印公钥 |
 | 版本 API | ✅ 247 已验证 | `track_version` 经 `validate_version_path`(DATACHAIN_VERSION_ROOT allowlist+路径遍历/目录/符号链接防护)后保存不可变内容快照(ContentStorage);`get_version_diff` 用两版本历史快照计算,`get_version_content` 读快照不读当前文件;历史文件被覆盖/删除仍可还原。单测覆盖 track/diff/快照缺失/路径校验 |
-| WebSocket 实时事件 | ⚠️ 已接线+集成测试已验证(频道隔离未实现) `97eeee5`/247 | `AppState` 持有 `WsHub`,连接有 JWT/连接数(256)/消息大小(16KiB)保护;业务事件经 EventBus 广播,已由 `tests/websocket_integration.rs` 自动化验证(8 passed):握手鉴权(无/无效 token 401、合法 101+welcome)、EventBus 广播(block_mined→block_added、metadata_created→metadata_added、aggregation_done→aggregation)、16KiB 上限(`/ws` 回 error 后断开、`/ws/chain` 只断开不回 error)、256 连接上限(第 257 个 503,释放后恢复)。**频道过滤未实现**:三频道共享全量广播,见下 🔺 频道隔离 |
-| WebSocket 频道隔离 | 🔺 未实现 `97eeee5` | `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 均 `hub.subscribe()` 订阅同一 `WsHub` 全量广播,`handle_channel_socket` 不做任何按频道过滤;所有 EventBus 事件推给所有频道客户端。差异影响:客户端订阅特定频道并不能只收到该类事件;原因:服务端尚未实现频道级路由,属已知遗留,后续若做需另起 backlog |
+| WebSocket 实时事件 | ✅ 本次提交 + 247 docker `rust:latest` `cargo test`（97 passed） | `AppState` 持有 `WsHub`，连接保留 JWT、全局 256 连接与 16KiB 保护；`WsMessage` JSON schema 未变。业务事件经 EventBus 广播，`tests/websocket_integration.rs` 的 9 个测试覆盖握手鉴权、消息/连接上限及四路连接接收五种事件。`/ws` 接收全部业务事件；专用频道按静态映射投递，未映射事件仅进入 `/ws`。 |
+| WebSocket 频道隔离 | ✅ 本次提交 + 247 docker `rust:latest` `cargo test`（97 passed） | 服务端采用静态映射：`/ws/chain` 仅投递 `block_added`、`chain_validated`；`/ws/metadata` 仅投递 `metadata_added`；`/ws/aggregation` 仅投递 `aggregation`。通用 `/ws` 保持全部业务事件；`version_tracked` 和未来未映射事件只投递到 `/ws`。新增端到端测试以四路连接发布五种事件，验证正向投递及非归属频道不投递。该功能不包含动态订阅或频道级授权。 |
 | EventBus/通知 | ✅ 247 已验证 `97eeee5` | `src/api/notification.rs` 已由 server 创建并注入;注册、元数据、挖矿、校验、版本、聚合 handler 会发布事件;广播链路已由 WS 集成测试覆盖(block/metadata/aggregation 三类事件实际收到) |
 
 ### 2.2 认证、授权与安全
@@ -63,7 +63,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
 | 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
 | CORS/TLS/限流 | ⚠️ | CORS 已改为 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时本地开发来源）；TLS、请求体限制、登录限速/锁定、审计日志仍未实现 |
-| WebSocket 认证 | ✅ 247 集成测试已验证 `97eeee5` | WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome);Hub 限制 256 连接、单条文本 16 KiB;广播接线已由 `tests/websocket_integration.rs` 验证。按频道的事件授权/过滤仍未实现(见 2.1 WebSocket 频道隔离 🔺) |
+| WebSocket 认证 | ✅ 本次提交 + 247 docker `rust:latest` `cargo test`（97 passed） | WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome)；Hub 保留全局 256 连接和单条文本 16 KiB 限制。频道按静态事件映射过滤，但不实施频道级授权；验证覆盖四路连接、五种事件的正向投递和非归属频道不投递。 |
 
 ### 2.3 区块链核心与数据完整性
 
@@ -101,9 +101,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ✅ 集成测试共 18 passed:`tests/api_integration.rs`(10,含语义目录端到端 Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥拒绝、**可信 Claim resolver 端到端**)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限)。247 验证为本次提交。
+- ✅ 集成测试共 19 passed:`tests/api_integration.rs`(10，含语义目录端到端 Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥拒绝、**可信 Claim resolver 端到端**)+ `tests/websocket_integration.rs`(9，真实 axum 服务 + tokio-tungstenite 客户端：握手鉴权、EventBus 广播、16KiB 上限、256 连接上限，以及四路连接接收五种事件的频道隔离)。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ 核心算法 + 新增能力单测共 78 passed(含 Claim resolver 的可信签发者/分类授权/覆盖关系/冲突/fail-closed 覆盖)。
-- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 收发自动化集成测试已补(`97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
+- ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 频道隔离已由端到端测试覆盖：专用频道只收到映射事件，`version_tracked` 仅进入 `/ws`；该功能不提供动态订阅或频道级授权。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
 ## 四、开发进度与后续建议
@@ -121,14 +121,14 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 ### 后续建议(backlog,非当前目标)
 
-- ✅ #4 WebSocket 收发自动化集成测试 — `97eeee5` 247 `cargo test --test websocket_integration` 8 passed。
+- ✅ #4 WebSocket 收发自动化集成测试 — 历史握手/广播/消息与连接上限覆盖已扩展为频道隔离端到端覆盖：四路连接、五种事件、正向投递和非归属频道不投递。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。
 - ✅ 可验证语义目录 — `d97cd94` Subject→Revision→Artifact + 完整语义 Merkle 承诺 + signed Claim + pending 持久化/查询投影，247 lib 75 + 集成 17 passed。
 - P2P 内部去中心化共识与自动分叉裁决：有意不实现，可信根由外部认证链锚定提供。
 - 跨链认证网后续: L2 多外链批次锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计)。
 - ✅ Claim 信任策略与有效状态 resolver — 本次提交:按可信认证者、分类授权、权重、观察/生效时间与 supersedes/withdrawn 链解析；同权重状态冲突显式返回，默认无可信认证者 fail-closed。
 - Claim 集中分类字典与认证机构治理：动态信任权重、认证机构变更、跨机构争议裁决仍待实现。
-- 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
+- ✅ WebSocket 频道隔离 — 静态事件映射已实现：`/ws/chain`→`block_added`、`chain_validated`，`/ws/metadata`→`metadata_added`，`/ws/aggregation`→`aggregation`；`/ws` 保持全量，`version_tracked` 和未映射事件仅进入 `/ws`。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。不包含动态订阅或频道级授权。
 - ✅ #6 纯 migration 驱动 — `13ded24` 移除 init_tables 兜底,建表事实源唯一化,旧库升级回归测试通过。回滚(自动 down)/数据回填按用户确认有意推迟。
 - ✅ #5 独立 metadata 查询表 — `b239df6` migration 005 投影表 + commit_block 同事务 upsert + 代码级回填 reconcile,读路径走 SQL(lib 64 含投影测试)。tag 关联表/pending 联合查询为最小版有意不做。
 - (可选)自动 down 回滚机制:当前 up-only + 手动回滚约定,无真实场景暂不实现。
