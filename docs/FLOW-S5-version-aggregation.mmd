@@ -1,0 +1,32 @@
+%% 拆分简略图 5:版本追踪与数据汇总
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart LR
+    subgraph VERSION["版本追踪"]
+        direction TB
+        FILE(["受控文件变更"]):::external
+        SAFE["路径与内容安全检查"]:::service
+        SNAP["保存不可变内容快照"]:::core
+        HISTORY["版本历史与差异对比"]:::api
+        FILE --> SAFE --> SNAP --> HISTORY
+    end
+
+    subgraph AGG["数据汇总"]
+        direction TB
+        BLOCKS(["已上链数据"]):::external
+        RULE["按时间、数量或手动触发"]:::service
+        SUMMARY["生成汇总结果<br/>统计、范围、摘要"]:::core
+        PARENT["递归父汇总<br/>低层结果逐级合并"]:::core
+        BLOCKS --> RULE --> SUMMARY --> PARENT
+    end
+
+    SNAP --> DB[("持久化保存")]:::db
+    PARENT --> DB
+    DB --> QUERY["查询版本与汇总历史"]:::api
+    QUERY --> EVENT["事件通知"]:::output
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef output fill:#fce7f3,stroke:#db2777,color:#831843;

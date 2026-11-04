@@ -1,0 +1,21 @@
+%% 拆分简略图 2:数据进入、上链与查询
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    SOURCE(["数据来源<br/>本地业务 / 外部链认证信息 / 人工提交"]):::external
+    DESCRIBE["生成数据元信息<br/>标识、所有者、内容摘要、标签"]:::service
+    WAIT["待打包数据<br/>等待区块生成"]:::core
+    MINE["生成新区块<br/>收集本批待打包数据"]:::core
+    PROTECT["完整性保护<br/>数据集合摘要 + 工作量证明"]:::compute
+    CHAIN["DataChain 区块链<br/>可追溯的区块序列"]:::core
+    STORE[("持久化保存<br/>区块原文 + 查询投影")]:::db
+    SEARCH["查询与审计<br/>按数据标识、所有者、时间、标签检索"]:::api
+    RESULT(["数据存在性与历史记录"]):::external
+
+    SOURCE --> DESCRIBE --> WAIT --> MINE --> PROTECT --> CHAIN --> STORE --> SEARCH --> RESULT
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef compute fill:#ccfbf1,stroke:#0f766e,color:#134e4a;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;

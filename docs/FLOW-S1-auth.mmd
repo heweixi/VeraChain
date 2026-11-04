@@ -1,0 +1,32 @@
+%% 拆分简略图 1:认证与授权
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    U(["使用者"]):::external
+    REG["注册<br/>创建普通用户"]:::api
+    LOGIN["登录<br/>核对账号状态与身份凭证"]:::api
+    USERDB[("用户信息<br/>账户、角色、状态")]:::db
+    TOKENS["令牌对<br/>访问令牌 + 刷新令牌"]:::core
+    ACCESS["受保护的业务能力<br/>按角色授权"]:::service
+    REFRESH["刷新会话<br/>旧刷新令牌失效<br/>签发新令牌对"]:::service
+    REVOKED[("已撤销刷新令牌记录<br/>支持重启后继续生效")]:::db
+    REUSE["发现令牌复用<br/>撤销该登录会话族"]:::warn
+    REJECT["拒绝访问<br/>无效、过期、无权限或已停用"]:::err
+
+    U --> REG --> USERDB
+    U --> LOGIN
+    USERDB --> LOGIN
+    LOGIN -->|成功| TOKENS --> ACCESS
+    LOGIN -->|失败| REJECT
+    TOKENS --> REFRESH
+    REFRESH -->|正常轮换| TOKENS
+    REFRESH --> REVOKED
+    REVOKED -->|令牌已使用或会话已撤销| REUSE --> REJECT
+    ACCESS -->|权限不足| REJECT
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef warn fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    classDef err fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;

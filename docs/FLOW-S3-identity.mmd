@@ -1,0 +1,24 @@
+%% 拆分简略图 3:链上身份与密钥状态 L1
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    KEY(["节点或身份持有者<br/>密钥对"]):::external
+    TX["提交身份交易<br/>登记公钥 / 撤销公钥"]:::api
+    CHECK["身份校验<br/>核对交易类型与签名归属"]:::service
+    BAD["拒绝交易<br/>签名无效、内容非法或权限不足"]:::err
+    WAIT["待打包密钥交易"]:::core
+    BLOCK["随正常新区块上链<br/>与业务数据同等保护"]:::core
+    REPLAY["重放历史密钥交易<br/>得到当前有效密钥集"]:::service
+    SNAPSHOT["身份快照摘要<br/>描述该区块高度的有效身份状态"]:::compute
+    VIEW["身份查询与审计<br/>当前有效密钥 / 单个密钥状态"]:::api
+
+    KEY --> TX --> CHECK
+    CHECK -->|通过| WAIT --> BLOCK --> REPLAY --> SNAPSHOT --> VIEW
+    CHECK -->|不通过| BAD
+    BLOCK -.身份交易变化.-> SNAPSHOT
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef compute fill:#ccfbf1,stroke:#0f766e,color:#134e4a;
+    classDef err fill:#fee2e2,stroke:#dc2626,color:#7f1d1d;

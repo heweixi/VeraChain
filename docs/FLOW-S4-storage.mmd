@@ -1,0 +1,22 @@
+%% 拆分简略图 4:存储、恢复与查询投影
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    START(["服务启动"]):::external
+    SCHEMA["检查并更新数据结构<br/>按版本顺序完成历史升级"]:::service
+    DB[("本地持久化库<br/>区块、用户、版本、聚合、锚定、查询投影")]:::db
+    LOAD["恢复运行状态<br/>区块链、用户、待打包数据、版本与聚合结果"]:::service
+    CHECK["恢复完整性检查<br/>验证已保存区块的连续性与完整性"]:::compute
+    RECONCILE["查询投影校准<br/>从历史区块补齐可检索的元数据"]:::service
+    READY["服务可用<br/>读写、查询、认证、锚定"]:::core
+    WRITE["运行期新增记录<br/>区块、用户、版本、汇总、锚定状态"]:::service
+    RESTART(["重启或故障恢复"]):::external
+
+    START --> SCHEMA --> DB --> LOAD --> CHECK --> RECONCILE --> READY
+    READY --> WRITE --> DB
+    RESTART --> START
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef compute fill:#ccfbf1,stroke:#0f766e,color:#134e4a;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;

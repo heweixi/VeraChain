@@ -4,14 +4,48 @@
 > `npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/<名>.mmd -o docs/<名>.png -b white -s 3 -p docs/.puppeteer.json`
 >
 > - **全节点简略图**:`docs/FLOW-0-simple.png`(源 `FLOW-0-simple.mmd`)——覆盖全链路关键节点、数据与计算，不展示接口或调用细节
+> - **业务简略分图**：认证(`FLOW-S1-auth`)、数据上链(`FLOW-S2-data`)、链上身份(`FLOW-S3-identity`)、存储恢复(`FLOW-S4-storage`)、版本与汇总(`FLOW-S5-version-aggregation`)、对外传播与锚定(`FLOW-S6-distribution`)——覆盖各节点业务流转，不展示接口、字段、SQL 或内部调用
 > - 架构总览:`docs/FLOW.png`(源 `FLOW.mmd`)——只画模块与数据流向
 > - 链路 A 元数据:`docs/FLOW-A-metadata.png`(源 `FLOW-A-metadata.mmd`)——带字段/计算
 > - 链路 B 链上身份 L1:`docs/FLOW-B-identity.png`(源 `FLOW-B-identity.mmd`)
 > - 链路 C 数据锚定 R5:`docs/FLOW-C-anchor.png`(源 `FLOW-C-anchor.mmd`)
 
-### 全节点简略流程
+## 全节点简略流程
 
 ![DataChain 全节点简略流程图](./FLOW-0-simple.png)
+
+## 业务简略分图
+
+> 以下六张图覆盖当前已实现的全部主要节点。它们只保留业务职责、状态和结果，
+> 不包含 API 路径、请求字段、数据库语句、签名内容或内部函数调用。
+
+### 认证与授权
+
+![认证与授权流程](./FLOW-S1-auth.png)
+
+### 数据上链与查询
+
+![数据上链与查询流程](./FLOW-S2-data.png)
+
+### 链上身份与密钥状态
+
+![链上身份流程](./FLOW-S3-identity.png)
+
+### 存储、恢复与查询投影
+
+![存储恢复流程](./FLOW-S4-storage.png)
+
+### 版本追踪与数据汇总
+
+![版本与汇总流程](./FLOW-S5-version-aggregation.png)
+
+### 通知、节点同步与外部认证锚定
+
+![传播与锚定流程](./FLOW-S6-distribution.png)
+
+## 技术细节图
+
+> 以下内容保留接口、字段、计算和调用信息，适合实现或审计时查阅。
 
 ### 架构总览
 
@@ -29,7 +63,7 @@
 
 ![数据锚定链路](./FLOW-C-anchor.png)
 
-> 最后核实:2026-10-18,对应提交 `4a8c025`(R0-R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1)。
+> 最后核实:2026-10-18,对应最新代码提交 `8b5ecf1`(跨链认证网 L1 含端到端验证)。
 > 本文仅描述**已实现并经 247 验证**的行为;未实现的 L2(多外链锚定)/L3(锚定进展回写)/
 > L4(失信切换)/L5(封存重启) 不在此图内,见 `IMPLEMENTATION_STATUS.md` 第四节后续建议。
 > 状态变化时需按 `.kiro/steering/doc-maintenance.md` 同步更新本文与核实提交。

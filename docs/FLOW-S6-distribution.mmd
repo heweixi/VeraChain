@@ -1,0 +1,36 @@
+%% 拆分简略图 6:通知、节点同步与外部链锚定
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    BLOCK["新区块或业务状态变化"]:::core
+
+    subgraph LOCAL["本链对外传播"]
+        direction LR
+        EVENT["事件通知<br/>实时消息推送"]:::output
+        P2P["受信节点同步<br/>区块广播、节点发现、合法链同步<br/>不做内部去中心化共识"]:::output
+    end
+
+    subgraph ANCHOR["外部认证锚定 R5（当前）"]
+        direction TB
+        SELECT["选择一条已上链数据<br/>生成存在性证明"]:::service
+        SIGN["生成本链认证记录<br/>源节点签名"]:::service
+        QUEUE["异步投递队列<br/>等待、重试、失败记录"]:::db
+        EXTERNAL(["可信外部认证链<br/>当前为单外链存证服务"]):::external
+        RECEIPT["外链确认回执<br/>外链交易引用与确认时间"]:::service
+        AUDIT["锚定状态查询与审计"]:::api
+        SELECT --> SIGN --> QUEUE --> EXTERNAL --> RECEIPT --> QUEUE --> AUDIT
+    end
+
+    BLOCK --> EVENT
+    BLOCK --> P2P
+    BLOCK --> SELECT
+
+    FUTURE["后续认证网能力（未实现）<br/>多外链并行认证、各链阶段回写本链、<br/>失信切换、人工封存后新链启用"]:::note
+    EXTERNAL -.- FUTURE
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef output fill:#fce7f3,stroke:#db2777,color:#831843;
+    classDef note fill:#fff7ed,stroke:#c2410c,color:#431407;
