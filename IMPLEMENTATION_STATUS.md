@@ -1,13 +1,12 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `8b5ecf1`(跨链认证网 L1 完成:含端到端集成测试)。
-> R0-R7 全部完成并在 247 服务器 docker `rust:latest` 完成 cargo check/test/fmt/clippy(--all-targets)验证并做 HTTP/双节点 smoke;backlog #4/#3/#6/#5 及跨链认证网 L1 已补并在 247 验证。
+> 核实日期:2026-10-18，代码进度更新至提交 `d97cd94`(可验证语义目录与完整 Claim 承诺基础)。
+> R0-R7、backlog #3/#4/#5/#6、认证网 L1 与可验证语义目录基础已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
-> 可信根来自把数据 merkle_root 与身份快照**锚定到多条外部去中心化公共链**,由外链不可篡改性
-> 为 DataChain 数据/身份背书。外链→本链的认证走正常上链路径(无特殊逻辑)。分层:L0 单链锚定(R5✅)
-> → L1 链上身份(✅ `5bf05c8`)→ L2 多外链锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
-> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)。
+> 可信根逐步来自把数据、身份及完整语义目录记录锚定到多个外部去中心化公共链。外链→本链的认证走正常上链路径(无特殊逻辑)。分层:L0 单链锚定(R5✅)
+> → L1 链上身份(✅ `8b5ecf1`)→ 语义目录基础(✅ `d97cd94`)→ L2 多外链批次锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
+> 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)、语义目录(d97cd94)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
@@ -24,6 +23,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ R5 跨链:完整 Merkle proof(可独立验证 data→root)、ed25519 节点签名、ChainAnchor/AnchorReceipt、anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` + RBAC。
 - ✅ R6 P2P:显式注册 + **主动区块广播** + **认证 gossip 发现**(跳过自身)+ 种子 peer + 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。
 - ✅ R7 测试:55 单测 + 4 集成测试(`tests/api_integration.rs`:health/401/RBAC 越权/SQLite 重启恢复),双节点 smoke 验证广播/发现。
+- ✅ 可验证语义目录:Subject→Revision→Artifact + 有签名/证据/时间范围/覆盖关系的 Claim；完整规范化语义成为 Merkle 叶子，目录 pending、区块提交与查询投影同链路持久化。
 
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
 - ⚠️ P2P 内部无共识、无同长度分叉选择——这是**有意设计**(见认证网主线:可信根在外链锚定,非内部自证),非缺陷。链上身份注册/撤销已由 L1 接入(`5bf05c8`);密钥轮换状态机、多外链锚定(L2)、回执回写(L3)、失信切换(L4)、自身封存重启(L5)待后续。
@@ -41,6 +41,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 健康检查 | ✅ | `src/api/handlers.rs` 的 `health_check`；Docker healthcheck 请求 `/health` |
 | 注册/登录/刷新 token | ✅ `1124baa`/247 已验证 | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。设备会话管理仍未做(单 family 不区分设备) |
 | 元数据创建/查询 | ✅ `b239df6`/247 已验证 | 创建(写路径)仍入链 pending(权威源);查询(读路径)走独立 `metadata` 投影表(migration 005),owner/时间下推 SQL、tag/分页应用层过滤,不再扫链。投影由 commit_block 同事务 upsert + 启动/CLI 代码级回填保证与区块一致。边界:只覆盖已上链元数据,pending 不出现在查询结果 |
+| 可验证语义目录 | ✅ `d97cd94`/247 端到端已验证 | `POST /api/v1/catalog/records` 提交由已上链有效身份公钥签名的 Subject/Revision/Artifact/Claim；校验对象关系、主标识唯一性与 Claim 证据/时间范围，记录进入普通新区块的 `catalog_records` 并作为完整语义 Merkle 叶子。提供对象、版本、构建物、Claim 历史查询。边界:Claim 当前返回完整历史，尚未按认证者信任策略/覆盖关系计算单一有效结论 |
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误);链恢复/验证完整性仍待加强(见启动恢复项) |
 | Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
@@ -67,7 +68,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
-| Block/Chain/PoW/Merkle | ✅核心 | `src/core/` 已有真实实现；跨语言哈希和 metadata leaf 规则已对齐 |
+| Block/Chain/PoW/Merkle | ✅ `d97cd94` | 现有 metadata 叶子保持 `SHA256(data_id)` 兼容旧链；L1 key_tx 与新目录记录(`catalog_records`)的完整规范化语义均进入 merkle_root，受区块哈希/PoW 保护。旧 metadata 的完整字段仍非 Merkle 语义承诺，历史区块不重写 |
 | 启动恢复 | ⚠️ | `src/cli/server.rs` 恢复 blocks/users/versions，但恢复时没有完整验证索引、previous hash、PoW、Merkle root |
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
@@ -79,8 +80,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
-| 独立 metadata/aggregation/events 表 | ⚠️ `b239df6` | metadata 查询投影表已建(migration 005,只读投影);aggregation 已持久化(`aggregations` 表);events 仍无独立表(事件经 EventBus 内存广播,不落库) |
-| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~004` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
+| 独立 metadata/aggregation/events 表 | ⚠️ `d97cd94` | metadata 查询投影表已建(migration 005);aggregation 已持久化(`aggregations` 表);语义目录新增 pending_catalog_records 与 catalog_subjects/catalog_revisions/catalog_artifacts/catalog_claims 查询投影(migration 006);事件通知仍无独立表(经 EventBus 内存广播,不落库) |
+| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
 | 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
 | 聚合持久化 | ⏳ | `AggregationEngine` 的 summaries 只在 `RwLock<Vec<_>>`，重启后列表和计数丢失 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
@@ -99,8 +100,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ✅ 集成测试共 15 passed:`tests/api_integration.rs`(7,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 anchor、SQLite 重启恢复,**+ L1 链上身份端到端 3 个**:register 自签→挖矿(断言非空 identity_snapshot_hash)→GET /keys active→revoke→挖矿→keys 空、无效签名 400、guest 提交 key-tx 403)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限,`97eeee5`)。247 验证 `8b5ecf1`。
-- ✅ 核心算法 + 新增能力单测共 55 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p)。
+- ✅ 集成测试共 17 passed:`tests/api_integration.rs`(9,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 anchor、SQLite 重启恢复、L1 链上身份端到端 3 个、**语义目录端到端** Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥 403)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限,`97eeee5`)。247 验证 `d97cd94`。
+- ✅ 核心算法 + 新增能力单测共 75 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p、链上身份、语义目录与 Merkle 语义承诺)。
 - ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 收发自动化集成测试已补(`97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
@@ -121,9 +122,10 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 - ✅ #4 WebSocket 收发自动化集成测试 — `97eeee5` 247 `cargo test --test websocket_integration` 8 passed。
 - ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。
-- P2P 共识与分叉选择(当前为单一诚实源假设)。
-- ✅ 链上身份注册/撤销(认证网 L1) — `5bf05c8` key-transaction 验签+进 merkle+密钥集重放+快照哈希。
-- 跨链认证网后续: L2 多外链锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计);密钥轮换状态机(完整版身份)。
+- ✅ 可验证语义目录 — `d97cd94` Subject→Revision→Artifact + 完整语义 Merkle 承诺 + signed Claim + pending 持久化/查询投影，247 lib 75 + 集成 17 passed。
+- P2P 内部去中心化共识与自动分叉裁决：有意不实现，可信根由外部认证链锚定提供。
+- 跨链认证网后续: L2 多外链批次锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计)。
+- Claim 信任策略与有效状态 resolver：按认证者信任、观察/生效时间与 supersedes/withdrawn 链计算当前结论；分类字典与认证者治理策略。
 - 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
 - ✅ #6 纯 migration 驱动 — `13ded24` 移除 init_tables 兜底,建表事实源唯一化,旧库升级回归测试通过。回滚(自动 down)/数据回填按用户确认有意推迟。
 - ✅ #5 独立 metadata 查询表 — `b239df6` migration 005 投影表 + commit_block 同事务 upsert + 代码级回填 reconcile,读路径走 SQL(lib 64 含投影测试)。tag 关联表/pending 联合查询为最小版有意不做。

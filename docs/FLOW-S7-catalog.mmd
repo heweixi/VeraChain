@@ -1,0 +1,37 @@
+%% 拆分简略图 7:可验证语义目录与认证声明
+%%{init: {"theme":"base","themeVariables":{"fontSize":"19px"},"flowchart":{"nodeSpacing":70,"rankSpacing":85}}}%%
+flowchart TB
+    ISSUER(["已登记且有效的认证者身份"]):::external
+    SUBJECT["逻辑对象 Subject<br/>文章、代码库、软件包或其他跟踪事物"]:::service
+    REVISION["不可变版本 Revision<br/>内容状态、版本关系、来源"]:::service
+    ARTIFACT["构建或配置变体 Artifact<br/>平台、构建配置、产物状态"]:::service
+    CLAIM["认证声明 Claim<br/>支持、质量、生命周期、漏洞、病毒或危险结论<br/>认证者、证据、时间范围与覆盖关系"]:::service
+    SIGN["身份与内容校验<br/>确认签发来源、关系完整性和声明范围"]:::compute
+    WAIT["持久化待打包记录"]:::core
+    BLOCK["正常新区块<br/>完整语义承诺进入区块完整性保护"]:::core
+    PROJECTION[("目录查询投影<br/>对象、版本、构建物、声明历史")]:::db
+    TRACE["查询与追溯<br/>对象 → 版本 → 构建物 → 声明 → 认证来源"]:::api
+    HISTORY["保留历史<br/>撤销、修正或覆盖以新声明追加"]:::note
+
+    ISSUER --> SUBJECT
+    ISSUER --> REVISION
+    ISSUER --> ARTIFACT
+    ISSUER --> CLAIM
+    SUBJECT --> REVISION --> ARTIFACT
+    SUBJECT --> CLAIM
+    REVISION --> CLAIM
+    ARTIFACT --> CLAIM
+    SUBJECT --> SIGN
+    REVISION --> SIGN
+    ARTIFACT --> SIGN
+    CLAIM --> SIGN --> WAIT --> BLOCK --> PROJECTION --> TRACE
+    CLAIM --> HISTORY
+    HISTORY -.后续声明.-> CLAIM
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef compute fill:#ccfbf1,stroke:#0f766e,color:#134e4a;
+    classDef db fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef note fill:#fff7ed,stroke:#c2410c,color:#431407;

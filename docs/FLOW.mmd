@@ -1,4 +1,4 @@
-%% DataChain Rust 架构总览(精简,只画模块与数据流向;字段见分链路图 FLOW-A/B/C)
+%% DataChain Rust 架构总览(精简,只画模块与数据流向;字段见分链路图 FLOW-A/B/C 与 FLOW-S7)
 %% 渲染: npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/FLOW.mmd -o docs/FLOW.png -b white -s 3
 %%{init: {"theme":"base","themeVariables":{"fontSize":"16px"},"flowchart":{"nodeSpacing":60,"rankSpacing":70,"curve":"basis"}}}%%
 flowchart TB
@@ -14,17 +14,20 @@ flowchart TB
 
     mw --> MD["元数据<br/>MetadataManager"]:::svc
     mw --> ID["链上身份 L1<br/>identity"]:::svc
+    mw --> CAT["可验证语义目录<br/>Subject / Revision / Artifact / Claim"]:::svc
     mw --> MINE["挖矿<br/>chain/mine"]:::svc
     mw --> ANCH["数据锚定 R5<br/>AnchorService"]:::svc
 
     MD -->|create 入 pending| CHAIN
     ID -->|key-tx 入 pending_key_tx| CHAIN
-    CHAIN["Chain 内存<br/>blocks / pending / pending_key_tx"]:::core
+    CAT -->|语义记录入 pending_catalog_records| CHAIN
+    CHAIN["Chain 内存<br/>blocks / pending / pending_key_tx<br/>pending_catalog_records"]:::core
     MINE --> CHAIN
-    CHAIN -->|mine_block + PoW| BLOCK["Block<br/>merkle_root(metadata++key_tx)<br/>identity_snapshot_hash"]:::core
-    BLOCK -->|commit_block 单事务| DB[("SQLite<br/>blocks / metadata投影 / users<br/>versions / aggregations<br/>anchor_outbox / revoked_refresh")]:::db
+    CHAIN -->|mine_block + PoW| BLOCK["Block<br/>merkle_root(metadata++key_tx++catalog)<br/>identity_snapshot_hash"]:::core
+    BLOCK -->|commit_block 单事务| DB[("SQLite<br/>blocks / metadata投影 / catalog投影 / users<br/>versions / aggregations<br/>anchor_outbox / revoked_refresh")]:::db
 
     MD -.读投影.-> DB
+    CAT -.读目录投影.-> DB
     ID -.读 replay_key_set.-> BLOCK
     DB --> EV["EventBus → WS 推送"]:::out
     DB --> P2P["P2P 广播/发现/最长链"]:::out

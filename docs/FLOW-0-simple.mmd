@@ -9,16 +9,17 @@ flowchart TB
     subgraph INGEST["数据接入"]
         META["元数据<br/>数据标识、所有者、哈希、标签"]:::service
         IDENTITY["链上身份 L1<br/>公钥注册 / 撤销<br/>ed25519 签名验证"]:::service
+        CATALOG["可验证语义目录<br/>对象、版本、构建变体、认证声明"]:::service
         VERSION["版本追踪<br/>内容快照、历史差异"]:::service
     end
 
-    PENDING["待打包队列<br/>元数据 + 密钥交易"]:::core
+    PENDING["待打包队列<br/>元数据 + 密钥交易 + 语义目录记录"]:::core
     CHAIN["DataChain 链<br/>受信节点维护的区块序列"]:::core
-    BLOCK["新区块<br/>业务数据 + 密钥交易<br/>身份快照摘要"]:::core
-    INTEGRITY["完整性计算<br/>Merkle Root = 数据标识叶子 + 密钥交易叶子<br/>PoW 区块哈希"]:::compute
+    BLOCK["新区块<br/>业务数据 + 密钥交易 + 目录记录<br/>身份快照摘要"]:::core
+    INTEGRITY["完整性计算<br/>Merkle Root = 数据标识叶子 + 密钥交易叶子 + 目录语义叶子<br/>PoW 区块哈希"]:::compute
 
-    DB[("本地 SQLite<br/>区块、用户、版本、投影、聚合<br/>锚定 outbox、刷新令牌撤销记录")]:::database
-    QUERY["查询与审计<br/>元数据投影、身份集重放<br/>区块/版本/锚定状态"]:::api
+    DB[("本地 SQLite<br/>区块、用户、版本、目录与数据投影、聚合<br/>锚定 outbox、刷新令牌撤销记录")]:::database
+    QUERY["查询与审计<br/>数据、对象/版本/构建物/声明、身份集<br/>区块/版本/锚定状态"]:::api
 
     EVENT["事件与通知<br/>WebSocket 实时推送"]:::output
     P2P["受信节点同步<br/>区块广播、发现、最长合法链<br/>不做内部去中心化共识"]:::output
@@ -30,9 +31,11 @@ flowchart TB
     INPUT --> AUTH
     AUTH --> META
     AUTH --> IDENTITY
+    AUTH --> CATALOG
     AUTH --> VERSION
     META --> PENDING
     IDENTITY --> PENDING
+    CATALOG --> PENDING
     PENDING --> CHAIN --> BLOCK --> INTEGRITY --> DB
     VERSION --> DB
 

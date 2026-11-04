@@ -2,7 +2,8 @@
 
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
 > 基于现有代码的完整流程图(模块级 + 带数据字段)见 `docs/FLOW.md`。
-> 最后核实:2026-10-18(进度至 R7 + backlog #4/#3/#6/#5 + 跨链认证网 L1 链上身份含端到端测试,提交 `8b5ecf1`)。
+> 跨链认证网、可验证语义目录与后续路线图见 `docs/CERTIFICATION_NETWORK.md`。
+> 最后核实:2026-10-18(进度至可验证语义目录基础,提交 `d97cd94`)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -18,10 +19,14 @@
 >   16KiB 消息上限/256 连接上限),`97eeee5` 247 验证 8 passed。
 > - backlog #3 refresh token 持久化 + token-family 复用检测 `1124baa`:撤销落 SQLite(重启不失忆)、
 >   复用触发整族撤销、并发双花以 jti 主键唯一性收口、启动清理过期撤销行。
-> - 共 62 单测 + 12 集成测试(api 4 + websocket 8)通过。
+> - 跨链认证网 L1 链上身份:公钥登记/撤销、ed25519 验签、身份快照摘要，身份交易进入 Merkle 根。
+> - 可验证语义目录 `d97cd94`:Subject→Revision→Artifact + 带签名/证据/时间范围/覆盖关系的 Claim；
+>   完整语义进入区块 Merkle 根，持久化待打包队列与查询投影；`/api/v1/catalog/*` 端点。
+> - 共 75 单测 + 17 集成测试(api 9 + websocket 8)通过。
 >
-> ⚠️ 仍未实现:P2P 共识与同长度分叉选择(单一诚实源假设)、跨链密钥轮换/链上身份注册、
-> WebSocket 频道隔离(`/ws/chain` 等当前为全量广播,服务端不按频道过滤)、设备会话管理。
+> ⚠️ 当前仍未实现:多外链批次认证、外链认证阶段回写本链、外链失信切换、人工封存后新链启用、
+> Claim 信任策略与有效状态 resolver、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播)、设备会话管理。
+> P2P 内部不做去中心化共识是有意设计，可信根逐步由外部认证链锚定提供。
 > 具体以 `IMPLEMENTATION_STATUS.md` 为准。
 
 数据追溯区块链系统 - Rust 实现
@@ -32,6 +37,7 @@
 - **多哈希支持**: MD5, SHA-256, SHA-3, bcrypt, scrypt, Argon2, PBKDF2
 - **认证系统**: JWT 令牌、RBAC 权限控制
 - **元数据管理**: 数据追溯、标签、查询
+- **可验证语义目录**: Subject→Revision→Artifact、带签名/证据/时间范围的 Claim、风险与长期支持等可追溯声明
 - **汇总引擎**: 时间/数量策略、递归父聚合(多层合并)
 - **版本控制**: 文件追踪、内容快照、历史差异
 - **跨链锚定**: 完整 Merkle proof、ed25519 节点签名、ChainAnchor/回执、outbox 重试投递
@@ -194,6 +200,19 @@ datachain version diff <v1> <v2>
 | POST | /api/v1/identity/key-transaction | 提交密钥交易(register/revoke) |
 | GET | /api/v1/identity/keys | 当前有效密钥集 |
 | GET | /api/v1/identity/keys/:public_key | 单个公钥状态 |
+
+### 可验证语义目录
+
+> Subject 表示长期逻辑对象，Revision 表示不可变内容版本，Artifact 表示构建或配置变体。
+> Claim 是带签名、证据、时间范围和覆盖关系的认证、支持、质量或风险声明；记录进入普通新区块并纳入 Merkle 根。
+
+| 方法 | 路径 | 描述 |
+|------|------|------|
+| POST | /api/v1/catalog/records | 提交已签名 Subject、Revision、Artifact 或 Claim |
+| GET | /api/v1/catalog/subjects/:subject_id | 查询对象登记记录 |
+| GET | /api/v1/catalog/subjects/:subject_id/revisions | 查询对象版本历史 |
+| GET | /api/v1/catalog/revisions/:revision_id/artifacts | 查询版本的构建/配置变体 |
+| GET | /api/v1/catalog/subjects/:subject_id/claims | 查询对象全部认证声明历史 |
 
 ### 版本
 
