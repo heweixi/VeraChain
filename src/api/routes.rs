@@ -104,6 +104,10 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_catalog_artifacts),
         )
         .route(
+            "/api/v1/catalog/subjects/:subject_id/effective-claims",
+            get(handlers::get_effective_catalog_claims),
+        )
+        .route(
             "/api/v1/catalog/subjects/:subject_id/claims",
             get(handlers::get_catalog_claims),
         )

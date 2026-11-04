@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::{notification::EventBus, rate_limit::RateLimiter, websocket::WsHub};
 use crate::aggregation::{AggregationEngine, Scheduler};
 use crate::auth::AuthService;
+use crate::catalog::ClaimResolver;
 use crate::core::Chain;
 use crate::crosschain::AnchorService;
 use crate::metadata::MetadataManager;
@@ -25,6 +26,7 @@ pub struct AppState {
     pub p2p: Arc<P2PService>,
     pub rate_limiter: Arc<RateLimiter>,
     pub anchor_service: Arc<AnchorService>,
+    pub claim_resolver: Arc<ClaimResolver>,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
         p2p: Arc<P2PService>,
         rate_limiter: Arc<RateLimiter>,
         anchor_service: Arc<AnchorService>,
+        claim_resolver: Arc<ClaimResolver>,
     ) -> Self {
         Self {
             chain,
@@ -56,6 +59,7 @@ impl AppState {
             p2p,
             rate_limiter,
             anchor_service,
+            claim_resolver,
         }
     }
 }

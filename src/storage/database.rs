@@ -989,6 +989,27 @@ impl Storage {
             .collect()
     }
 
+    /// 读取 Claim 历史及其上链高度，供 resolver 按策略计算指定时间点的有效结论。
+    pub async fn get_catalog_claims_at_block(
+        &self,
+        subject_id: &str,
+    ) -> Result<Vec<crate::catalog::CatalogRecordAtBlock>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT data, block_index FROM catalog_claims WHERE subject_id = ? ORDER BY block_index ASC, claim_id ASC",
+        )
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(data, block_index)| {
+                Ok(crate::catalog::CatalogRecordAtBlock {
+                    record: serde_json::from_str(&data)?,
+                    block_index,
+                })
+            })
+            .collect()
+    }
+
     /// 关闭存储
     pub async fn close(&self) {
         self.pool.close().await;

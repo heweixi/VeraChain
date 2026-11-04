@@ -1,11 +1,11 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-10-18，代码进度更新至提交 `d97cd94`(可验证语义目录与完整 Claim 承诺基础)。
-> R0-R7、backlog #3/#4/#5/#6、认证网 L1 与可验证语义目录基础已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
+> 核实日期:2026-10-18，代码进度更新至本次提交（Claim 信任策略与有效结论 resolver）。
+> R0-R7、backlog #3/#4/#5/#6、认证网 L1、可验证语义目录与 Claim resolver 已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
 > 可信根逐步来自把数据、身份及完整语义目录记录锚定到多个外部去中心化公共链。外链→本链的认证走正常上链路径(无特殊逻辑)。分层:L0 单链锚定(R5✅)
-> → L1 链上身份(✅ `8b5ecf1`)→ 语义目录基础(✅ `d97cd94`)→ L2 多外链批次锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
+> → L1 链上身份(✅ `8b5ecf1`)→ 语义目录基础(✅ `d97cd94`)→ Claim resolver(✅ 本次提交)→ L2 多外链批次锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
 > 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)、语义目录(d97cd94)。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
@@ -41,7 +41,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 健康检查 | ✅ | `src/api/handlers.rs` 的 `health_check`；Docker healthcheck 请求 `/health` |
 | 注册/登录/刷新 token | ✅ `1124baa`/247 已验证 | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。设备会话管理仍未做(单 family 不区分设备) |
 | 元数据创建/查询 | ✅ `b239df6`/247 已验证 | 创建(写路径)仍入链 pending(权威源);查询(读路径)走独立 `metadata` 投影表(migration 005),owner/时间下推 SQL、tag/分页应用层过滤,不再扫链。投影由 commit_block 同事务 upsert + 启动/CLI 代码级回填保证与区块一致。边界:只覆盖已上链元数据,pending 不出现在查询结果 |
-| 可验证语义目录 | ✅ `d97cd94`/247 端到端已验证 | `POST /api/v1/catalog/records` 提交由已上链有效身份公钥签名的 Subject/Revision/Artifact/Claim；校验对象关系、主标识唯一性与 Claim 证据/时间范围，记录进入普通新区块的 `catalog_records` 并作为完整语义 Merkle 叶子。提供对象、版本、构建物、Claim 历史查询。边界:Claim 当前返回完整历史，尚未按认证者信任策略/覆盖关系计算单一有效结论 |
+| 可验证语义目录 | ✅ 本次提交/247 端到端已验证 | `POST /api/v1/catalog/records` 提交由已上链有效身份公钥签名的 Subject/Revision/Artifact/Claim；校验对象关系、主标识唯一性与 Claim 证据/时间范围，记录进入普通新区块的 `catalog_records` 并作为完整语义 Merkle 叶子。原始 Claim 历史可查；`GET /catalog/subjects/:id/effective-claims` 按配置可信认证者、分类授权、权重、有效时间和覆盖关系解析有效结论，同权重不同状态返回 conflicts，未配可信认证者默认 fail-closed。边界:无集中分类字典和动态认证机构治理 |
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误);链恢复/验证完整性仍待加强(见启动恢复项) |
 | Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
@@ -59,6 +59,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 用户持久化 | ⚠️ | 启动可从 SQLite 加载；运行中注册写库失败仍成功返回，运行中资料/密码管理 API 未完整提供 |
 | 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
 | RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
+| Claim 信任策略 | ✅ 本次提交/247 已验证 | `[claim_policy]` 配置可信认证者身份/公钥、分类授权和权重；resolver 仅接受满足最小权重及有效时间的声明，覆盖关系生效，同权重冲突不强行裁决。默认无可信认证者时 fail-closed |
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
 | 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
 | CORS/TLS/限流 | ⚠️ | CORS 已改为 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时本地开发来源）；TLS、请求体限制、登录限速/锁定、审计日志仍未实现 |
@@ -100,8 +101,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 ## 三、测试与验证状态
 
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
-- ✅ 集成测试共 17 passed:`tests/api_integration.rs`(9,tower oneshot 进程内驱动 Router:公开 health、受保护路由 401、RBAC 越权 anchor、SQLite 重启恢复、L1 链上身份端到端 3 个、**语义目录端到端** Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥 403)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限,`97eeee5`)。247 验证 `d97cd94`。
-- ✅ 核心算法 + 新增能力单测共 75 passed(core/merkle/canonical、密码哈希、JWT、权限、版本 diff/content、node_signing、crosschain、递归聚合、commit_block 原子性、p2p、链上身份、语义目录与 Merkle 语义承诺)。
+- ✅ 集成测试共 18 passed:`tests/api_integration.rs`(10,含语义目录端到端 Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥拒绝、**可信 Claim resolver 端到端**)+ `tests/websocket_integration.rs`(8,真实 axum 服务 + tokio-tungstenite 客户端:握手鉴权、EventBus 广播、16KiB 上限、256 连接上限)。247 验证为本次提交。
+- ✅ 核心算法 + 新增能力单测共 78 passed(含 Claim resolver 的可信签发者/分类授权/覆盖关系/冲突/fail-closed 覆盖)。
 - ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 收发自动化集成测试已补(`97eeee5`),但只验证"频道客户端能收到广播",**不覆盖频道隔离**(服务端全量广播,频道过滤未实现,见 2.1 🔺)。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
@@ -125,7 +126,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ 可验证语义目录 — `d97cd94` Subject→Revision→Artifact + 完整语义 Merkle 承诺 + signed Claim + pending 持久化/查询投影，247 lib 75 + 集成 17 passed。
 - P2P 内部去中心化共识与自动分叉裁决：有意不实现，可信根由外部认证链锚定提供。
 - 跨链认证网后续: L2 多外链批次锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计)。
-- Claim 信任策略与有效状态 resolver：按认证者信任、观察/生效时间与 supersedes/withdrawn 链计算当前结论；分类字典与认证者治理策略。
+- ✅ Claim 信任策略与有效状态 resolver — 本次提交:按可信认证者、分类授权、权重、观察/生效时间与 supersedes/withdrawn 链解析；同权重状态冲突显式返回，默认无可信认证者 fail-closed。
+- Claim 集中分类字典与认证机构治理：动态信任权重、认证机构变更、跨机构争议裁决仍待实现。
 - 🔺 WebSocket 频道隔离:服务端按 `/ws/chain`、`/ws/metadata`、`/ws/aggregation` 过滤事件(当前为全量广播,见 2.1)。
 - ✅ #6 纯 migration 驱动 — `13ded24` 移除 init_tables 兜底,建表事实源唯一化,旧库升级回归测试通过。回滚(自动 down)/数据回填按用户确认有意推迟。
 - ✅ #5 独立 metadata 查询表 — `b239df6` migration 005 投影表 + commit_block 同事务 upsert + 代码级回填 reconcile,读路径走 SQL(lib 64 含投影测试)。tag 关联表/pending 联合查询为最小版有意不做。

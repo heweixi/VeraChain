@@ -1,6 +1,6 @@
 # 跨链认证网与可验证语义目录
 
-> 最后核实:2026-10-18，对应代码提交 `d97cd94`。
+> 最后核实:2026-10-18，对应代码为本次提交（Claim 信任策略与有效结论 resolver）。
 > 本文描述已确认的认证网方向与当前实现边界。多外链批次认证、外链阶段回写、失信切换、封存重启仍未实现，见文末路线图。
 
 ## 设计基调
@@ -44,6 +44,25 @@ risk.dangerous
 
 Claim 不是永久标签。它记录“谁在何时依据什么证据，对哪个对象作出什么结论”。后续修正、撤销或新结论通过新的 Claim 追加，并用 `supersedes_claim_id` 建立覆盖关系，历史不被删除。
 
+### 当前有效结论与认证者信任策略
+
+原始 Claim 历史始终可查；“当前有效结论”由 `ClaimResolver` 在查询时计算，不改写历史。策略配置位于 `[claim_policy]`：
+
+```toml
+[claim_policy]
+min_weight = 1
+
+[[claim_policy.trusted_issuers]]
+issuer_identity = "security-lab"
+issuer_key = "<base64-ed25519-public-key>"
+weight = 10
+categories = ["risk.*", "quality.verified"]
+```
+
+resolver 仅接受同时满足以下条件的声明：可信认证者身份与公钥精确匹配、该认证者获授权发布相应分类、权重不低于 `min_weight`、声明处于查询时间点的有效区间、且未被可信后续 Claim 覆盖。
+
+同一对象范围和分类下，同权重认证者给出不同状态时，resolver 返回显式 `conflicts`，不伪造单一结论。未配置可信认证者时采用 fail-closed：历史仍可查询，但不产生“可信有效”结论。
+
 ### 语义完整性承诺
 
 旧 metadata 的 Merkle 叶子只承诺 `data_id`。新目录记录采用固定字段顺序和长度前缀的规范化语义负载：
@@ -85,13 +104,14 @@ catalog-v1 + 记录类型 + 签发身份 + 签发公钥 + 全部业务字段
 | GET | `/api/v1/catalog/subjects/:subject_id/revisions` | 查询对象的已上链版本历史 |
 | GET | `/api/v1/catalog/revisions/:revision_id/artifacts` | 查询版本的构建/配置变体 |
 | GET | `/api/v1/catalog/subjects/:subject_id/claims` | 查询对象的全部 Claim 历史 |
+| GET | `/api/v1/catalog/subjects/:subject_id/effective-claims?as_of=<unix秒>` | 按可信认证者、分类授权、权重、有效时间与覆盖关系解析有效声明和冲突 |
 
 提交需要 `BlockMine` 权限，查询需要 `BlockRead` 权限。
 
 ## 当前边界与未实现项
 
-- Claim 查询当前返回完整历史，尚未实现按“认证者信任策略、有效时间、撤销/覆盖链”计算单一当前结论的 resolver。
-- Claim 分类是命名空间约定，尚未实现集中分类字典、认证者角色治理或不同认证机构的信任权重策略。
+- Claim 当前有效结论已按配置的可信认证者、分类授权、权重、有效时间和覆盖关系解析；同权重不同状态显式返回冲突，默认无可信认证者时 fail-closed。
+- Claim 分类仍是命名空间约定，尚未实现集中分类字典、链上认证者角色治理、动态信任权重或跨机构治理流程。
 - Subject / Revision / Artifact 的稳定标识由提交方提供；当前不做全局命名注册或跨链名称冲突裁决。
 - 目录记录已持久化到 pending 队列并可随服务重启恢复；投影是查询加速副本，区块中的 `catalog_records` 才是权威事实。
 - 现有 legacy metadata 继续以 `data_id` 承诺，历史区块不重写；新的目录记录从 `catalog-v1` 开始具备完整语义承诺。

@@ -15,6 +15,7 @@ use datachain::aggregation::{create_aggregation_engine, create_scheduler};
 use datachain::api::{self, AppState, EventBus, NotificationService, WsHub};
 use datachain::auth::{create_auth_service, RegisterRequest, Role};
 use datachain::catalog::{Artifact, CatalogPayload, CatalogRecord, Claim, Revision, Subject};
+use datachain::config::{ClaimPolicyConfig, TrustedIssuerConfig};
 use datachain::core::{create_chain, KeyTransactionEntry};
 use datachain::crosschain::AnchorService;
 use datachain::metadata::create_metadata_manager;
@@ -78,6 +79,7 @@ async fn build_state(dsn: &str) -> (AppState, Arc<datachain::storage::Storage>) 
         p2p,
         rate_limiter,
         anchor_service,
+        claim_resolver: Arc::new(datachain::catalog::ClaimResolver::new(Default::default())),
     };
     (state, storage)
 }
@@ -681,4 +683,101 @@ async fn catalog_rejects_unknown_issuer() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn effective_claims_api_applies_trusted_issuer_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("catalog-policy.sqlite");
+    let (mut state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+
+    let issuer = NodeIdentity::generate("policy-issuer");
+    let issuer_key = issuer.public_key_base64();
+    state.claim_resolver = Arc::new(datachain::catalog::ClaimResolver::new(ClaimPolicyConfig {
+        min_weight: 5,
+        trusted_issuers: vec![TrustedIssuerConfig {
+            issuer_identity: "issuer:node-a".to_string(),
+            issuer_key,
+            weight: 10,
+            categories: vec!["risk.*".to_string()],
+        }],
+    }));
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+
+    // 先登记认证者身份与目标对象。
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&token),
+            signed_key_tx_body("register", &issuer, "auditor"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &token).await;
+
+    let subject = CatalogPayload::Subject(Subject {
+        subject_id: "policy-subject".to_string(),
+        subject_type: "package".to_string(),
+        display_name: "Policy Subject".to_string(),
+        source_ref: String::new(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&token),
+            signed_catalog_body(subject, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &token).await;
+
+    let claim = CatalogPayload::Claim(Claim {
+        claim_id: "policy-risk".to_string(),
+        subject_id: "policy-subject".to_string(),
+        revision_id: String::new(),
+        artifact_id: String::new(),
+        category: "risk.vulnerability".to_string(),
+        status: "confirmed".to_string(),
+        evidence_ref: "sha256:policy-report".to_string(),
+        observed_at: 1,
+        effective_from: Some(1),
+        effective_to: None,
+        supersedes_claim_id: String::new(),
+    });
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/catalog/records",
+            Some(&token),
+            signed_catalog_body(claim, &issuer),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    mine_catalog_record(router.clone(), &token).await;
+
+    let response = router
+        .oneshot(get(
+            "/api/v1/catalog/subjects/policy-subject/effective-claims?as_of=2",
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body_json(response).await;
+    assert_eq!(
+        result["data"]["effective_claims"].as_array().unwrap().len(),
+        1
+    );
+    assert!(result["data"]["conflicts"].as_array().unwrap().is_empty());
+    assert_eq!(
+        result["data"]["effective_claims"][0]["claim"]["claim_id"],
+        "policy-risk"
+    );
 }

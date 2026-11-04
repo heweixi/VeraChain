@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub chain_identity: ChainIdentityConfig,
+    #[serde(default)]
+    pub claim_policy: ClaimPolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +101,37 @@ impl Default for ChainIdentityConfig {
     }
 }
 
+/// Claim 认证者信任策略。
+///
+/// 默认 trusted_issuers 为空：原始 Claim 历史可查询，但不会被 resolver 视为可信有效结论。
+/// 生产部署必须显式列出可信认证者，避免任意已登记公钥的风险/质量声明自动获得信任。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClaimPolicyConfig {
+    #[serde(default = "default_min_claim_weight")]
+    pub min_weight: u32,
+    #[serde(default)]
+    pub trusted_issuers: Vec<TrustedIssuerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedIssuerConfig {
+    pub issuer_identity: String,
+    pub issuer_key: String,
+    #[serde(default = "default_claim_weight")]
+    pub weight: u32,
+    /// 可发布的 Claim 分类。空数组代表允许所有分类；`risk.*` 可匹配 risk.vulnerability 等。
+    #[serde(default)]
+    pub categories: Vec<String>,
+}
+
+fn default_min_claim_weight() -> u32 {
+    1
+}
+
+fn default_claim_weight() -> u32 {
+    1
+}
+
 // 默认值函数
 fn default_port() -> u16 {
     8080
@@ -172,6 +205,7 @@ impl Default for AppConfig {
                 level: default_log_level(),
             },
             chain_identity: ChainIdentityConfig::default(),
+            claim_policy: ClaimPolicyConfig::default(),
         }
     }
 }
@@ -248,6 +282,26 @@ impl AppConfig {
         }
         if self.blockchain.block_size == 0 {
             anyhow::bail!("blockchain block_size must be greater than zero");
+        }
+        if self.claim_policy.min_weight == 0 {
+            anyhow::bail!("claim_policy min_weight must be greater than zero");
+        }
+        for issuer in &self.claim_policy.trusted_issuers {
+            if issuer.issuer_identity.trim().is_empty() || issuer.issuer_key.trim().is_empty() {
+                anyhow::bail!("claim_policy trusted issuer identity/key must not be empty");
+            }
+            if issuer.weight == 0 {
+                anyhow::bail!("claim_policy trusted issuer weight must be greater than zero");
+            }
+            if issuer
+                .categories
+                .iter()
+                .any(|category| category.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "claim_policy trusted issuer categories must not contain empty values"
+                );
+            }
         }
         Ok(())
     }

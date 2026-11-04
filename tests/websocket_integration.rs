@@ -100,6 +100,7 @@ async fn build_state(dsn: &str) -> AppState {
         p2p,
         rate_limiter,
         anchor_service,
+        claim_resolver: Arc::new(datachain::catalog::ClaimResolver::new(Default::default())),
     }
 }
 

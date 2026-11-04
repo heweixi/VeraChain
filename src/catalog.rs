@@ -10,9 +10,12 @@
 //! - Claim 是认证者带签名、证据和时间范围的声明，不可原地修改，只能补充、撤销或覆盖；
 //! - 当前状态由链上记录重放或查询投影得出，区块记录才是权威事实源。
 
+use std::collections::{BTreeMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::{ClaimPolicyConfig, TrustedIssuerConfig};
 use crate::error::{DataChainError, Result};
 use crate::node_signing::NodeIdentity;
 
@@ -276,6 +279,166 @@ impl CatalogRecord {
     }
 }
 
+/// 查询投影中附带区块高度的目录记录。区块高度用于对相同权重声明给出可解释的时间顺序。
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogRecordAtBlock {
+    pub record: CatalogRecord,
+    pub block_index: i64,
+}
+
+/// 一条被当前信任策略接受的有效 Claim。
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedClaim {
+    pub claim: Claim,
+    pub record_id: String,
+    pub issuer_identity: String,
+    pub issuer_key: String,
+    pub trust_weight: u32,
+    pub block_index: i64,
+}
+
+/// 同一对象范围、同一分类出现同权重但不同状态的可信 Claim 时，不强行裁决。
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimConflict {
+    pub subject_id: String,
+    pub revision_id: String,
+    pub artifact_id: String,
+    pub category: String,
+    pub candidates: Vec<ResolvedClaim>,
+}
+
+/// 指定时间点的有效 Claim 解析结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimResolution {
+    pub as_of: i64,
+    pub effective_claims: Vec<ResolvedClaim>,
+    pub conflicts: Vec<ClaimConflict>,
+}
+
+/// 配置驱动的 Claim resolver。
+///
+/// 它不删除或改写历史 Claim，而是按可信签发者、分类授权、权重、有效时间与覆盖关系得到
+/// 当前有效结论。未配置可信签发者时，原始历史仍可查询，但不会产生有效结论（fail-closed）。
+#[derive(Debug, Clone)]
+pub struct ClaimResolver {
+    policy: ClaimPolicyConfig,
+}
+
+impl ClaimResolver {
+    pub fn new(policy: ClaimPolicyConfig) -> Self {
+        Self { policy }
+    }
+
+    fn trusted_issuer<'a>(
+        &'a self,
+        record: &CatalogRecord,
+        category: &str,
+    ) -> Option<&'a TrustedIssuerConfig> {
+        self.policy.trusted_issuers.iter().find(|issuer| {
+            issuer.weight >= self.policy.min_weight
+                && issuer.issuer_identity == record.issuer_identity
+                && issuer.issuer_key == record.issuer_key
+                && category_allowed(&issuer.categories, category)
+        })
+    }
+
+    /// 解析指定时点（Unix 秒）的有效 Claim。
+    pub fn resolve(&self, records: Vec<CatalogRecordAtBlock>, as_of: i64) -> ClaimResolution {
+        // 首先筛选“签发者可信且分类获授权且在生效窗口内”的声明。
+        let mut candidates = Vec::<ResolvedClaim>::new();
+        for item in records {
+            let CatalogPayload::Claim(claim) = &item.record.payload else {
+                continue;
+            };
+            let Some(issuer) = self.trusted_issuer(&item.record, &claim.category) else {
+                continue;
+            };
+            let from = claim.effective_from.unwrap_or(claim.observed_at);
+            if from > as_of || claim.effective_to.is_some_and(|to| to < as_of) {
+                continue;
+            }
+            candidates.push(ResolvedClaim {
+                claim: claim.clone(),
+                record_id: item.record.record_id,
+                issuer_identity: item.record.issuer_identity,
+                issuer_key: item.record.issuer_key,
+                trust_weight: issuer.weight,
+                block_index: item.block_index,
+            });
+        }
+
+        // 一个可信后续声明显式 supersedes 旧声明时，旧声明不再参与当前结论。
+        let superseded: HashSet<String> = candidates
+            .iter()
+            .filter_map(|item| {
+                (!item.claim.supersedes_claim_id.is_empty())
+                    .then_some(item.claim.supersedes_claim_id.clone())
+            })
+            .collect();
+        candidates.retain(|item| {
+            !superseded.contains(&item.claim.claim_id)
+                && item.claim.status != "withdrawn"
+                && item.claim.status != "superseded"
+        });
+
+        let mut grouped: BTreeMap<(String, String, String, String), Vec<ResolvedClaim>> =
+            BTreeMap::new();
+        for item in candidates {
+            grouped
+                .entry((
+                    item.claim.subject_id.clone(),
+                    item.claim.revision_id.clone(),
+                    item.claim.artifact_id.clone(),
+                    item.claim.category.clone(),
+                ))
+                .or_default()
+                .push(item);
+        }
+
+        let mut effective_claims = Vec::new();
+        let mut conflicts = Vec::new();
+        for ((subject_id, revision_id, artifact_id, category), mut group) in grouped {
+            let max_weight = group
+                .iter()
+                .map(|item| item.trust_weight)
+                .max()
+                .unwrap_or(0);
+            group.retain(|item| item.trust_weight == max_weight);
+            let statuses: HashSet<String> =
+                group.iter().map(|item| item.claim.status.clone()).collect();
+            if statuses.len() > 1 {
+                // 同权重认证者给出不同状态，公开保留冲突，不伪造一个单一结论。
+                conflicts.push(ClaimConflict {
+                    subject_id,
+                    revision_id,
+                    artifact_id,
+                    category,
+                    candidates: group,
+                });
+            } else {
+                // 同一状态可由多个等权可信认证者共同支持，全部保留为有效证据。
+                group.sort_by_key(|item| (item.block_index, item.record_id.clone()));
+                effective_claims.extend(group);
+            }
+        }
+        ClaimResolution {
+            as_of,
+            effective_claims,
+            conflicts,
+        }
+    }
+}
+
+fn category_allowed(allowed: &[String], category: &str) -> bool {
+    allowed.is_empty()
+        || allowed.iter().any(|rule| {
+            rule == category
+                || rule
+                    .strip_suffix(".*")
+                    .is_some_and(|prefix| category.starts_with(&format!("{}.", prefix)))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +519,120 @@ mod tests {
             supersedes_claim_id: String::new(),
         });
         assert!(claim.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    fn claim_record(
+        claim_id: &str,
+        status: &str,
+        supersedes: &str,
+        issuer_identity: &str,
+        issuer_key: &str,
+        recorded_at: i64,
+    ) -> CatalogRecordAtBlock {
+        CatalogRecordAtBlock {
+            record: CatalogRecord {
+                record_id: format!("record-{}", claim_id),
+                payload: CatalogPayload::Claim(Claim {
+                    claim_id: claim_id.to_string(),
+                    subject_id: "repo-example".to_string(),
+                    revision_id: "rev-1".to_string(),
+                    artifact_id: String::new(),
+                    category: "risk.vulnerability".to_string(),
+                    status: status.to_string(),
+                    evidence_ref: format!("sha256:{}", claim_id),
+                    observed_at: 100,
+                    effective_from: Some(100),
+                    effective_to: None,
+                    supersedes_claim_id: supersedes.to_string(),
+                }),
+                issuer_identity: issuer_identity.to_string(),
+                issuer_key: issuer_key.to_string(),
+                signature: String::new(),
+                recorded_at,
+            },
+            block_index: recorded_at,
+        }
+    }
+
+    fn resolver() -> ClaimResolver {
+        ClaimResolver::new(ClaimPolicyConfig {
+            min_weight: 1,
+            trusted_issuers: vec![TrustedIssuerConfig {
+                issuer_identity: "security-lab".to_string(),
+                issuer_key: "key-security-lab".to_string(),
+                weight: 10,
+                categories: vec!["risk.*".to_string()],
+            }],
+        })
+    }
+
+    #[test]
+    fn resolver_honors_trust_scope_and_superseding_history() {
+        let old = claim_record(
+            "old-risk",
+            "confirmed",
+            "",
+            "security-lab",
+            "key-security-lab",
+            1,
+        );
+        let replacement = claim_record(
+            "fixed-risk",
+            "resolved",
+            "old-risk",
+            "security-lab",
+            "key-security-lab",
+            2,
+        );
+        let untrusted = claim_record("untrusted-risk", "confirmed", "", "random", "key-random", 3);
+        let result = resolver().resolve(vec![old, replacement, untrusted], 200);
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.effective_claims.len(), 1);
+        assert_eq!(result.effective_claims[0].claim.claim_id, "fixed-risk");
+        assert_eq!(result.effective_claims[0].claim.status, "resolved");
+    }
+
+    #[test]
+    fn resolver_exposes_equal_weight_status_conflicts() {
+        let confirmed = claim_record(
+            "risk-confirmed",
+            "confirmed",
+            "",
+            "security-lab",
+            "key-security-lab",
+            1,
+        );
+        let disputed = claim_record(
+            "risk-disputed",
+            "disputed",
+            "",
+            "security-lab",
+            "key-security-lab",
+            2,
+        );
+        let result = resolver().resolve(vec![confirmed, disputed], 200);
+        assert!(result.effective_claims.is_empty());
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn resolver_fails_closed_without_trusted_issuer() {
+        let record = claim_record(
+            "risk",
+            "confirmed",
+            "",
+            "security-lab",
+            "key-security-lab",
+            1,
+        );
+        let result = ClaimResolver::new(ClaimPolicyConfig::default()).resolve(vec![record], 200);
+        assert!(result.effective_claims.is_empty());
+        assert!(result.conflicts.is_empty());
     }
 }

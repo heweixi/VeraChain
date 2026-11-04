@@ -223,6 +223,9 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         .with_default_target_chain_id(config.chain_identity.target_chain_id.clone()),
     );
     let _anchor_worker = anchor_service.clone().start_worker();
+    let claim_resolver = Arc::new(crate::catalog::ClaimResolver::new(
+        config.claim_policy.clone(),
+    ));
 
     // 创建应用状态
     let app_state = api::AppState {
@@ -238,6 +241,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         p2p,
         rate_limiter,
         anchor_service,
+        claim_resolver,
     };
 
     // 启动服务

@@ -10,6 +10,7 @@ flowchart TB
     WAIT["持久化待打包记录"]:::core
     BLOCK["正常新区块<br/>完整语义承诺进入区块完整性保护"]:::core
     PROJECTION[("目录查询投影<br/>对象、版本、构建物、声明历史")]:::db
+    RESOLVE["有效结论解析<br/>可信认证者、分类授权、权重、时间范围与覆盖关系<br/>同权重冲突明确保留"]:::compute
     TRACE["查询与追溯<br/>对象 → 版本 → 构建物 → 声明 → 认证来源"]:::api
     HISTORY["保留历史<br/>撤销、修正或覆盖以新声明追加"]:::note
 
@@ -24,7 +25,7 @@ flowchart TB
     SUBJECT --> SIGN
     REVISION --> SIGN
     ARTIFACT --> SIGN
-    CLAIM --> SIGN --> WAIT --> BLOCK --> PROJECTION --> TRACE
+    CLAIM --> SIGN --> WAIT --> BLOCK --> PROJECTION --> RESOLVE --> TRACE
     CLAIM --> HISTORY
     HISTORY -.后续声明.-> CLAIM
 

@@ -1212,6 +1212,36 @@ pub async fn get_catalog_claims(
         })
 }
 
+/// 按当前信任策略解析指定时间点的有效 Claim；同权重不同状态会明确返回 conflicts。
+#[derive(Debug, Deserialize)]
+pub struct EffectiveClaimsQuery {
+    pub as_of: Option<i64>,
+}
+
+pub async fn get_effective_catalog_claims(
+    State(state): State<AppState>,
+    Path(subject_id): Path<String>,
+    Query(query): Query<EffectiveClaimsQuery>,
+) -> Result<Json<ApiResponse<crate::catalog::ClaimResolution>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let records = state
+        .storage
+        .get_catalog_claims_at_block(&subject_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+    let as_of = query
+        .as_of
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    Ok(Json(ApiResponse::success(
+        state.claim_resolver.resolve(records, as_of),
+    )))
+}
+
 /// 获取内容的 Merkle 证明
 #[derive(Serialize)]
 pub struct ProofResponse {

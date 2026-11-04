@@ -3,7 +3,7 @@
 > 实现状态与未完成需求见本仓库 `IMPLEMENTATION_STATUS.md`；该文档是独立仓库的回顾入口。
 > 基于现有代码的完整流程图(模块级 + 带数据字段)见 `docs/FLOW.md`。
 > 跨链认证网、可验证语义目录与后续路线图见 `docs/CERTIFICATION_NETWORK.md`。
-> 最后核实:2026-10-18(进度至可验证语义目录基础,提交 `d97cd94`)。
+> 最后核实:2026-10-18(进度至 Claim 信任策略与有效结论 resolver，本次提交)。
 >
 > R0-R7 已在 247 服务器 docker `rust:latest` 完成 `cargo check/test/fmt/clippy` 与 HTTP smoke 验证:
 > - R1 安全:公开注册固定普通用户、RBAC 路由权限、JWT issuer/audience + refresh jti 一次性撤销、
@@ -25,7 +25,8 @@
 > - 共 75 单测 + 17 集成测试(api 9 + websocket 8)通过。
 >
 > ⚠️ 当前仍未实现:多外链批次认证、外链认证阶段回写本链、外链失信切换、人工封存后新链启用、
-> Claim 信任策略与有效状态 resolver、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播)、设备会话管理。
+> Claim 集中分类字典与认证机构治理、WebSocket 频道隔离(`/ws/chain` 等当前为全量广播)、设备会话管理。
+> Claim 当前有效结论已按配置的可信认证者、分类授权、权重、有效时间和覆盖关系解析；未配置可信认证者时默认不产生可信结论。
 > P2P 内部不做去中心化共识是有意设计，可信根逐步由外部认证链锚定提供。
 > 具体以 `IMPLEMENTATION_STATUS.md` 为准。
 
@@ -213,6 +214,7 @@ datachain version diff <v1> <v2>
 | GET | /api/v1/catalog/subjects/:subject_id/revisions | 查询对象版本历史 |
 | GET | /api/v1/catalog/revisions/:revision_id/artifacts | 查询版本的构建/配置变体 |
 | GET | /api/v1/catalog/subjects/:subject_id/claims | 查询对象全部认证声明历史 |
+| GET | /api/v1/catalog/subjects/:subject_id/effective-claims | 按可信认证者策略解析指定时间点的有效声明与冲突 |
 
 ### 版本
 
@@ -270,6 +272,16 @@ expire_hours = 24     # 令牌过期时间
 [aggregation]
 time_interval_secs = 3600  # 时间汇总间隔
 count_threshold = 100      # 数量汇总阈值
+
+# 未配置可信认证者时，Claim 历史仍可查询，但不会生成可信“有效结论”。
+[claim_policy]
+min_weight = 1
+
+[[claim_policy.trusted_issuers]]
+issuer_identity = "security-lab"
+issuer_key = "<base64-ed25519-public-key>"
+weight = 10
+categories = ["risk.*", "quality.verified"]
 ```
 
 ## 技术栈
