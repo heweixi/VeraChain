@@ -3,10 +3,15 @@
 > 图片与源定义(Mermaid)。重新生成(需 node):
 > `npx -y @mermaid-js/mermaid-cli@11.4.2 -i docs/<名>.mmd -o docs/<名>.png -b white -s 3 -p docs/.puppeteer.json`
 >
+> - **全节点简略图**:`docs/FLOW-0-simple.png`(源 `FLOW-0-simple.mmd`)——覆盖全链路关键节点、数据与计算，不展示接口或调用细节
 > - 架构总览:`docs/FLOW.png`(源 `FLOW.mmd`)——只画模块与数据流向
 > - 链路 A 元数据:`docs/FLOW-A-metadata.png`(源 `FLOW-A-metadata.mmd`)——带字段/计算
 > - 链路 B 链上身份 L1:`docs/FLOW-B-identity.png`(源 `FLOW-B-identity.mmd`)
 > - 链路 C 数据锚定 R5:`docs/FLOW-C-anchor.png`(源 `FLOW-C-anchor.mmd`)
+
+### 全节点简略流程
+
+![DataChain 全节点简略流程图](./FLOW-0-simple.png)
 
 ### 架构总览
 

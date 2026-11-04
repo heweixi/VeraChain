@@ -1,0 +1,57 @@
+%% DataChain Rust 全节点简略流程图(现有实现)
+%% 只保留环节职责、关键数据与关键计算,不展示接口/调用技术细节。
+%%{init: {"theme":"base","themeVariables":{"fontSize":"18px"},"flowchart":{"nodeSpacing":65,"rankSpacing":80,"curve":"basis"}}}%%
+flowchart TB
+    INPUT(["数据来源<br/>用户 / 本节点 / 外部链认证信息"]):::external
+
+    AUTH["认证与授权<br/>用户、JWT、角色权限<br/>refresh 撤销记录"]:::api
+
+    subgraph INGEST["数据接入"]
+        META["元数据<br/>数据标识、所有者、哈希、标签"]:::service
+        IDENTITY["链上身份 L1<br/>公钥注册 / 撤销<br/>ed25519 签名验证"]:::service
+        VERSION["版本追踪<br/>内容快照、历史差异"]:::service
+    end
+
+    PENDING["待打包队列<br/>元数据 + 密钥交易"]:::core
+    CHAIN["DataChain 链<br/>受信节点维护的区块序列"]:::core
+    BLOCK["新区块<br/>业务数据 + 密钥交易<br/>身份快照摘要"]:::core
+    INTEGRITY["完整性计算<br/>Merkle Root = 数据标识叶子 + 密钥交易叶子<br/>PoW 区块哈希"]:::compute
+
+    DB[("本地 SQLite<br/>区块、用户、版本、投影、聚合<br/>锚定 outbox、刷新令牌撤销记录")]:::database
+    QUERY["查询与审计<br/>元数据投影、身份集重放<br/>区块/版本/锚定状态"]:::api
+
+    EVENT["事件与通知<br/>WebSocket 实时推送"]:::output
+    P2P["受信节点同步<br/>区块广播、发现、最长合法链<br/>不做内部去中心化共识"]:::output
+
+    ANCHOR["跨链锚定 R5<br/>数据存在性证明<br/>源链节点签名、投递重试"]:::anchor
+    OUTBOX["锚定投递状态<br/>待投递 → 已确认 / 失败<br/>外链交易引用与回执"]:::database
+    EXTCHAIN(["可信外部认证链<br/>当前：单外链 HTTP 存证服务<br/>未来：多外链认证网"]):::external
+
+    INPUT --> AUTH
+    AUTH --> META
+    AUTH --> IDENTITY
+    AUTH --> VERSION
+    META --> PENDING
+    IDENTITY --> PENDING
+    PENDING --> CHAIN --> BLOCK --> INTEGRITY --> DB
+    VERSION --> DB
+
+    DB --> QUERY
+    BLOCK --> EVENT
+    BLOCK --> P2P
+    BLOCK --> ANCHOR --> OUTBOX --> EXTCHAIN
+    OUTBOX --> QUERY
+
+    TRUST["可信根设计<br/>本链负责生成、保存和追溯<br/>外部链锚定提供去中心化时间戳与不可篡改背书<br/>当前身份快照已写入本链区块，尚未纳入外链锚定"]:::note
+    EXTCHAIN -.- TRUST
+    DB -.- TRUST
+
+    classDef external fill:#e5e7eb,stroke:#6b7280,color:#111827;
+    classDef api fill:#dbeafe,stroke:#2563eb,color:#172554;
+    classDef service fill:#ede9fe,stroke:#7c3aed,color:#3b0764;
+    classDef core fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef compute fill:#ccfbf1,stroke:#0f766e,color:#134e4a;
+    classDef database fill:#fef3c7,stroke:#d97706,color:#78350f;
+    classDef output fill:#fce7f3,stroke:#db2777,color:#831843;
+    classDef anchor fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    classDef note fill:#fff7ed,stroke:#c2410c,color:#431407;
