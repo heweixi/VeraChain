@@ -452,4 +452,52 @@ mod tests {
         });
         assert!(chain.validate_loaded_blocks(&[genesis]).is_err());
     }
+
+    fn pending_identity_entry() -> KeyTransactionEntry {
+        KeyTransactionEntry {
+            tx_type: "register".to_string(),
+            target_key: "key-a".to_string(),
+            role: "node".to_string(),
+            label: "pending".to_string(),
+            signed_by: "key-a".to_string(),
+            signature: "signature".to_string(),
+            timestamp: 10,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_key_transaction_and_mining_apis_remain_usable() {
+        let chain = Chain::new(1, 100);
+        chain.init();
+        let entry = pending_identity_entry();
+
+        chain.add_key_transaction(entry.clone());
+        let block = chain.mine_block().unwrap();
+
+        assert_eq!(block.key_transactions, vec![entry]);
+        assert!(chain.rollback_mined_block(&block));
+        assert_eq!(chain.get_block_count(), 1);
+        assert_eq!(chain.get_pending_key_tx_count(), 1);
+    }
+
+    #[test]
+    fn sidecar_mining_returns_only_the_ids_of_entries_in_the_block_and_rolls_back_together() {
+        let chain = Chain::new(1, 100);
+        chain.init();
+        let entry = pending_identity_entry();
+
+        assert!(chain.add_pending_key_transaction("tx-a".to_string(), entry.clone()));
+        let mined = chain.mine_block_with_identity_transaction_ids().unwrap();
+        assert_eq!(mined.identity_transaction_ids, vec!["tx-a"]);
+        assert_eq!(mined.block.key_transactions, vec![entry]);
+
+        assert!(chain.rollback_mined_block_with_identity_transaction_ids(&mined));
+        assert_eq!(chain.get_block_count(), 1);
+        assert_eq!(chain.get_pending_key_tx_count(), 1);
+
+        let remine = chain.mine_block_with_identity_transaction_ids().unwrap();
+        assert_eq!(remine.identity_transaction_ids, vec!["tx-a"]);
+        assert_eq!(remine.block.key_transactions.len(), 1);
+    }
 }
