@@ -1,6 +1,6 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-11-05。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
+> 核实日期:2026-11-10。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 > R0-R7、backlog #3/#4/#5/#6、认证网 L1、可验证语义目录与 Claim resolver 已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
@@ -22,7 +22,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ R4 版本快照:内容快照 + 基于快照的历史 diff + `DATACHAIN_VERSION_ROOT` 路径 allowlist/遍历/符号链接校验。
 - ✅ R5 跨链:完整 Merkle proof(可独立验证 data→root)、ed25519 节点签名、ChainAnchor/AnchorReceipt、anchor_outbox 重试投递、attestation connector、`/api/v1/crosschain/*` + RBAC。
 - ✅ R6 P2P:显式注册 + **主动区块广播** + **认证 gossip 发现**(跳过自身)+ 种子 peer + 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。
-- ✅ R7 测试:55 单测 + 4 集成测试(`tests/api_integration.rs`:health/401/RBAC 越权/SQLite 重启恢复),双节点 smoke 验证广播/发现。
+- ✅ R7 测试:78 单测 + 19 集成测试（API 10 + WebSocket 9），共 97 passed；API 覆盖 health、401、RBAC 越权、SQLite 重启恢复及语义目录/Claim resolver 端到端路径，WebSocket 覆盖握手鉴权、EventBus 广播、16KiB 消息上限、256 连接上限和四路静态频道隔离；另有双节点 smoke 验证广播/发现。
 - ✅ 可验证语义目录:Subject→Revision→Artifact + 有签名/证据/时间范围/覆盖关系的 Claim；完整规范化语义成为 Merkle 叶子，目录 pending、区块提交与查询投影同链路持久化。
 
 **仍存在的实质差异(⚠️/🧩,非本轮目标)**:
@@ -56,13 +56,13 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | JWT access/refresh | ✅ `1124baa`/247 已验证 | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。仍缺:设备会话管理、access token 即时吊销(受 JWT 无状态固有限制,整族撤销对已签发 access 有最长一个 access 有效期的滞后) |
-| 用户持久化 | ⚠️ | 启动可从 SQLite 加载；运行中注册写库失败仍成功返回，运行中资料/密码管理 API 未完整提供 |
+| 用户持久化 | ⚠️ | 注册时若 `save_user` 失败，服务会回滚已写入内存的用户并返回 500；启动可从 SQLite 加载用户。仍缺运行时资料管理与密码管理 API。 |
 | 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
 | RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
 | Claim 信任策略 | ✅ 本次提交/247 已验证 | `[claim_policy]` 配置可信认证者身份/公钥、分类授权和权重；resolver 仅接受满足最小权重及有效时间的声明，覆盖关系生效，同权重冲突不强行裁决。默认无可信认证者时 fail-closed |
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
 | 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
-| CORS/TLS/限流 | ⚠️ | CORS 已改为 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时本地开发来源）；TLS、请求体限制、登录限速/锁定、审计日志仍未实现 |
+| CORS/TLS/限流 | ⚠️ | CORS 使用 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时仅本地开发来源）；可选 TLS、10MiB 全局请求体限制与进程内全局限流已实现。仍缺登录专属限速/锁定和审计日志。 |
 | WebSocket 认证 | ✅ 本次提交 + 247 docker `rust:latest` `cargo test`（97 passed） | WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome)；Hub 保留全局 256 连接和单条文本 16 KiB 限制。频道按静态事件映射过滤，但不实施频道级授权；验证覆盖四路连接、五种事件的正向投递和非归属频道不投递。 |
 
 ### 2.3 区块链核心与数据完整性
@@ -84,7 +84,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 独立 metadata/aggregation/events 表 | ⚠️ `d97cd94` | metadata 查询投影表已建(migration 005);aggregation 已持久化(`aggregations` 表);语义目录新增 pending_catalog_records 与 catalog_subjects/catalog_revisions/catalog_artifacts/catalog_claims 查询投影(migration 006);事件通知仍无独立表(经 EventBus 内存广播,不落库) |
 | SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
 | 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
-| 聚合持久化 | ⏳ | `AggregationEngine` 的 summaries 只在 `RwLock<Vec<_>>`，重启后列表和计数丢失 |
+| 聚合持久化 | ✅ | aggregation summaries 已写入 SQLite 的 `aggregations` 表，server 启动时加载并恢复查询结果和聚合计数。仍有的边界：时间/数量策略通常扫描全部历史 metadata，不区分未聚合部分。 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
 | 配置环境变量 | ✅基础已实现/待验证 | JWT、数据库 DSN、host、port 支持环境变量覆盖；默认 JWT secret/短 secret 启动拒绝；聚合等配置仍主要来自 TOML |
 
@@ -137,4 +137,4 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 - 本仓库不再依赖 monorepo 根的 `PROJECT_STATUS_OVERVIEW.md`；状态以本文档和 README 为准。
 - 每次需求、设计或代码行为变化，都要同步本文档对应表格、README 和任务记录，并在状态项后附 commit 与验证方式。
-- 远程仓库地址尚未配置；当前 Git 历史由原 monorepo 的 `datachain-rust` subtree 提取而来，提交消息和演进路径保留，commit hash 因 subtree 拆分而重新生成。
+- 远程仓库已配置为 `https://github.com/heweixi/datachain-rust.git`；当前 Git 历史由原 monorepo 的 `datachain-rust` subtree 提取而来，提交消息和演进路径保留，commit hash 因 subtree 拆分而重新生成。
