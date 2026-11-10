@@ -11,6 +11,24 @@ use crate::metadata::create_metadata_manager;
 use crate::storage::create_storage;
 use crate::versioning::create_version_tracker;
 
+/// 从持久化存储恢复已验证区块；空存储则创建并持久化创世区块。
+async fn initialize_or_load_chain(
+    chain: &Arc<crate::core::Chain>,
+    storage: &Arc<crate::storage::Storage>,
+) -> anyhow::Result<()> {
+    let blocks = storage.get_all_blocks().await?;
+    if !blocks.is_empty() {
+        chain.validate_loaded_blocks(&blocks)?;
+        chain.load_blocks(blocks);
+        info!("已加载 {} 个区块", chain.get_block_count());
+    } else {
+        let genesis = chain.init();
+        storage.save_block(&genesis).await?;
+        info!("已创建创世区块");
+    }
+    Ok(())
+}
+
 /// 运行服务器
 pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("正在启动 DataChain 服务...");
@@ -24,18 +42,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     // 创建区块链
     let chain = create_chain(config.blockchain.difficulty, config.blockchain.block_size);
 
-    // 从存储加载区块
-    let blocks = storage.get_all_blocks().await?;
-    if !blocks.is_empty() {
-        chain.validate_loaded_blocks(&blocks)?;
-        chain.load_blocks(blocks);
-        info!("已加载 {} 个区块", chain.get_block_count());
-    } else {
-        // 初始化创世区块
-        let genesis = chain.init();
-        storage.save_block(&genesis).await?;
-        info!("已创建创世区块");
-    }
+    initialize_or_load_chain(&chain, &storage).await?;
 
     // 恢复尚未打包的元数据；它们不会出现在 blocks 快照中。
     // 若上次进程在 save_block 成功后删除 pending 失败，启动时丢弃已提交的重复行。
@@ -258,4 +265,58 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Block;
+
+    #[tokio::test]
+    async fn initialize_or_load_chain_creates_and_persists_genesis_for_empty_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let dsn = directory.path().join("datachain.sqlite");
+        let storage = create_storage(dsn.to_str().unwrap()).await.unwrap();
+        let chain = create_chain(1, 100);
+
+        initialize_or_load_chain(&chain, &storage).await.unwrap();
+
+        assert_eq!(chain.get_block_count(), 1);
+        let stored_blocks = storage.get_all_blocks().await.unwrap();
+        assert_eq!(stored_blocks.len(), 1);
+        assert_eq!(stored_blocks[0].index, 0);
+        assert_eq!(stored_blocks[0].previous_hash, "0");
+        assert!(chain.validate_loaded_blocks(&stored_blocks).is_ok());
+    }
+
+    #[tokio::test]
+    async fn initialize_or_load_chain_rejects_corrupt_storage_without_mutating_memory_or_database()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let dsn = directory.path().join("datachain.sqlite");
+        let storage = create_storage(dsn.to_str().unwrap()).await.unwrap();
+        let mut corrupt = Block::new(0, "0".to_string(), 1);
+        corrupt.mine();
+        corrupt.metadata_list.push(crate::core::MetadataEntry {
+            data_id: "tampered-after-mining".to_string(),
+            data_size: 1,
+            created_at: chrono::Utc::now(),
+            modified_at: chrono::Utc::now(),
+            owner: "tester".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        });
+        storage.save_block(&corrupt).await.unwrap();
+        let blocks_before = serde_json::to_value(storage.get_all_blocks().await.unwrap()).unwrap();
+        let chain = create_chain(1, 100);
+
+        assert!(initialize_or_load_chain(&chain, &storage).await.is_err());
+        assert_eq!(chain.get_block_count(), 0);
+        assert_eq!(
+            serde_json::to_value(storage.get_all_blocks().await.unwrap()).unwrap(),
+            blocks_before
+        );
+    }
 }
