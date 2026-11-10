@@ -1332,4 +1332,94 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(storage.metadata_projection_count().await.unwrap(), 2);
     }
+
+    fn pending_identity_entry(target_key: &str) -> crate::core::KeyTransactionEntry {
+        crate::core::KeyTransactionEntry {
+            tx_type: "register".to_string(),
+            target_key: target_key.to_string(),
+            role: "node".to_string(),
+            label: "pending".to_string(),
+            signed_by: target_key.to_string(),
+            signature: "signature".to_string(),
+            timestamp: 10,
+            reason: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_transaction_is_durable_idempotent_and_committed_with_block() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let entry = pending_identity_entry("key-a");
+
+        let first = storage
+            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-a", &entry, 10)
+            .await
+            .unwrap();
+        assert!(first.created, "首次提交必须创建 pending 账本行");
+        assert_eq!(first.transaction.status, "pending");
+
+        let replay = storage
+            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-a", &entry, 20)
+            .await
+            .unwrap();
+        assert!(!replay.created, "相同用户与幂等键重试不得创建第二行");
+        assert_eq!(replay.transaction.transaction_id, first.transaction.transaction_id);
+        assert_eq!(storage.get_pending_identity_transactions().await.unwrap().len(), 1);
+
+        let mismatch = storage
+            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-b", &entry, 20)
+            .await;
+        assert!(matches!(mismatch, Err(DataChainError::IdentityTransactionConflict)));
+
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.key_transactions.push(entry);
+        block.hash = "h".repeat(16);
+        storage
+            .commit_block(&block, &[first.transaction.transaction_id.clone()])
+            .await
+            .unwrap();
+
+        let committed = storage
+            .get_identity_transaction(&first.transaction.transaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.status, "committed");
+        assert_eq!(committed.committed_block_index, Some(1));
+        assert!(storage.get_pending_identity_transactions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_identity_transactions_restore_first_acceptance_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let first = storage
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-a"),
+                "fingerprint-a",
+                &pending_identity_entry("key-a"),
+                10,
+            )
+            .await
+            .unwrap();
+        let second = storage
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-b"),
+                "fingerprint-b",
+                &pending_identity_entry("key-b"),
+                20,
+            )
+            .await
+            .unwrap();
+
+        let pending = storage.get_pending_identity_transactions().await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].transaction_id, first.transaction.transaction_id);
+        assert_eq!(pending[1].transaction_id, second.transaction.transaction_id);
+    }
 }
