@@ -46,6 +46,8 @@ pub struct StartupRecoveryResult {
     pub versions: Vec<crate::versioning::Version>,
     pub pending_metadata: Vec<crate::core::MetadataEntry>,
     pub pending_catalog_records: Vec<crate::catalog::CatalogRecord>,
+    /// 权威源只读扫描阶段读取的历史聚合结果(调度器写入,非可重建投影)。
+    pub aggregations: Vec<crate::aggregation::AggregationSummary>,
     pub projection_report: crate::storage::ProjectionReport,
 }
 
@@ -55,12 +57,15 @@ pub async fn scan_authoritative_sources_and_ensure_projections(
 ) -> crate::error::Result<StartupRecoveryResult> {
     // 第 4 步:权威源只读扫描,严格顺序 users → versions → refresh 撤销(无 JSON 列,
     // 由 purge_expired_refresh/is_* 按需查询,此处不整表扫描)→ pending metadata
-    // → pending catalog → anchor_outbox。任一失败立即返回 Err,不执行任何写操作。
+    // → pending catalog → anchor_outbox → aggregations。任一失败立即返回 Err,不执行任何写操作。
     let users = storage.get_all_users().await?;
     let versions = storage.get_all_versions().await?;
     let pending_metadata = storage.get_pending_metadata().await?;
     let pending_catalog_records = storage.get_pending_catalog_records().await?;
-    let _ = storage.list_pending_anchors(i64::MAX).await?;
+    // anchor_outbox 全表扫描(不按 status 过滤),status/signed/receipt 任一损坏即失败。
+    storage.scan_anchor_outbox().await?;
+    // aggregations 同为权威源,必须在任何写操作之前读取并校验,后续直接复用。
+    let aggregations = storage.get_all_aggregations().await?;
 
     // 第 7 步:区块校验已由调用方完成(initialize_or_load_chain),此处检测并重建
     // 可重建投影。
@@ -71,6 +76,7 @@ pub async fn scan_authoritative_sources_and_ensure_projections(
         versions,
         pending_metadata,
         pending_catalog_records,
+        aggregations,
         projection_report,
     })
 }
@@ -181,9 +187,8 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     }
 
     // 加载历史聚合结果，恢复查询结果和聚合计数。aggregations 非可重建投影
-    // (前置核实:含递归合并历史状态,不是纯区块导出),损坏时此处 fail-closed。
-    let aggregations = storage.get_all_aggregations().await?;
-    for summary in aggregations {
+    // (前置核实:含递归合并历史状态,不是纯区块导出),已在启动扫描阶段读取并 fail-closed。
+    for summary in recovery.aggregations {
         aggregation_engine.load_aggregation(summary);
     }
 

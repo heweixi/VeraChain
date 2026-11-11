@@ -52,8 +52,7 @@ pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Resul
         }
     }
 
-    let blocks = load_verified_chain(&storage, &chain).await?;
-    let _ = blocks;
+    load_verified_chain(&storage, &chain).await?;
 
     // Mine 需要内存链里有待打包元数据才能出块;CLI 各命令各自独立进程/连接,
     // 这里按与 server 启动一致的"去重"语义加载一次(已打包的不会重复加入)。

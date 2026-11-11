@@ -82,32 +82,111 @@ async fn get_anchor_reports_structured_corruption_for_unknown_status() {
     }
 }
 
+/// 辅助:对已入队的 anchor 执行一条损坏 SQL(绑定 ? = 值,? = anchor_id)。
+async fn corrupt_outbox(dsn: &str, sql: &str, value: &str, anchor_id: &str) {
+    let pool = common::corrupt::connect(dsn).await;
+    sqlx::query(sql)
+        .bind(value)
+        .bind(anchor_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
+fn assert_outbox_corruption(err: DataChainError, expected_key: &str, expected_reason: &str) {
+    match err {
+        DataChainError::DataCorruption {
+            category,
+            table,
+            key,
+            reason,
+        } => {
+            assert_eq!(category, CorruptionCategory::Authoritative);
+            assert_eq!(table, "anchor_outbox");
+            assert_eq!(key, expected_key);
+            if expected_reason == "json_" {
+                assert!(reason.starts_with("json_"), "reason={}", reason);
+            } else {
+                assert_eq!(reason, expected_reason);
+            }
+        }
+        other => panic!("期望 DataCorruption,实际: {:?}", other),
+    }
+}
+
 #[tokio::test]
-async fn list_pending_anchors_reports_structured_corruption_for_unknown_status() {
+async fn list_pending_anchors_reports_anchor_id_key_for_bad_signed_json() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("data.sqlite");
     let dsn = dsn.to_str().unwrap();
     let storage = create_storage(dsn).await.unwrap();
 
-    let signed = sample_signed("anchor-2");
-    storage.enqueue_anchor(&signed).await.unwrap();
+    storage.enqueue_anchor(&sample_signed("anchor-2")).await.unwrap();
+    corrupt_outbox(
+        dsn,
+        "UPDATE anchor_outbox SET signed = ? WHERE anchor_id = ?",
+        "{not valid json",
+        "anchor-2",
+    )
+    .await;
 
+    let err = storage.list_pending_anchors(10).await.unwrap_err();
+    assert_outbox_corruption(err, "anchor-2", "json_");
+}
+
+#[tokio::test]
+async fn scan_anchor_outbox_reports_unknown_status_row_filtered_by_pending_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("data.sqlite");
+    let dsn = dsn.to_str().unwrap();
+    let storage = create_storage(dsn).await.unwrap();
+
+    storage.enqueue_anchor(&sample_signed("anchor-ok")).await.unwrap();
+    storage.enqueue_anchor(&sample_signed("anchor-bogus")).await.unwrap();
+    corrupt_outbox(
+        dsn,
+        "UPDATE anchor_outbox SET status = ? WHERE anchor_id = ?",
+        "bogus",
+        "anchor-bogus",
+    )
+    .await;
+
+    // pending 查询按 status 过滤,漏掉 bogus 行;全表扫描必须抓到。
+    assert_eq!(storage.list_pending_anchors(10).await.unwrap().len(), 1);
+    let err = storage.scan_anchor_outbox().await.unwrap_err();
+    assert_outbox_corruption(err, "anchor-bogus", "unknown_status");
+}
+
+#[tokio::test]
+async fn scan_anchor_outbox_reports_bad_receipt_json_on_confirmed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("data.sqlite");
+    let dsn = dsn.to_str().unwrap();
+    let storage = create_storage(dsn).await.unwrap();
+
+    storage.enqueue_anchor(&sample_signed("anchor-conf")).await.unwrap();
     let pool = common::corrupt::connect(dsn).await;
-    sqlx::query("UPDATE anchor_outbox SET status = 'bogus' WHERE anchor_id = ?")
-        .bind("anchor-2")
+    sqlx::query("UPDATE anchor_outbox SET status = 'confirmed', receipt = ? WHERE anchor_id = ?")
+        .bind("{not valid json")
+        .bind("anchor-conf")
         .execute(&pool)
         .await
         .unwrap();
     pool.close().await;
 
-    let err = storage.list_pending_anchors(10).await.unwrap_err();
-    match err {
-        DataChainError::DataCorruption { table, reason, .. } => {
-            assert_eq!(table, "anchor_outbox");
-            assert_eq!(reason, "unknown_status");
-        }
-        other => panic!("期望 DataCorruption,实际: {:?}", other),
-    }
+    let err = storage.scan_anchor_outbox().await.unwrap_err();
+    assert_outbox_corruption(err, "anchor-conf", "json_");
+}
+
+#[tokio::test]
+async fn scan_anchor_outbox_counts_healthy_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("data.sqlite");
+    let storage = create_storage(dsn.to_str().unwrap()).await.unwrap();
+    storage.enqueue_anchor(&sample_signed("a1")).await.unwrap();
+    storage.enqueue_anchor(&sample_signed("a2")).await.unwrap();
+    assert_eq!(storage.scan_anchor_outbox().await.unwrap(), 2);
 }
 
 #[tokio::test]

@@ -598,7 +598,7 @@ impl Storage {
             corruption_from_json(
                 CorruptionCategory::Authoritative,
                 "aggregations",
-                Some(&row.0),
+                Some(row.0.as_str()),
                 &e,
             )
         })
@@ -618,7 +618,7 @@ impl Storage {
                     corruption_from_json(
                         CorruptionCategory::Authoritative,
                         "aggregations",
-                        Some(&summary_id),
+                        Some(summary_id.as_str()),
                         &e,
                     )
                 })

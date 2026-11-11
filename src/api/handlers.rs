@@ -110,10 +110,16 @@ pub async fn login(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state.auth_service.login(&req) {
         Ok(resp) => Ok((StatusCode::OK, Json(ApiResponse::success(resp)))),
-        Err(e) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::error(e.to_string())),
-        )),
+        Err(e) => {
+            // 数据损坏属服务端故障 => 500,不伪装成凭证错误。
+            let status = match e {
+                crate::error::DataChainError::DataCorruption { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                _ => StatusCode::UNAUTHORIZED,
+            };
+            Err((status, Json(ApiResponse::error(e.to_string()))))
+        }
     }
 }
 
@@ -146,7 +152,8 @@ pub async fn refresh_token(
             // 底层数据库/存储故障 => 500，避免把服务端故障伪装成鉴权失败而掩盖问题。
             let status = match e {
                 crate::error::DataChainError::DatabaseError(_)
-                | crate::error::DataChainError::StorageError(_) => {
+                | crate::error::DataChainError::StorageError(_)
+                | crate::error::DataChainError::DataCorruption { .. } => {
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
                 _ => StatusCode::UNAUTHORIZED,

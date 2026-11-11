@@ -233,3 +233,81 @@ async fn startup_scan_rebuilds_projection_when_only_metadata_table_is_corrupt() 
     );
     assert_eq!(storage.metadata_projection_count().await.unwrap(), 1);
 }
+
+/// aggregations 坏 JSON:启动扫描 fail-closed,key=summary_id,且在任何写操作之前
+/// (pending 重复行仍在,未被去重删除)。
+#[tokio::test]
+async fn startup_scan_fails_closed_on_corrupt_aggregation_before_any_write() {
+    use chrono::Utc;
+    use datachain::aggregation::AggregationSummary;
+    use datachain::cli::server::scan_authoritative_sources_and_ensure_projections;
+    use datachain::core::MetadataEntry;
+    use datachain::error::{CorruptionCategory, DataChainError};
+
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let dsn_str = dsn.to_str().unwrap();
+    let storage = create_storage(dsn_str).await.unwrap();
+    let chain = create_chain(1, 100);
+    let genesis = chain.init();
+    storage.save_block(&genesis).await.unwrap();
+
+    let entry = MetadataEntry {
+        data_id: "dup-1".to_string(),
+        data_size: 1,
+        created_at: Utc::now(),
+        modified_at: Utc::now(),
+        owner: "alice".to_string(),
+        hashes: std::collections::HashMap::new(),
+        metadata: std::collections::HashMap::new(),
+        parent_id: None,
+        tags: Vec::new(),
+    };
+    storage.save_pending_metadata(&entry).await.unwrap();
+
+    let summary = AggregationSummary {
+        summary_id: "agg-bad".to_string(),
+        summary_type: "manual".to_string(),
+        level: 1,
+        created_at: Utc::now(),
+        time_range: None,
+        block_range: Some((0, 1)),
+        statistics: std::collections::HashMap::new(),
+        merkle_root: "root".to_string(),
+        metadata_count: 1,
+        parent_summaries: Vec::new(),
+        is_merged: false,
+    };
+    storage.save_aggregation(&summary).await.unwrap();
+
+    let pool = common::corrupt::connect(dsn_str).await;
+    sqlx::query("UPDATE aggregations SET data = ? WHERE summary_id = ?")
+        .bind("{not valid json")
+        .bind("agg-bad")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let err = match scan_authoritative_sources_and_ensure_projections(&chain, &storage).await {
+        Ok(_) => panic!("aggregations 损坏必须 fail-closed"),
+        Err(e) => e,
+    };
+    match err {
+        DataChainError::DataCorruption {
+            category,
+            table,
+            key,
+            reason,
+        } => {
+            assert_eq!(category, CorruptionCategory::Authoritative);
+            assert_eq!(table, "aggregations");
+            assert_eq!(key, "agg-bad");
+            assert!(reason.starts_with("json_"));
+        }
+        other => panic!("期望 DataCorruption,实际: {:?}", other),
+    }
+
+    // 扫描阶段未写库:pending 行仍在。
+    assert_eq!(storage.get_pending_metadata().await.unwrap().len(), 1);
+}
