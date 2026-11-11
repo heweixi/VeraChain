@@ -27,6 +27,8 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub anchor_service: Arc<AnchorService>,
     pub claim_resolver: Arc<ClaimResolver>,
+    /// 串行化同一进程的身份提交与挖矿，令内存队列与 SQLite 账本保持一致。
+    pub identity_tx_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -60,6 +62,7 @@ impl AppState {
             rate_limiter,
             anchor_service,
             claim_resolver,
+            identity_tx_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }

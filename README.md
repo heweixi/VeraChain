@@ -2,8 +2,9 @@
 
 DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：既可作为可嵌入的 Rust 模块使用，也可独立运行 Axum HTTP + WebSocket 服务。
 
-> **最后核实：2026-11-10**
+> **最后核实：2026-11-11**
 >
+> - ⚠️ 本次新增身份交易 `Idempotency-Key` 与 pending 身份交易持久化：代码已实现，但**当前精确代码尚未完成 `cargo test`/`fmt`/`clippy` 验证**（本机无 Rust 工具链，247 磁盘满）。下方 97 passed 为旧版本历史结果，不代表本次改动。详见 [IMPLEMENTATION_STATUS.md §2.3.1](IMPLEMENTATION_STATUS.md)。
 > - ✅ 已验证的 WebSocket 静态频道隔离：已提交 `b20cbc4`；247 docker `rust:latest` `cargo test`，97 passed。
 > - 实现状态与未完成需求见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。该文档是本独立仓库的状态入口。
 
@@ -30,6 +31,10 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 - ⚠️ **WebSocket 不是动态订阅系统。** 它不支持动态订阅或频道级授权；专用频道是服务端固定事件映射。
 - ⚠️ **跨链认证网仍处于演进中。** 当前是单条数据、单外链锚定；多外链批次认证、回执回写、失信切换和封存重启尚未实现。
 - ⚠️ **公开注册账号不能挖矿。** `POST /api/v1/auth/register` 固定创建普通 `user`，该角色可创建和读取 metadata，但没有 `BlockMine` 权限；使用其 Bearer token 请求 `POST /api/v1/chain/mine` 会被认证中间件拒绝并返回 `403`。管理员账户须由部署者在受信运维流程中预先创建并保管；请严格按[新手指南的 Docker Compose 或 Cargo 管理员初始化路径](docs/GETTING_STARTED.md#8-受信管理员打包-pending-元数据)操作，以复用运行服务的数据库和 JWT secret。`docker-compose.yml` 与 `config.toml` 不定义或自动生成管理员账户、管理员 Bearer token。
+- ⚠️ **身份交易幂等与升级注意（未验证）。** `POST /api/v1/identity/key-transaction` 支持可选 `Idempotency-Key` 请求头：同一用户、同键、同指纹返回原事务（pending `202` / committed `200`），同键不同请求返回 `409`；空白或非 UTF-8 的键视为未提供；键按提交用户隔离；CORS 已允许该头。`transaction_id` 只存在于 SQLite 账本与内存队列，不进入区块、Merkle 或签名。新增迁移 `007_identity_transactions.sql`、`008_identity_transaction_recovery_state.sql`。
+  - 🔺 升级前遗留的 pending 身份交易会被标记为 `legacy_unverified`，**服务启动与 CLI `chain mine` 将 fail-closed 拒绝运行，不自动修复**。须先备份数据库，人工核对这些交易是否已入块后再处理；示意 SQL 与步骤见 [IMPLEMENTATION_STATUS.md §2.3.1](IMPLEMENTATION_STATUS.md)，执行需谨慎，项目无内置恢复命令。
+  - 限制：服务运行时不要用 CLI `chain mine` 对同一数据库挖矿（内存队列与账本可能漂移，导致挖矿持续失败直至重启）；`Idempotency-Key` 无长度上限，指纹仅覆盖 `signing_payload` 的 5 个字段（不含 `reason`/`timestamp`/`signature`）；同步导入区块不清理本地同内容 pending（既有行为）。
+  - 🔺 `Storage::commit_block` 公开签名变更（breaking），新增 `identity_transaction_ids` 参数。
 - ⚠️ **语义目录的治理能力未完成。** Claim 集中分类字典、动态认证机构治理与跨机构争议裁决尚未实现。
 
 完整限制、证据和后续项以 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) 为准。
@@ -63,6 +68,7 @@ Docker Compose 路径、请求示例和端口说明见新手指南。
 - 健康检查：`GET /health`。
 - Rust 测试：`cargo test`。
 - 当前 WebSocket 测试证据：已提交 `b20cbc4`；247 docker `rust:latest` `cargo test`，97 passed。此证据描述实现验证，不代表本轮文档已运行 Rust 验证。
+- 身份交易幂等改动：当前精确代码未完成 `cargo test`/`fmt`/`clippy`（本机无 Rust 工具链、247 磁盘满）；仅有旧版本历史结果（87 lib + 19 API + 9 WS 通过）可作参考，**不代表本次提交**。reviewer 复审（读代码）无 Important。
 
 ## 文档导航
 

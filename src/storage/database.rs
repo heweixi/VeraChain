@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::aggregation::AggregationSummary;
 use crate::auth::User;
 use crate::catalog::{CatalogPayload, CatalogRecord};
-use crate::core::{Block, MetadataEntry};
+use crate::core::{Block, KeyTransactionEntry, MetadataEntry};
 use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
 use crate::error::{DataChainError, Result};
 use crate::versioning::Version;
@@ -12,6 +12,38 @@ use crate::versioning::Version;
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
+}
+
+/// `identity_transactions` 查询使用的 SQLx 行元组。
+type IdentityTransactionRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+    Option<i64>,
+);
+
+/// 已接受的身份交易账本行。`transaction_id` 仅用于持久化/状态协调，不进入区块。
+#[derive(Debug, Clone)]
+pub struct StoredIdentityTransaction {
+    pub transaction_id: String,
+    pub submitter_user_id: String,
+    pub idempotency_key: Option<String>,
+    pub request_fingerprint: String,
+    pub entry: KeyTransactionEntry,
+    pub accepted_at: i64,
+    pub status: String,
+    pub committed_block_index: Option<i64>,
+}
+
+/// 创建或读取身份交易账本行的结果。
+#[derive(Debug, Clone)]
+pub struct CreateIdentityTransactionResult {
+    pub transaction: StoredIdentityTransaction,
+    pub created: bool,
 }
 
 impl Storage {
@@ -64,6 +96,14 @@ impl Storage {
             (
                 6,
                 include_str!("../../migrations/006_catalog_semantic_records.sql"),
+            ),
+            (
+                7,
+                include_str!("../../migrations/007_identity_transactions.sql"),
+            ),
+            (
+                8,
+                include_str!("../../migrations/008_identity_transaction_recovery_state.sql"),
             ),
         ];
         for (version, sql) in migrations {
@@ -128,11 +168,17 @@ impl Storage {
         Ok(())
     }
 
-    /// 原子提交区块:在同一事务内写入区块并删除其已打包的 pending 元数据。
+    /// 原子提交区块:在同一事务内写入区块、删除已打包的 pending 元数据，
+    /// 并将映射中 `Some` 身份交易账本行转为 committed。
     ///
-    /// 消除 save_block + delete_pending_metadata 两步之间崩溃导致的不一致窗口:
-    /// 要么区块与 pending 删除一起生效,要么都回滚。
-    pub async fn commit_block(&self, block: &Block) -> Result<()> {
+    /// `identity_transaction_ids` 必须与 `block.key_transactions` 逐项对齐；`None`
+    /// 表示普通密钥交易，不触碰身份交易账本。
+    /// 消除区块写入和 pending 状态转移之间的崩溃不一致窗口：要么全部生效，要么回滚。
+    pub async fn commit_block(
+        &self,
+        block: &Block,
+        identity_transaction_ids: &[Option<String>],
+    ) -> Result<()> {
         let data = serde_json::to_string(block)?;
         let timestamp = block.timestamp.timestamp();
 
@@ -154,6 +200,35 @@ impl Storage {
         .bind(&data)
         .execute(&mut *tx)
         .await?;
+
+        if identity_transaction_ids.len() != block.key_transactions.len() {
+            return Err(DataChainError::StorageError(format!(
+                "identity transaction sidecar count {} does not match block key transaction count {}",
+                identity_transaction_ids.len(),
+                block.key_transactions.len()
+            )));
+        }
+        for (transaction_id, entry) in identity_transaction_ids.iter().zip(&block.key_transactions)
+        {
+            let Some(transaction_id) = transaction_id else {
+                continue;
+            };
+            let entry_json = serde_json::to_string(entry)?;
+            let result = sqlx::query(
+                "UPDATE identity_transactions SET status = 'committed', committed_block_index = ? WHERE transaction_id = ? AND status = 'pending' AND recovery_state = 'verified' AND entry = ?",
+            )
+            .bind(block.index)
+            .bind(transaction_id)
+            .bind(entry_json)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(DataChainError::StorageError(format!(
+                    "identity transaction is missing, not pending, or does not match block entry: {}",
+                    transaction_id
+                )));
+            }
+        }
 
         for entry in &block.metadata_list {
             sqlx::query("DELETE FROM pending_metadata WHERE data_id = ?")
@@ -281,6 +356,164 @@ impl Storage {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 创建身份交易账本行；携带幂等键的重复请求返回同一行。
+    pub async fn create_or_get_identity_transaction(
+        &self,
+        submitter_user_id: &str,
+        idempotency_key: Option<&str>,
+        request_fingerprint: &str,
+        entry: &KeyTransactionEntry,
+        accepted_at: i64,
+    ) -> Result<CreateIdentityTransactionResult> {
+        if let Some(key) = idempotency_key {
+            if let Some(existing) = self
+                .get_identity_transaction_by_key(submitter_user_id, key)
+                .await?
+            {
+                return self.identity_transaction_replay_result(existing, request_fingerprint);
+            }
+        }
+
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        let entry_json = serde_json::to_string(entry)?;
+        let inserted = sqlx::query(
+            "INSERT INTO identity_transactions (transaction_id, submitter_user_id, idempotency_key, request_fingerprint, entry, accepted_at, status, committed_block_index, recovery_state) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, 'verified')",
+        )
+        .bind(&transaction_id)
+        .bind(submitter_user_id)
+        .bind(idempotency_key)
+        .bind(request_fingerprint)
+        .bind(entry_json)
+        .bind(accepted_at)
+        .execute(&self.pool)
+        .await;
+
+        match inserted {
+            Ok(_) => Ok(CreateIdentityTransactionResult {
+                transaction: self
+                    .get_identity_transaction(&transaction_id)
+                    .await?
+                    .ok_or_else(|| {
+                        DataChainError::StorageError(
+                            "new identity transaction disappeared".to_string(),
+                        )
+                    })?,
+                created: true,
+            }),
+            Err(error) if idempotency_key.is_some() => {
+                let existing = self
+                    .get_identity_transaction_by_key(submitter_user_id, idempotency_key.unwrap())
+                    .await?;
+                match existing {
+                    Some(existing) => {
+                        self.identity_transaction_replay_result(existing, request_fingerprint)
+                    }
+                    None => Err(DataChainError::DatabaseError(error)),
+                }
+            }
+            Err(error) => Err(DataChainError::DatabaseError(error)),
+        }
+    }
+
+    fn identity_transaction_replay_result(
+        &self,
+        transaction: StoredIdentityTransaction,
+        request_fingerprint: &str,
+    ) -> Result<CreateIdentityTransactionResult> {
+        if transaction.request_fingerprint != request_fingerprint {
+            return Err(DataChainError::IdentityTransactionConflict);
+        }
+        Ok(CreateIdentityTransactionResult {
+            transaction,
+            created: false,
+        })
+    }
+
+    /// 读取一条账本交易；不存在时返回 `None`。
+    pub async fn get_identity_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<StoredIdentityTransaction>> {
+        let row: Option<IdentityTransactionRow> = sqlx::query_as(
+            "SELECT transaction_id, submitter_user_id, idempotency_key, request_fingerprint, entry, accepted_at, status, committed_block_index FROM identity_transactions WHERE transaction_id = ?",
+        )
+        .bind(transaction_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::decode_identity_transaction).transpose()
+    }
+
+    /// 按认证用户和幂等键读取账本交易。
+    async fn get_identity_transaction_by_key(
+        &self,
+        submitter_user_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredIdentityTransaction>> {
+        let row: Option<IdentityTransactionRow> = sqlx::query_as(
+            "SELECT transaction_id, submitter_user_id, idempotency_key, request_fingerprint, entry, accepted_at, status, committed_block_index FROM identity_transactions WHERE submitter_user_id = ? AND idempotency_key = ?",
+        )
+        .bind(submitter_user_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::decode_identity_transaction).transpose()
+    }
+
+    fn decode_identity_transaction(
+        row: IdentityTransactionRow,
+    ) -> Result<StoredIdentityTransaction> {
+        let (
+            transaction_id,
+            submitter_user_id,
+            idempotency_key,
+            request_fingerprint,
+            entry_json,
+            accepted_at,
+            status,
+            committed_block_index,
+        ) = row;
+        Ok(StoredIdentityTransaction {
+            transaction_id,
+            submitter_user_id,
+            idempotency_key,
+            request_fingerprint,
+            entry: serde_json::from_str(&entry_json)?,
+            accepted_at,
+            status,
+            committed_block_index,
+        })
+    }
+
+    /// 读取待打包身份交易，按首次接受顺序恢复。
+    ///
+    /// 007 升级前的 pending 行没有 transaction-to-block 可信映射；区块协议不包含
+    /// transaction_id，不能用条目内容反推其是否已入块。此类记录必须拒绝启动恢复，
+    /// 而不是有可能重复打包或误拒绝同内容的新交易。
+    pub async fn get_pending_identity_transactions(
+        &self,
+    ) -> Result<Vec<StoredIdentityTransaction>> {
+        let (unverifiable_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM identity_transactions WHERE status = 'pending' AND recovery_state != 'verified'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if unverifiable_count > 0 {
+            return Err(DataChainError::StorageError(format!(
+                "refusing to recover {} unverifiable legacy pending identity transaction(s)",
+                unverifiable_count
+            )));
+        }
+
+        let rows: Vec<IdentityTransactionRow> = sqlx::query_as(
+            "SELECT transaction_id, submitter_user_id, idempotency_key, request_fingerprint, entry, accepted_at, status, committed_block_index FROM identity_transactions WHERE status = 'pending' AND recovery_state = 'verified' ORDER BY accepted_at ASC, transaction_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(Self::decode_identity_transaction)
+            .collect()
     }
 
     /// 获取区块
@@ -1093,7 +1326,7 @@ mod tests {
         });
         block.hash = "h".repeat(16);
 
-        storage.commit_block(&block).await.unwrap();
+        storage.commit_block(&block, &[]).await.unwrap();
 
         // 区块已落库;d1 的 pending 被同事务删除,d2 保留。
         assert_eq!(storage.get_block_count().await.unwrap(), 1);
@@ -1302,7 +1535,7 @@ mod tests {
             .push(mk("m1", "alice", vec!["x".into()]));
         block.metadata_list.push(mk("m2", "bob", vec!["y".into()]));
 
-        storage.commit_block(&block).await.unwrap();
+        storage.commit_block(&block, &[]).await.unwrap();
 
         // 投影写入:按 id / owner / 全量可查。
         assert_eq!(storage.metadata_projection_count().await.unwrap(), 2);
@@ -1354,30 +1587,76 @@ mod tests {
         let entry = pending_identity_entry("key-a");
 
         let first = storage
-            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-a", &entry, 10)
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-a"),
+                "fingerprint-a",
+                &entry,
+                10,
+            )
             .await
             .unwrap();
         assert!(first.created, "首次提交必须创建 pending 账本行");
         assert_eq!(first.transaction.status, "pending");
 
         let replay = storage
-            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-a", &entry, 20)
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-a"),
+                "fingerprint-a",
+                &entry,
+                20,
+            )
             .await
             .unwrap();
         assert!(!replay.created, "相同用户与幂等键重试不得创建第二行");
-        assert_eq!(replay.transaction.transaction_id, first.transaction.transaction_id);
-        assert_eq!(storage.get_pending_identity_transactions().await.unwrap().len(), 1);
+        assert_eq!(
+            replay.transaction.transaction_id,
+            first.transaction.transaction_id
+        );
+        assert_eq!(
+            storage
+                .get_pending_identity_transactions()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         let mismatch = storage
-            .create_or_get_identity_transaction("user-a", Some("idempotency-a"), "fingerprint-b", &entry, 20)
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-a"),
+                "fingerprint-b",
+                &entry,
+                20,
+            )
             .await;
-        assert!(matches!(mismatch, Err(DataChainError::IdentityTransactionConflict)));
+        assert!(matches!(
+            mismatch,
+            Err(DataChainError::IdentityTransactionConflict)
+        ));
+
+        let unmapped = storage
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-unmapped"),
+                "fingerprint-unmapped",
+                &pending_identity_entry("key-unmapped"),
+                30,
+            )
+            .await
+            .unwrap()
+            .transaction;
 
         let mut block = Block::new(1, "0".repeat(64), 2);
-        block.key_transactions.push(entry);
+        block.key_transactions = vec![pending_identity_entry("legacy-key"), entry];
         block.hash = "h".repeat(16);
         storage
-            .commit_block(&block, &[first.transaction.transaction_id.clone()])
+            .commit_block(
+                &block,
+                &[None, Some(first.transaction.transaction_id.clone())],
+            )
             .await
             .unwrap();
 
@@ -1388,7 +1667,18 @@ mod tests {
             .unwrap();
         assert_eq!(committed.status, "committed");
         assert_eq!(committed.committed_block_index, Some(1));
-        assert!(storage.get_pending_identity_transactions().await.unwrap().is_empty());
+        let unmapped = storage
+            .get_identity_transaction(&unmapped.transaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unmapped.status, "pending", "None 映射不得更新身份账本");
+        assert!(storage
+            .get_pending_identity_transactions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|transaction| transaction.transaction_id == unmapped.transaction_id));
     }
 
     #[tokio::test]
@@ -1421,5 +1711,207 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].transaction_id, first.transaction.transaction_id);
         assert_eq!(pending[1].transaction_id, second.transaction.transaction_id);
+    }
+
+    #[tokio::test]
+    async fn identity_transaction_commit_failure_rolls_back_block_and_keeps_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let entry = pending_identity_entry("key-a");
+        let transaction = storage
+            .create_or_get_identity_transaction(
+                "user-a",
+                Some("idempotency-a"),
+                "fingerprint-a",
+                &entry,
+                10,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        let mut block = Block::new(1, "0".repeat(64), 2);
+        block.key_transactions.push(entry);
+        block.hash = "h".repeat(16);
+
+        let error = storage
+            .commit_block(&block, &[Some("missing-transaction".to_string())])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DataChainError::StorageError(_)));
+        assert_eq!(
+            storage.get_block_count().await.unwrap(),
+            0,
+            "失败事务不得留下已写入区块"
+        );
+        let pending = storage
+            .get_identity_transaction(&transaction.transaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, "pending", "失败事务不得转换账本状态");
+        assert_eq!(pending.committed_block_index, None);
+    }
+
+    #[tokio::test]
+    async fn commit_block_rejects_cross_instance_sidecars_in_a_different_entry_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage_a = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let storage_b = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let first = storage_a
+            .create_or_get_identity_transaction(
+                "user-a",
+                None,
+                "fingerprint-a",
+                &pending_identity_entry("key-a"),
+                10,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        let second = storage_a
+            .create_or_get_identity_transaction(
+                "user-a",
+                None,
+                "fingerprint-b",
+                &pending_identity_entry("key-b"),
+                20,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        let mut block = Block::new(1, "0".repeat(64), 1);
+        block.key_transactions = vec![
+            pending_identity_entry("key-a"),
+            pending_identity_entry("key-b"),
+        ];
+        block.hash = "h".repeat(16);
+
+        let error = storage_b
+            .commit_block(
+                &block,
+                &[
+                    Some(second.transaction_id.clone()),
+                    Some(first.transaction_id.clone()),
+                ],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DataChainError::StorageError(_)));
+        assert_eq!(storage_a.get_block_count().await.unwrap(), 0);
+        for transaction_id in [&first.transaction_id, &second.transaction_id] {
+            assert_eq!(
+                storage_a
+                    .get_identity_transaction(transaction_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_block_rejects_identity_sidecars_for_metadata_only_blocks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let transaction = storage
+            .create_or_get_identity_transaction(
+                "user-a",
+                None,
+                "fingerprint-a",
+                &pending_identity_entry("key-a"),
+                10,
+            )
+            .await
+            .unwrap()
+            .transaction;
+        let mut block = Block::new(1, "0".repeat(64), 1);
+        block.hash = "h".repeat(16);
+
+        let error = storage
+            .commit_block(&block, &[Some(transaction.transaction_id.clone())])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DataChainError::StorageError(_)));
+        assert_eq!(storage.get_block_count().await.unwrap(), 0);
+        assert_eq!(
+            storage
+                .get_identity_transaction(&transaction.transaction_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_six_upgrades_identity_transactions_with_recovery_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("schema-v6.sqlite");
+        let dsn = path.to_str().unwrap();
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&format!("sqlite:{}?mode=rwc", dsn))
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            for version in 1..=6 {
+                sqlx::query("INSERT INTO schema_migrations (version) VALUES (?)")
+                    .bind(version)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+        }
+
+        let storage = Storage::new(dsn).await.unwrap();
+        let (version,): (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 8);
+        let index_sql: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_identity_transactions_submitter_idempotency'",
+        )
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert!(index_sql.0.contains("WHERE idempotency_key IS NOT NULL"));
+
+        let entry = pending_identity_entry("key-a");
+        let first = storage
+            .create_or_get_identity_transaction("user-a", Some("same-key"), "fp-a", &entry, 1)
+            .await
+            .unwrap();
+        let second = storage
+            .create_or_get_identity_transaction("user-b", Some("same-key"), "fp-b", &entry, 2)
+            .await
+            .unwrap();
+        let recovery_state: (String,) = sqlx::query_as(
+            "SELECT recovery_state FROM identity_transactions WHERE transaction_id = ?",
+        )
+        .bind(&first.transaction.transaction_id)
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(recovery_state.0, "verified");
+        assert_ne!(
+            first.transaction.transaction_id, second.transaction.transaction_id,
+            "部分唯一索引必须按 submitter_user_id 隔离相同幂等键"
+        );
     }
 }

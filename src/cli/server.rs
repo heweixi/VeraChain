@@ -11,6 +11,24 @@ use crate::metadata::create_metadata_manager;
 use crate::storage::create_storage;
 use crate::versioning::create_version_tracker;
 
+/// 从 SQLite 账本恢复待打包身份交易。
+///
+/// `transaction_id` 不进入区块 JSON，因此历史区块只能证明某个条目内容曾经入块，不能证明
+/// 它属于哪个账本交易。无幂等键的相同请求可合法生成不同交易 ID，恢复时以账本状态为准，
+/// 不能用 `KeyTransactionEntry` JSON 反推已提交状态。
+pub async fn recover_pending_identity_transactions(
+    chain: &std::sync::Arc<crate::core::Chain>,
+    storage: &std::sync::Arc<crate::storage::Storage>,
+) -> anyhow::Result<()> {
+    let pending_identity_transactions = storage.get_pending_identity_transactions().await?;
+    chain.load_pending_key_transactions(
+        pending_identity_transactions
+            .into_iter()
+            .map(|transaction| (transaction.transaction_id, transaction.entry)),
+    );
+    Ok(())
+}
+
 /// 运行服务器
 pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("正在启动 DataChain 服务...");
@@ -60,6 +78,12 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     }
     chain.load_pending(pending_to_load);
     info!("已加载 {} 条待打包元数据", chain.get_pending_count());
+
+    recover_pending_identity_transactions(&chain, &storage).await?;
+    info!(
+        "已加载 {} 条待打包身份交易",
+        chain.get_pending_key_tx_count()
+    );
 
     // 恢复已被接受但尚未打包的完整语义目录记录(subject/revision/artifact/claim)。
     let pending_catalog_records = storage.get_pending_catalog_records().await?;
@@ -242,6 +266,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         rate_limiter,
         anchor_service,
         claim_resolver,
+        identity_tx_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // 启动服务
@@ -258,4 +283,140 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Block, KeyTransactionEntry};
+    use tempfile::tempdir;
+
+    fn pending_identity_entry() -> KeyTransactionEntry {
+        KeyTransactionEntry {
+            tx_type: "register".to_string(),
+            target_key: "key-a".to_string(),
+            role: "node".to_string(),
+            label: "pending".to_string(),
+            signed_by: "key-a".to_string(),
+            signature: "signature".to_string(),
+            timestamp: 10,
+            reason: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_fails_closed_for_unverifiable_legacy_pending_in_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let dsn = path.to_str().unwrap();
+        let entry = pending_identity_entry();
+        let chain = create_chain(1, 100);
+        let genesis = chain.init();
+        let mut committed_block = Block::new(1, genesis.hash.clone(), 1);
+        committed_block.key_transactions.push(entry.clone());
+        committed_block.mine();
+
+        // 模拟 007 已部署但尚未记录恢复可信度的旧库。区块 JSON 不含 transaction_id，
+        // 因而无法证明这条 pending 行是否已经是该历史区块中的条目。
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}?mode=rwc", dsn))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for version in 1..=7 {
+            sqlx::query("INSERT INTO schema_migrations (version) VALUES (?)")
+                .bind(version)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "CREATE TABLE identity_transactions (transaction_id TEXT PRIMARY KEY NOT NULL, submitter_user_id TEXT NOT NULL, idempotency_key TEXT, request_fingerprint TEXT NOT NULL, entry TEXT NOT NULL, accepted_at INTEGER NOT NULL, status TEXT NOT NULL, committed_block_index INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blocks (block_index INTEGER UNIQUE NOT NULL, timestamp INTEGER NOT NULL, previous_hash TEXT NOT NULL, merkle_root TEXT NOT NULL, nonce INTEGER NOT NULL, difficulty INTEGER NOT NULL, hash TEXT UNIQUE NOT NULL, data TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blocks (block_index, timestamp, previous_hash, merkle_root, nonce, difficulty, hash, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(committed_block.index)
+        .bind(committed_block.timestamp.timestamp())
+        .bind(&committed_block.previous_hash)
+        .bind(&committed_block.merkle_root)
+        .bind(committed_block.nonce as i64)
+        .bind(committed_block.difficulty as i64)
+        .bind(&committed_block.hash)
+        .bind(serde_json::to_string(&committed_block).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO identity_transactions (transaction_id, submitter_user_id, idempotency_key, request_fingerprint, entry, accepted_at, status, committed_block_index) VALUES ('legacy-tx', 'user-a', NULL, 'legacy-fingerprint', ?, 10, 'pending', NULL)",
+        )
+        .bind(serde_json::to_string(&entry).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let storage = create_storage(dsn).await.unwrap();
+        chain.load_blocks(vec![genesis, committed_block]);
+        let result = recover_pending_identity_transactions(&chain, &storage).await;
+        assert!(result.is_err(), "无法验证的旧 pending 必须在启动时 fail-closed");
+        assert_eq!(chain.get_pending_key_tx_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_keeps_distinct_verified_no_key_transaction_despite_identical_history_entry(
+    ) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        let storage = create_storage(path.to_str().unwrap()).await.unwrap();
+        let entry = pending_identity_entry();
+        let first = storage
+            .create_or_get_identity_transaction("user-a", None, "fingerprint-a", &entry, 10)
+            .await
+            .unwrap()
+            .transaction;
+        let second = storage
+            .create_or_get_identity_transaction("user-a", None, "fingerprint-b", &entry, 20)
+            .await
+            .unwrap()
+            .transaction;
+
+        let chain = create_chain(1, 100);
+        let genesis = chain.init();
+        let mut committed_block = Block::new(1, genesis.hash.clone(), 1);
+        committed_block.key_transactions.push(entry);
+        committed_block.mine();
+        storage
+            .commit_block(&committed_block, &[Some(first.transaction_id)])
+            .await
+            .unwrap();
+        chain.load_blocks(vec![genesis, committed_block]);
+
+        recover_pending_identity_transactions(&chain, &storage)
+            .await
+            .unwrap();
+        assert_eq!(chain.get_pending_key_tx_count(), 1);
+        assert_eq!(
+            chain
+                .mine_block_with_identity_transaction_ids()
+                .unwrap()
+                .identity_transaction_ids,
+            vec![Some(second.transaction_id)]
+        );
+    }
 }

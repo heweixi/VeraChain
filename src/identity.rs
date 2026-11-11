@@ -22,7 +22,7 @@ pub const TX_REGISTER: &str = "register";
 pub const TX_REVOKE: &str = "revoke";
 
 /// 提交密钥交易的请求体。签名针对 `KeyTransactionEntry::signing_payload()`。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeyTransactionRequest {
     /// register / revoke。
     pub tx_type: String,

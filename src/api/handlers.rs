@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
@@ -290,20 +290,30 @@ pub async fn mine_block(
         ));
     }
 
-    match state.chain.mine_block() {
-        Ok(mut block) => {
+    let _gate = state.identity_tx_gate.lock().await;
+    match state.chain.mine_block_with_identity_transaction_ids() {
+        Ok(mut mined) => {
             // 挖矿后计算当前身份集快照哈希并写入区块头(backlog L1)。
             // snapshot_hash 派生自已进 merkle 的 key_transactions,不参与 PoW 哈希,
             // 故此处填入不影响区块 hash;同步更新链内副本,保证与持久化一致。
             let key_set = crate::identity::replay_key_set(&state.chain.get_all_blocks());
             let snapshot = crate::identity::compute_identity_snapshot_hash(&key_set);
             if !snapshot.is_empty() {
-                block.identity_snapshot_hash = snapshot.clone();
-                state.chain.set_latest_identity_snapshot(&block, &snapshot);
+                mined.block.identity_snapshot_hash = snapshot.clone();
+                state
+                    .chain
+                    .set_latest_identity_snapshot(&mined.block, &snapshot);
             }
-            // 在同一事务内原子提交区块并删除对应 pending;失败时回滚内存区块与 pending 队列。
-            if let Err(e) = state.storage.commit_block(&block).await {
-                state.chain.rollback_mined_block(&block);
+            // 传入与本次 key transaction 逐项对齐的身份账本映射；`None` 保留普通
+            // 交易位置，防止共享 DSN 的其他 AppState 误提交未包含在本区块的交易。
+            if let Err(e) = state
+                .storage
+                .commit_block(&mined.block, &mined.identity_transaction_ids)
+                .await
+            {
+                state
+                    .chain
+                    .rollback_mined_block_with_identity_transaction_ids(&mined);
                 tracing::error!("提交区块失败: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -312,15 +322,15 @@ pub async fn mine_block(
             }
             state.event_bus.publish(Event::new(
                 EventType::BlockMined,
-                serde_json::to_value(&block).unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::to_value(&mined.block).unwrap_or_else(|_| serde_json::json!({})),
             ));
             // 挖矿成功后向已注册 peer 主动广播新区块(异步,不阻塞响应)。
             let p2p = state.p2p.clone();
-            let broadcast_block = block.clone();
+            let broadcast_block = mined.block.clone();
             tokio::spawn(async move {
                 p2p.broadcast_blocks(vec![broadcast_block]).await;
             });
-            Ok((StatusCode::CREATED, Json(ApiResponse::success(block))))
+            Ok((StatusCode::CREATED, Json(ApiResponse::success(mined.block))))
         }
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
@@ -960,32 +970,76 @@ pub async fn get_node_identity(
 
 // ==================== 链上身份处理器 (backlog L1) ====================
 
-/// 提交一条密钥交易(register/revoke)。验签通过后进入待打包队列,下次挖矿上链。
+/// 提交一条密钥交易(register/revoke)。带 `Idempotency-Key` 的请求跨重试返回同一账本交易。
 pub async fn submit_key_transaction(
     State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    headers: HeaderMap,
     Json(req): Json<crate::identity::KeyTransactionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let idempotency_key = headers.get("idempotency-key").and_then(|value| {
+        value
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
     let now = chrono::Utc::now().timestamp();
-    match crate::identity::build_verified_key_transaction(&req, now) {
-        Ok(entry) => {
-            state.chain.add_key_transaction(entry.clone());
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(ApiResponse::success(serde_json::json!({
-                    "tx_type": entry.tx_type,
-                    "target_key": entry.target_key,
-                    "signed_by": entry.signed_by,
-                    "timestamp": entry.timestamp,
-                    "status": "pending",
-                }))),
-            ))
-        }
-        // 验签失败/非法请求 => 400(客户端凭证/输入问题),不是服务端故障。
-        Err(e) => Err((
+    let entry = crate::identity::build_verified_key_transaction(&req, now).map_err(|e| {
+        (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(e.to_string())),
-        )),
+        )
+    })?;
+    let request_fingerprint = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(entry.signing_payload()))
+    };
+
+    let _gate = state.identity_tx_gate.lock().await;
+    let result = state
+        .storage
+        .create_or_get_identity_transaction(
+            &claims.sub,
+            idempotency_key.as_deref(),
+            &request_fingerprint,
+            &entry,
+            now,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::error::DataChainError::IdentityTransactionConflict => (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(e.to_string())),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            ),
+        })?;
+    if result.created {
+        state.chain.add_pending_key_transaction(
+            result.transaction.transaction_id.clone(),
+            result.transaction.entry.clone(),
+        );
     }
+    let status_code = if result.transaction.status == "committed" {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((
+        status_code,
+        Json(ApiResponse::success(serde_json::json!({
+            "transaction_id": result.transaction.transaction_id,
+            "tx_type": result.transaction.entry.tx_type,
+            "target_key": result.transaction.entry.target_key,
+            "signed_by": result.transaction.entry.signed_by,
+            "timestamp": result.transaction.entry.timestamp,
+            "status": result.transaction.status,
+        }))),
+    ))
 }
 
 /// 查询当前有效密钥集(重放链上 key_transactions)。

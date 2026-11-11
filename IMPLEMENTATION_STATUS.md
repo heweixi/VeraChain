@@ -1,6 +1,7 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-11-10。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
+> 最后核实:2026-11-11。本次新增「身份交易 Idempotency-Key + pending 身份交易 SQLite 持久化」，**当前精确代码尚未完成 cargo test/fmt/clippy 验证**（本机无 Rust 工具链、247 磁盘满），详见 §2.3 与 §三。
+> 其余条目沿用 2026-11-10 核实：WebSocket 频道隔离已实现；验证证据为 247 docker `rust:latest` `cargo test`（97 passed，**旧版本历史结果，不代表本次改动**）。
 > R0-R7、backlog #3/#4/#5/#6、认证网 L1、可验证语义目录与 Claim resolver 已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
@@ -73,8 +74,53 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 启动恢复 | ⚠️ | `src/cli/server.rs` 恢复 blocks/users/versions，但恢复时没有完整验证索引、previous hash、PoW、Merkle root |
 | 链验证 | ⚠️ | `Chain::validate_chain` 验证大部分链接和 PoW，但不重新验证创世块、Merkle root 与 metadata 的对应关系 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
-| attestation/identity/key transactions | ⚠️ `8b5ecf1`/247 端到端已验证 | 链上身份最小版(L1)已接入并经端到端集成测试(register→挖矿→查询→撤销链路真实可用):`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。签名负载不含 timestamp(服务端独立盖,`8b5ecf1` 修复)。**仍未做**:密钥轮换状态机、Merkle 身份树、pending key_tx 持久化(仅内存,重启丢未打包交易,幂等可重提);attestation 仍只在 verify_content 读、无专门提交流程 |
+| attestation/identity/key transactions | ⚠️ `8b5ecf1`/247 端到端已验证 | 链上身份最小版(L1)已接入并经端到端集成测试(register→挖矿→查询→撤销链路真实可用):`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。签名负载不含 timestamp(服务端独立盖,`8b5ecf1` 修复)。**仍未做**:密钥轮换状态机、Merkle 身份树;attestation 仍只在 verify_content 读、无专门提交流程。(「pending key_tx 仅内存」的旧限制已由下一行的身份交易账本取代,见 §2.3.1) |
+| 身份交易幂等与 pending 持久化(`Idempotency-Key`) | ⚠️ 代码已实现 / **本次提交当前代码未完成 Rust 验证** | 见 §2.3.1 |
 | P2P/节点同步/冲突解决 | ⚠️ `R6`/247 双节点已验证 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks`:显式注册 + **主动广播**(挖矿后 `broadcast_blocks` 推新块给 peers)+ **认证 gossip 发现**(`exchange_peers` 从已知 peer 拉取 peer 列表并入,跳过自身)+ 种子 peer(DATACHAIN_P2P_SEED_PEERS)+ 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。**仍无共识、同长度分叉选择**(⚠️ 单一诚实源假设)。双节点 smoke:a 挖矿→b 经广播增长, 双向 exchange_peers 互相发现 |
+
+### 2.3.1 身份交易幂等与 pending 持久化(本次提交,⚠️ 代码已实现、验证未完成)
+
+依据:`src/api/handlers.rs`(`submit_key_transaction`、`mine_block`)、`src/api/routes.rs`(CORS)、`src/storage/database.rs`(`create_or_get_identity_transaction`、`commit_block`、`get_pending_identity_transactions`)、`src/cli/server.rs`(`recover_pending_identity_transactions`)、`src/cli/chain.rs`、`migrations/007`、`008`。
+
+**行为(读代码核实)**:
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| `POST /api/v1/identity/key-transaction` 可选 `Idempotency-Key` 头 | ⚠️ 代码已实现/未验证 | 同用户 + 同键 + 同指纹 → 返回原事务:仍 pending 返回 `202`,已 committed 返回 `200`;同键但指纹不同 → `409`(`IdentityTransactionConflict`)。响应新增 `transaction_id`、`status` 字段 |
+| 键的解析 | ⚠️ 代码已实现/未验证 | 去首尾空白后为空,或请求头非 UTF-8(`to_str()` 失败),均视为未提供(按无幂等键处理,每次生成新事务) |
+| 用户隔离 | ⚠️ 代码已实现/未验证 | 唯一索引 `(submitter_user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`,键按 JWT `claims.sub` 隔离,不同用户可使用相同键 |
+| sidecar `transaction_id` | ⚠️ 代码已实现/未验证 | `transaction_id` 仅存于 SQLite 账本与内存队列的 sidecar,**不进入区块 JSON、Merkle 叶子或签名负载**;`KeyTransactionEntry` 与区块协议未变 |
+| CORS | ⚠️ 代码已实现/未验证 | `allow_headers` 增加 `idempotency-key` |
+| pending 持久化与重启恢复 | ⚠️ 代码已实现/未验证 | 身份交易先落 `identity_transactions` 表(`pending`),服务启动经 `recover_pending_identity_transactions` 按 `accepted_at, transaction_id` 恢复入队;`commit_block` 同事务把对应行置 `committed` 并记录 `committed_block_index` |
+| 串行化 | ⚠️ 代码已实现/未验证 | `AppState.identity_tx_gate`(进程内 `tokio::Mutex`)串行化「身份提交」与「HTTP 挖矿」 |
+| `Storage::commit_block` 签名 | 🔺 破坏性变更 | 由 `commit_block(&block)` 变为 `commit_block(&block, &[Option<String>])`(须与 `block.key_transactions` 逐项对齐,`None` 表示普通交易)。公开库 API 的调用方需适配;README 已声明库 API 不承诺稳定 |
+
+**迁移与升级(007/008)**:
+
+- `007_identity_transactions.sql`:新建 `identity_transactions` 表(状态 `pending`/`committed`)、幂等唯一索引、pending 顺序索引。
+- `008_identity_transaction_recovery_state.sql`:新增 `recovery_state`(`legacy_unverified`/`verified`),列默认值为 `legacy_unverified`。新提交的身份交易写入 `verified`。
+- 🔺 **升级前遗留 pending 行**(007 已部署、008 之前产生)会被标为 `legacy_unverified`:因区块 JSON 不含 `transaction_id`,无法证明其是否已被打包。**服务启动与 CLI `chain mine` 均 fail-closed**(报错 `refusing to recover N unverifiable legacy pending identity transaction(s)`),**不自动修复**。
+- 人工处置思路(⚠️ 需谨慎,以下仅为示意,执行前务必按实际库核对):
+  1. 停止服务,**先完整备份** SQLite 文件(含 `-wal`/`-shm`)。
+  2. 查看遗留行:`SELECT transaction_id, submitter_user_id, entry, accepted_at FROM identity_transactions WHERE status='pending' AND recovery_state!='verified';`
+  3. 人工把每条 `entry` 与 `blocks.data` 中的 `key_transactions` 比对,判断是否已入块。注意同内容条目可能合法重复,内容相同不等于同一交易。
+  4. 已确认入块的:示意性改为已提交(`UPDATE identity_transactions SET status='committed', committed_block_index=<块号> WHERE transaction_id='<id>';`);确认未入块且确需继续打包的:示意性标为已核实(`UPDATE identity_transactions SET recovery_state='verified' WHERE transaction_id='<id>';`);确认应丢弃的再决定是否删除。以上 SQL **未经本项目验证**,不是内置恢复流程。
+  5. 处理完毕再启动服务。
+
+**已知限制(登记)**:
+
+- ⚠️ (a) **服务运行时不要用 CLI `chain mine` 对同一数据库挖矿**:CLI 进程与服务进程各有内存队列且不共享 `identity_tx_gate`,可能使内存队列与账本漂移,导致服务后续挖矿持续失败,直到重启服务重新加载账本。
+- ⚠️ (b) `legacy_unverified` **没有内置恢复命令**,只能人工处置(见上)。
+- ⚠️ (c) `Idempotency-Key` **无长度上限**。请求指纹为 `SHA256(signing_payload)`,仅覆盖 `tx_type|target_key|role|label|signed_by` 5 个字段,**不含 `reason`、`timestamp`、`signature`**:同键下仅这三项不同的请求会被视为同一请求并返回原事务。
+- ⚠️ (d) 同步导入区块(P2P/sync)**不会清理**本地内容相同的 pending(既有行为,本次未改变)。
+
+**验证证据(如实)**:
+
+- 本次提交的**当前精确代码未完成** `cargo test` / `cargo fmt --check` / `cargo clippy`:本机无 Rust 工具链,247 服务器磁盘已满无法运行 docker 验证。
+- 仅有**旧版本**历史结果(87 lib + 19 API + 9 WS 通过)可供参考,**不代表本次代码**;本次未编造或推算任何新的测试计数。
+- 代码中含相关新增测试(`tests/api_integration.rs`、`src/storage/database.rs`、`src/cli/server.rs`、`src/cli/chain.rs`),但**均未在本次代码上运行**。
+- reviewer 复审结论:无 Important 级问题(基于读代码,非运行结果)。
+- 因此上表各项不标 ✅;待 247 磁盘恢复并通过 cargo test/fmt/clippy 后再升级。
 
 ### 2.4 存储、迁移与恢复
 
@@ -82,7 +128,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 |---|---|---|
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
 | 独立 metadata/aggregation/events 表 | ⚠️ `d97cd94` | metadata 查询投影表已建(migration 005);aggregation 已持久化(`aggregations` 表);语义目录新增 pending_catalog_records 与 catalog_subjects/catalog_revisions/catalog_artifacts/catalog_claims 查询投影(migration 006);事件通知仍无独立表(经 EventBus 内存广播,不落库) |
-| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
+| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~008`(007/008 为本次新增,见 §2.3.1,未在本次代码上验证) + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
 | 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
 | 聚合持久化 | ✅ | aggregation summaries 已写入 SQLite 的 `aggregations` 表，server 启动时加载并恢复查询结果和聚合计数。仍有的边界：时间/数量策略通常扫描全部历史 metadata，不区分未聚合部分。 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
@@ -106,6 +152,18 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ⚠️ P2P 双节点广播/发现路径由 247 双容器 smoke 验证(非进程内集成测试)。refresh token 持久化/复用检测/并发双花已由单测覆盖(`1124baa`:正常轮换/复用整族撤销/并发双花 tokio::join 恰一成功/跨实例重启撤销持久化/revoke_refresh 抢占/purge 边界)。WebSocket 频道隔离已由端到端测试覆盖：专用频道只收到映射事件，`version_tracked` 仅进入 `/ws`；该功能不提供动态订阅或频道级授权。
 - ✅ 已建立独立仓库 CI 证据:R0-R7 均在 247 `rust:latest` 执行 `cargo check/test/fmt/clippy` 并做 HTTP smoke(见各 R 提交说明)。
 
+- ⚠️ **本次(身份交易幂等 + pending 持久化)验证状态**:当前精确代码在本机无 Rust 工具链、247 磁盘满的条件下**未完成** cargo test/fmt/clippy。上面的 97 passed / 87 lib + 19 API + 9 WS 均为**旧版本历史结果**,仅供参考,不代表本次提交。reviewer 复审(读代码)无 Important。
+
+### 登记项(本次提交时登记,编号沿用本节顺序)
+
+| 编号 | 状态 | 内容 |
+|---|---|---|
+| R-1 | 🔺 | `Storage::commit_block` 公开签名变更(breaking):新增 `identity_transaction_ids: &[Option<String>]` 参数 |
+| R-2 | 🔺 协议既有 | `KeyTransactionEntry::signing_payload` 以 `|` 拼接字段,字段含 `|` 时可能碰撞;属协议既有问题,本次未改,计划在协议 v2 迁移时修复 |
+| R-3 | ⚠️ | clippy 基线警告:既有代码存在 clippy 警告(基线问题),本次未清理,也未在本次代码上重跑 clippy |
+| R-4 | ⚠️ 环境 | 247 验证服务器磁盘长期处于满状态,导致 docker 验证无法执行;须先清理磁盘,才能补做本次验证 |
+| R-5 | ⚠️ | 见 §2.3.1 已知限制 (a)-(d):CLI 与运行中服务同库挖矿漂移、`legacy_unverified` 无内置恢复、幂等键无长度上限且指纹仅 5 字段、同步导入不清理本地 pending |
+
 ## 四、开发进度与后续建议
 
 ### 已完成(R0-R7,推荐顺序)
@@ -120,6 +178,8 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 8. ✅ **R7 测试与 CI**:集成测试(API/RBAC/重启恢复)、双节点 smoke、247 CI 证据。
 
 ### 后续建议(backlog,非当前目标)
+
+- ⏳ 补做本次身份交易幂等改动的 Rust 验证(247 磁盘恢复后跑 cargo test/fmt/clippy);提供 `legacy_unverified` 的内置恢复命令;为 `Idempotency-Key` 增加长度上限;指纹覆盖 reason/timestamp/signature 的取舍评估;`signing_payload` v2 分隔方案。
 
 - ✅ #4 WebSocket 收发自动化集成测试 — 历史握手/广播/消息与连接上限覆盖已扩展为频道隔离端到端覆盖：四路连接、五种事件、正向投递和非归属频道不投递。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。

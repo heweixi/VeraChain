@@ -99,6 +99,7 @@ async fn build_state(dsn: &str) -> AppState {
         rate_limiter,
         anchor_service,
         claim_resolver: Arc::new(datachain::catalog::ClaimResolver::new(Default::default())),
+        identity_tx_gate: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 

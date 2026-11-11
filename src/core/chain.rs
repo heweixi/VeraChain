@@ -6,6 +6,28 @@ use super::block::{Block, KeyTransactionEntry, MetadataEntry};
 use crate::catalog::CatalogRecord;
 use crate::error::{DataChainError, Result};
 
+/// 仅在内存 pending 队列中保留的身份交易协调信息。
+///
+/// `transaction_id` 是 SQLite 账本的 sidecar，不进入 `Block`，因此不会改变区块 JSON、
+/// 签名或 Merkle 负载。
+#[derive(Debug, Clone)]
+struct PendingKeyTransaction {
+    /// 仅持久账本管理的条目带有 sidecar ID；兼容的公开 API 添加的条目保持 `None`。
+    transaction_id: Option<String>,
+    entry: KeyTransactionEntry,
+}
+
+/// 一次挖矿的结果。身份交易 ID 映射仅供持久层提交状态使用，不属于区块协议。
+#[derive(Debug, Clone)]
+pub struct MinedBlock {
+    pub block: Block,
+    /// 与 `block.key_transactions` 按位置对齐的身份账本 sidecar 映射。
+    ///
+    /// `Some(id)` 表示对应条目来自持久身份账本；`None` 表示原有公开 API 加入的
+    /// 普通密钥交易。该映射不进入区块 JSON、签名或 Merkle 负载。
+    pub identity_transaction_ids: Vec<Option<String>>,
+}
+
 /// 区块链
 pub struct Chain {
     blocks: RwLock<Vec<Block>>,
@@ -13,7 +35,7 @@ pub struct Chain {
     block_size: usize,
     pending: RwLock<Vec<MetadataEntry>>,
     /// 待打包的密钥交易(backlog L1)。与元数据 pending 并列,下次挖矿并入区块。
-    pending_key_tx: RwLock<Vec<KeyTransactionEntry>>,
+    pending_key_tx: RwLock<Vec<PendingKeyTransaction>>,
     /// 待打包的完整语义目录记录(Subject/Revision/Artifact/Claim)。
     pending_catalog_records: RwLock<Vec<CatalogRecord>>,
 }
@@ -32,8 +54,37 @@ impl Chain {
     }
 
     /// 加入一条待打包密钥交易。
-    pub fn add_key_transaction(&self, tx: KeyTransactionEntry) {
-        self.pending_key_tx.write().push(tx);
+    ///
+    /// 这是原有公开 API。该 API 不带持久身份账本 sidecar，调用方可继续使用
+    /// `mine_block` 与 `rollback_mined_block` 维持原有行为。
+    pub fn add_key_transaction(&self, entry: KeyTransactionEntry) {
+        self.pending_key_tx.write().push(PendingKeyTransaction {
+            transaction_id: None,
+            entry,
+        });
+    }
+
+    /// 按持久账本 ID 加入一条待打包密钥交易。
+    ///
+    /// handlers 与 CLI 必须使用这个显式协调接口，以便
+    /// `mine_block_with_identity_transaction_ids` 将实际入块条目对应的账本 ID
+    /// 交给 `Storage::commit_block`。重复 ID 不得重复入队。
+    pub fn add_pending_key_transaction(
+        &self,
+        transaction_id: String,
+        entry: KeyTransactionEntry,
+    ) -> bool {
+        let mut pending = self.pending_key_tx.write();
+        if pending.iter().any(|transaction| {
+            transaction.transaction_id.as_deref() == Some(transaction_id.as_str())
+        }) {
+            return false;
+        }
+        pending.push(PendingKeyTransaction {
+            transaction_id: Some(transaction_id),
+            entry,
+        });
+        true
     }
 
     /// 待打包密钥交易数量。
@@ -41,9 +92,37 @@ impl Chain {
         self.pending_key_tx.read().len()
     }
 
+    /// 从持久账本恢复待打包密钥交易，并按 transaction_id 去重保留首次接受顺序。
+    pub fn load_pending_key_transactions(
+        &self,
+        txs: impl IntoIterator<Item = (String, KeyTransactionEntry)>,
+    ) {
+        let mut pending = self.pending_key_tx.write();
+        pending.clear();
+        for (transaction_id, entry) in txs {
+            if pending.iter().all(|transaction| {
+                transaction.transaction_id.as_deref() != Some(transaction_id.as_str())
+            }) {
+                pending.push(PendingKeyTransaction {
+                    transaction_id: Some(transaction_id),
+                    entry,
+                });
+            }
+        }
+    }
+
     /// 加载待打包密钥交易(从存储恢复)。
+    ///
+    /// 这是原有公开 API 的兼容 wrapper。其条目没有身份账本 sidecar，故挖矿结果中
+    /// 对应位置的 `identity_transaction_ids` 为 `None`。
     pub fn load_pending_key_tx(&self, txs: Vec<KeyTransactionEntry>) {
-        *self.pending_key_tx.write() = txs;
+        *self.pending_key_tx.write() = txs
+            .into_iter()
+            .map(|entry| PendingKeyTransaction {
+                transaction_id: None,
+                entry,
+            })
+            .collect();
     }
 
     /// 加入一条待打包语义目录记录。
@@ -177,10 +256,41 @@ impl Chain {
         }
     }
 
-    /// 回滚尚未完成持久化的挖矿结果。
+    /// 回滚由原有公开 `mine_block` 返回的区块。
     ///
-    /// 挖矿和 SQLite 写入不是同一事务；调用方必须只在 save_block 失败时调用此方法。
+    /// 兼容 API 创建的 key transaction 没有持久身份账本 sidecar，因此会作为普通
+    /// 待打包条目恢复。
     pub fn rollback_mined_block(&self, block: &Block) -> bool {
+        self.rollback_mined_block_with_sidecars(
+            block,
+            std::iter::repeat_with(|| None).take(block.key_transactions.len()),
+        )
+    }
+
+    /// 回滚尚未完成持久化的带身份账本 sidecar 挖矿结果。
+    ///
+    /// 挖矿和 SQLite 写入不是同一事务；handlers 与 CLI 必须只在
+    /// `Storage::commit_block` 失败时调用此显式协调接口。每条 ID 都与其原始
+    /// key transaction 一同按顺序恢复。sidecar 数量与 key transaction 数量不一致时
+    /// 返回 `false`，且不修改内存链或任何 pending 队列。
+    pub fn rollback_mined_block_with_identity_transaction_ids(&self, mined: &MinedBlock) -> bool {
+        // 先验证 sidecar 与区块密钥交易逐项对齐，避免 `zip` 静默截断后已移除
+        // 链块或恢复不完整的 pending 队列。
+        if mined.identity_transaction_ids.len() != mined.block.key_transactions.len() {
+            return false;
+        }
+
+        self.rollback_mined_block_with_sidecars(
+            &mined.block,
+            mined.identity_transaction_ids.iter().cloned(),
+        )
+    }
+
+    fn rollback_mined_block_with_sidecars(
+        &self,
+        block: &Block,
+        sidecars: impl IntoIterator<Item = Option<String>>,
+    ) -> bool {
         let mut blocks = self.blocks.write();
         let is_latest = blocks
             .last()
@@ -198,9 +308,17 @@ impl Chain {
         *pending = restored;
         drop(pending);
 
-        // 一并回滚密钥交易,放回待打包队列头部,保持与元数据回滚一致的语义。
         let mut pending_key_tx = self.pending_key_tx.write();
-        let mut restored_tx = block.key_transactions.clone();
+        let mut restored_tx = block
+            .key_transactions
+            .iter()
+            .cloned()
+            .zip(sidecars)
+            .map(|(entry, transaction_id)| PendingKeyTransaction {
+                transaction_id,
+                entry,
+            })
+            .collect::<Vec<_>>();
         restored_tx.append(&mut *pending_key_tx);
         *pending_key_tx = restored_tx;
         drop(pending_key_tx);
@@ -212,8 +330,20 @@ impl Chain {
         true
     }
 
-    /// 挖掘新区块
+    /// 挖掘新区块。
+    ///
+    /// 这是原有公开 API。它只返回不可变的 `Block`，不会暴露身份账本 sidecar。
     pub fn mine_block(&self) -> Result<Block> {
+        self.mine_block_with_identity_transaction_ids()
+            .map(|mined| mined.block)
+    }
+
+    /// 挖掘新区块，并返回身份账本协调所需的 sidecar。
+    ///
+    /// handlers 与 CLI 必须使用此接口，并仅将返回的
+    /// `identity_transaction_ids` 传给 `Storage::commit_block`。ID 不写入区块，
+    /// 因此不会改变既有 JSON、签名或 Merkle 负载。
+    pub fn mine_block_with_identity_transaction_ids(&self) -> Result<MinedBlock> {
         let blocks = self.blocks.read();
         if blocks.is_empty() {
             return Err(DataChainError::ChainNotInitialized);
@@ -237,8 +367,16 @@ impl Chain {
             new_block.add_metadata(entry);
         }
 
-        // 并入全部待打包密钥交易(backlog L1);它们会进入 merkle_root 受哈希保护。
-        new_block.key_transactions = pending_key_tx.drain(..).collect();
+        // sidecar 仅留在协调结果中，绝不进入区块序列化或 Merkle 负载。
+        let pending_key_transactions = pending_key_tx.drain(..).collect::<Vec<_>>();
+        let identity_transaction_ids = pending_key_transactions
+            .iter()
+            .map(|transaction| transaction.transaction_id.clone())
+            .collect::<Vec<_>>();
+        new_block.key_transactions = pending_key_transactions
+            .into_iter()
+            .map(|transaction| transaction.entry)
+            .collect();
         // 并入完整语义目录记录;其 leaf_hash 覆盖完整 Subject/Revision/Artifact/Claim 内容。
         new_block.catalog_records = pending_catalog.drain(..).collect();
 
@@ -254,7 +392,10 @@ impl Chain {
         let mut blocks = self.blocks.write();
         blocks.push(new_block.clone());
 
-        Ok(new_block)
+        Ok(MinedBlock {
+            block: new_block,
+            identity_transaction_ids,
+        })
     }
 
     /// 添加区块（用于同步）
@@ -482,22 +623,68 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mining_returns_only_the_ids_of_entries_in_the_block_and_rolls_back_together() {
+    fn legacy_load_pending_key_tx_wrapper_restores_entries_without_identity_sidecars() {
         let chain = Chain::new(1, 100);
         chain.init();
         let entry = pending_identity_entry();
 
+        chain.load_pending_key_tx(vec![entry.clone()]);
+        let mined = chain.mine_block_with_identity_transaction_ids().unwrap();
+
+        assert_eq!(mined.block.key_transactions, vec![entry]);
+        assert_eq!(mined.identity_transaction_ids, vec![None]);
+    }
+
+    #[test]
+    fn sidecar_mining_keeps_an_aligned_mapping_for_mixed_key_transactions_and_rolls_back_together() {
+        let chain = Chain::new(1, 100);
+        chain.init();
+        let entry = pending_identity_entry();
+        let mut legacy_entry = pending_identity_entry();
+        legacy_entry.target_key = "key-legacy".to_string();
+        legacy_entry.signed_by = "key-legacy".to_string();
+
+        chain.add_key_transaction(legacy_entry.clone());
         assert!(chain.add_pending_key_transaction("tx-a".to_string(), entry.clone()));
         let mined = chain.mine_block_with_identity_transaction_ids().unwrap();
-        assert_eq!(mined.identity_transaction_ids, vec!["tx-a"]);
-        assert_eq!(mined.block.key_transactions, vec![entry]);
+        assert_eq!(mined.identity_transaction_ids, vec![None, Some("tx-a".to_string())]);
+        assert_eq!(mined.block.key_transactions, vec![legacy_entry, entry]);
 
         assert!(chain.rollback_mined_block_with_identity_transaction_ids(&mined));
         assert_eq!(chain.get_block_count(), 1);
-        assert_eq!(chain.get_pending_key_tx_count(), 1);
+        assert_eq!(chain.get_pending_key_tx_count(), 2);
 
         let remine = chain.mine_block_with_identity_transaction_ids().unwrap();
-        assert_eq!(remine.identity_transaction_ids, vec!["tx-a"]);
-        assert_eq!(remine.block.key_transactions.len(), 1);
+        assert_eq!(
+            remine.identity_transaction_ids,
+            vec![None, Some("tx-a".to_string())]
+        );
+        assert_eq!(remine.block.key_transactions.len(), 2);
+    }
+
+    #[test]
+    fn sidecar_rollback_rejects_misaligned_sidecars_without_changing_chain_or_pending_transactions() {
+        let chain = Chain::new(1, 100);
+        chain.init();
+        let entry = pending_identity_entry();
+        assert!(chain.add_pending_key_transaction("tx-a".to_string(), entry));
+        let mut mined = chain.mine_block_with_identity_transaction_ids().unwrap();
+
+        let mut later_entry = pending_identity_entry();
+        later_entry.target_key = "key-later".to_string();
+        later_entry.signed_by = "key-later".to_string();
+        assert!(chain.add_pending_key_transaction("tx-later".to_string(), later_entry.clone()));
+        mined.identity_transaction_ids.clear();
+
+        assert!(!chain.rollback_mined_block_with_identity_transaction_ids(&mined));
+        assert_eq!(chain.get_block_count(), 2);
+        assert_eq!(chain.get_pending_key_tx_count(), 1);
+
+        let next_mined = chain.mine_block_with_identity_transaction_ids().unwrap();
+        assert_eq!(next_mined.block.key_transactions, vec![later_entry]);
+        assert_eq!(
+            next_mined.identity_transaction_ids,
+            vec![Some("tx-later".to_string())]
+        );
     }
 }

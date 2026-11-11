@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderValue, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -36,6 +36,9 @@ async fn build_state(dsn: &str) -> (AppState, Arc<datachain::storage::Storage>) 
     } else {
         chain.load_blocks(blocks);
     }
+    datachain::cli::server::recover_pending_identity_transactions(&chain, &storage)
+        .await
+        .unwrap();
 
     let auth_service = create_auth_service(JWT_SECRET.to_string(), 24, storage.clone());
     for user in storage.get_all_users().await.unwrap() {
@@ -80,6 +83,7 @@ async fn build_state(dsn: &str) -> (AppState, Arc<datachain::storage::Storage>) 
         rate_limiter,
         anchor_service,
         claim_resolver: Arc::new(datachain::catalog::ClaimResolver::new(Default::default())),
+        identity_tx_gate: Arc::new(tokio::sync::Mutex::new(())),
     };
     (state, storage)
 }
@@ -779,5 +783,577 @@ async fn effective_claims_api_applies_trusted_issuer_policy() {
     assert_eq!(
         result["data"]["effective_claims"][0]["claim"]["claim_id"],
         "policy-risk"
+    );
+}
+
+#[tokio::test]
+async fn identity_key_transaction_idempotency_key_replays_pending_then_committed() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let id = NodeIdentity::generate("idempotency-node");
+    let body = signed_key_tx_body("register", &id, "node");
+
+    let request = |body: Value| {
+        let mut request = post("/api/v1/identity/key-transaction", Some(&token), body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", "identity-retry-1".parse().unwrap());
+        request
+    };
+
+    let first = router.clone().oneshot(request(body.clone())).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = body_json(first).await;
+    let transaction_id = first_body["data"]["transaction_id"]
+        .as_str()
+        .expect("首次 pending 响应必须包含 transaction_id")
+        .to_string();
+
+    let replay = router.clone().oneshot(request(body.clone())).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        body_json(replay).await["data"]["transaction_id"],
+        transaction_id
+    );
+
+    let mined = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(mined.status(), StatusCode::CREATED);
+
+    let committed = router.oneshot(request(body)).await.unwrap();
+    assert_eq!(committed.status(), StatusCode::OK);
+    assert_eq!(body_json(committed).await["data"]["status"], "committed");
+}
+
+#[tokio::test]
+async fn identity_key_transaction_idempotency_ignores_unsigned_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let identity = NodeIdentity::generate("idempotency-reason");
+    let body = signed_key_tx_body("register", &identity, "node");
+    let mut body_with_different_reason = body.clone();
+    body_with_different_reason["reason"] = Value::String("retry context".to_string());
+
+    let request = |body: Value| {
+        let mut request = post("/api/v1/identity/key-transaction", Some(&token), body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", "identity-reason-1".parse().unwrap());
+        request
+    };
+
+    let first = router.clone().oneshot(request(body)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let transaction_id = body_json(first).await["data"]["transaction_id"]
+        .as_str()
+        .expect("首次 pending 响应必须包含 transaction_id")
+        .to_string();
+
+    let replay = router
+        .oneshot(request(body_with_different_reason))
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::ACCEPTED,
+        "仅未签名 reason 不同的重试应复用原交易"
+    );
+    assert_eq!(
+        body_json(replay).await["data"]["transaction_id"],
+        transaction_id,
+        "同一已签名规范化负载必须复用同一 transaction_id"
+    );
+}
+
+#[tokio::test]
+async fn identity_key_transaction_reused_key_with_different_request_returns_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let first_identity = NodeIdentity::generate("first-identity");
+    let second_identity = NodeIdentity::generate("second-identity");
+
+    let keyed_request = |body: Value| {
+        let mut request = post("/api/v1/identity/key-transaction", Some(&token), body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", "identity-conflict-1".parse().unwrap());
+        request
+    };
+
+    let first = router
+        .clone()
+        .oneshot(keyed_request(signed_key_tx_body(
+            "register",
+            &first_identity,
+            "node",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let conflict = router
+        .clone()
+        .oneshot(keyed_request(signed_key_tx_body(
+            "register",
+            &second_identity,
+            "node",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        conflict.status(),
+        StatusCode::CONFLICT,
+        "同一认证用户不得以相同 Idempotency-Key 提交不同签名请求"
+    );
+
+    let mined = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(mined.status(), StatusCode::CREATED);
+
+    let keys = router
+        .oneshot(get("/api/v1/identity/keys", Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(keys.status(), StatusCode::OK);
+    let keys = body_json(keys).await;
+    let keys = keys["data"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "冲突请求不得进入待打包队列");
+    assert_eq!(keys[0]["public_key"], first_identity.public_key_base64());
+}
+
+#[tokio::test]
+async fn identity_key_transaction_without_idempotency_key_retains_accepted_pending_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let identity = NodeIdentity::generate("no-key-identity");
+    let body = signed_key_tx_body("register", &identity, "node");
+
+    let first = router
+        .clone()
+        .oneshot(post(
+            "/api/v1/identity/key-transaction",
+            Some(&token),
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = body_json(first).await;
+
+    let second = router
+        .clone()
+        .oneshot(post("/api/v1/identity/key-transaction", Some(&token), body))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    let second_body = body_json(second).await;
+    assert_ne!(
+        first_body["data"]["transaction_id"], second_body["data"]["transaction_id"],
+        "无 Idempotency-Key 的兼容路径不提供去重保证"
+    );
+
+    let mined = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(mined.status(), StatusCode::CREATED);
+    let keys = router
+        .oneshot(get("/api/v1/identity/keys", Some(&token)))
+        .await
+        .unwrap();
+    let keys = body_json(keys).await;
+    assert_eq!(keys["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn identity_key_transaction_concurrent_same_key_creates_one_pending_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let identity = NodeIdentity::generate("concurrent-identity");
+    let body = signed_key_tx_body("register", &identity, "node");
+
+    let keyed_request = |body: Value| {
+        let mut request = post("/api/v1/identity/key-transaction", Some(&token), body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", "identity-concurrent-1".parse().unwrap());
+        request
+    };
+    let (first, second) = tokio::join!(
+        router.clone().oneshot(keyed_request(body.clone())),
+        router.clone().oneshot(keyed_request(body)),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        body_json(first).await["data"]["transaction_id"],
+        body_json(second).await["data"]["transaction_id"],
+        "并发同 key 必须收敛到同一 pending 账本交易"
+    );
+
+    let mined = router
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(mined.status(), StatusCode::CREATED);
+    let mined = body_json(mined).await;
+    assert_eq!(
+        mined["data"]["key_transactions"].as_array().unwrap().len(),
+        1,
+        "同 key 并发重试不得产生第二条已入块身份交易"
+    );
+}
+
+#[tokio::test]
+async fn identity_key_transaction_restart_recovers_pending_for_mining() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let dsn = dsn.to_str().unwrap();
+    let identity = NodeIdentity::generate("restart-identity");
+    let body = signed_key_tx_body("register", &identity, "node");
+
+    {
+        let (state, _) = build_state(dsn).await;
+        seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+        let router = api::create_router(state);
+        let token = login(router.clone(), "admin", "adminpass123").await;
+        let response = router
+            .oneshot(post(
+                "/api/v1/identity/key-transaction",
+                Some(&token),
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let (state, _) = build_state(dsn).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let mined = router
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(
+        mined.status(),
+        StatusCode::CREATED,
+        "重启后应恢复持久化 pending 身份交易并允许挖矿"
+    );
+    let keys = router
+        .oneshot(get("/api/v1/identity/keys", Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(keys.status(), StatusCode::OK);
+    let keys = body_json(keys).await;
+    assert_eq!(keys["data"].as_array().unwrap().len(), 1);
+    assert_eq!(keys["data"][0]["public_key"], identity.public_key_base64());
+}
+
+#[tokio::test]
+async fn identity_transaction_remains_pending_when_another_app_state_mines_only_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("shared-state.sqlite");
+    let dsn = dsn.to_str().unwrap();
+
+    // 两个 AppState 在 t1 被 A 接受之前就已启动，因此 B 的内存队列只应包含它自己接受的条目。
+    let (state_a, _) = build_state(dsn).await;
+    seed_user(&state_a, "admin", "adminpass123", Role::Admin).await;
+    let router_a = api::create_router(state_a);
+    let token_a = login(router_a.clone(), "admin", "adminpass123").await;
+
+    let (state_b, _) = build_state(dsn).await;
+    let router_b = api::create_router(state_b);
+    let token_b = login(router_b.clone(), "admin", "adminpass123").await;
+
+    let identity = NodeIdentity::generate("shared-state-identity");
+    let key_body = signed_key_tx_body("register", &identity, "node");
+    let keyed_request = |body: Value| {
+        let mut request = post("/api/v1/identity/key-transaction", Some(&token_a), body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", "shared-state-t1".parse().unwrap());
+        request
+    };
+
+    let accepted = router_a
+        .clone()
+        .oneshot(keyed_request(key_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let transaction_id = body_json(accepted).await["data"]["transaction_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let metadata = router_b
+        .clone()
+        .oneshot(post(
+            "/api/v1/metadata",
+            Some(&token_b),
+            serde_json::json!({"data_size":1,"owner":"admin","hashes":{"sha256":"metadata"},"metadata":{},"tags":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), StatusCode::CREATED);
+
+    let mined_by_b = router_b
+        .clone()
+        .oneshot(post("/api/v1/chain/mine", Some(&token_b), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(mined_by_b.status(), StatusCode::CREATED);
+    let mined_by_b = body_json(mined_by_b).await;
+    assert!(
+        mined_by_b["data"]["key_transactions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "B 的区块不得包含仅在 A 内存队列中的 t1"
+    );
+
+    let still_pending = router_a
+        .clone()
+        .oneshot(keyed_request(key_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(still_pending.status(), StatusCode::ACCEPTED);
+    let still_pending = body_json(still_pending).await;
+    assert_eq!(still_pending["data"]["transaction_id"], transaction_id);
+    assert_eq!(still_pending["data"]["status"], "pending");
+
+    // 模拟 A 重启：从账本恢复 t1 后，它应只被打包一次。
+    drop(router_a);
+    drop(router_b);
+    let (restarted_a, _) = build_state(dsn).await;
+    let restarted_router = api::create_router(restarted_a);
+    let restarted_token = login(restarted_router.clone(), "admin", "adminpass123").await;
+    let mined_by_restarted_a = restarted_router
+        .clone()
+        .oneshot(post(
+            "/api/v1/chain/mine",
+            Some(&restarted_token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mined_by_restarted_a.status(), StatusCode::CREATED);
+    let mined_by_restarted_a = body_json(mined_by_restarted_a).await;
+    let key_transactions = mined_by_restarted_a["data"]["key_transactions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(key_transactions.len(), 1, "重启后 t1 应恰好入块一次");
+    assert_eq!(
+        key_transactions[0]["target_key"],
+        identity.public_key_base64()
+    );
+
+    let committed = restarted_router
+        .oneshot(keyed_request(key_body))
+        .await
+        .unwrap();
+    assert_eq!(committed.status(), StatusCode::OK);
+    assert_eq!(body_json(committed).await["data"]["status"], "committed");
+}
+
+#[tokio::test]
+async fn idempotency_key_is_scoped_to_user_and_blank_values_do_not_deduplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("idempotency-scope.sqlite");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "alice", "alicepass123", Role::Admin).await;
+    seed_user(&state, "bob", "bobpass123456", Role::Admin).await;
+    let router = api::create_router(state);
+    let alice_token = login(router.clone(), "alice", "alicepass123").await;
+    let bob_token = login(router.clone(), "bob", "bobpass123456").await;
+    let identity = NodeIdentity::generate("idempotency-scope");
+    let body = signed_key_tx_body("register", &identity, "node");
+
+    let keyed_request = |token: &str, key: &str| {
+        let mut request = post(
+            "/api/v1/identity/key-transaction",
+            Some(token),
+            body.clone(),
+        );
+        request
+            .headers_mut()
+            .insert("idempotency-key", key.parse().unwrap());
+        request
+    };
+
+    let alice = router
+        .clone()
+        .oneshot(keyed_request(&alice_token, "same-key"))
+        .await
+        .unwrap();
+    let bob = router
+        .clone()
+        .oneshot(keyed_request(&bob_token, "same-key"))
+        .await
+        .unwrap();
+    assert_eq!(alice.status(), StatusCode::ACCEPTED);
+    assert_eq!(bob.status(), StatusCode::ACCEPTED);
+    assert_ne!(
+        body_json(alice).await["data"]["transaction_id"],
+        body_json(bob).await["data"]["transaction_id"],
+        "不同用户可独立使用相同 Idempotency-Key"
+    );
+
+    let blank_first = router
+        .clone()
+        .oneshot(keyed_request(&alice_token, "   "))
+        .await
+        .unwrap();
+    let blank_second = router
+        .oneshot(keyed_request(&alice_token, "\t"))
+        .await
+        .unwrap();
+    assert_eq!(blank_first.status(), StatusCode::ACCEPTED);
+    assert_eq!(blank_second.status(), StatusCode::ACCEPTED);
+    assert_ne!(
+        body_json(blank_first).await["data"]["transaction_id"],
+        body_json(blank_second).await["data"]["transaction_id"],
+        "空白 Idempotency-Key 应视为未提供"
+    );
+}
+
+#[tokio::test]
+async fn non_ascii_idempotency_key_is_treated_as_missing_and_cors_preflight_allows_the_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("idempotency-header.sqlite");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let identity = NodeIdentity::generate("idempotency-header");
+    let body = signed_key_tx_body("register", &identity, "node");
+
+    let non_ascii_request = || {
+        let mut request = post(
+            "/api/v1/identity/key-transaction",
+            Some(&token),
+            body.clone(),
+        );
+        request.headers_mut().insert(
+            "idempotency-key",
+            HeaderValue::from_bytes(&[0xff]).expect("obs-text 是合法 HTTP header value"),
+        );
+        request
+    };
+    let first = router.clone().oneshot(non_ascii_request()).await.unwrap();
+    let second = router.clone().oneshot(non_ascii_request()).await.unwrap();
+    assert_eq!(
+        first.status(),
+        StatusCode::ACCEPTED,
+        "非 ASCII Idempotency-Key 应视为未提供并正常接受"
+    );
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    assert_ne!(
+        body_json(first).await["data"]["transaction_id"],
+        body_json(second).await["data"]["transaction_id"],
+        "非 ASCII Idempotency-Key 不得触发幂等去重"
+    );
+
+    let preflight = Request::builder()
+        .method("OPTIONS")
+        .uri("/api/v1/identity/key-transaction")
+        .header("origin", "http://localhost:3000")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type,idempotency-key",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let preflight = router.oneshot(preflight).await.unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let allowed_headers = preflight
+        .headers()
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(allowed_headers
+        .to_ascii_lowercase()
+        .contains("idempotency-key"));
+}
+
+#[tokio::test]
+async fn failed_identity_transaction_commit_rolls_back_the_mined_block_and_pending_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("identity-commit-rollback.sqlite");
+    let (state, storage) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "admin", "adminpass123", Role::Admin).await;
+    let chain = state.chain.clone();
+    let router = api::create_router(state);
+    let token = login(router.clone(), "admin", "adminpass123").await;
+    let identity = NodeIdentity::generate("identity-commit-rollback");
+    let body = signed_key_tx_body("register", &identity, "node");
+    let mut request = post("/api/v1/identity/key-transaction", Some(&token), body);
+    request
+        .headers_mut()
+        .insert("idempotency-key", "rollback-t1".parse().unwrap());
+    let accepted = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let transaction_id = body_json(accepted).await["data"]["transaction_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 用公开 Storage API 将账本行抢先转换为 committed，构造 handler 的原子提交失败点。
+    // sidecar 必须与区块内条目配对，才能模拟另一实例合法完成的提交。
+    let transaction = storage
+        .get_identity_transaction(&transaction_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut conflicting_block = datachain::core::Block::new(99, "0".repeat(64), 1);
+    conflicting_block.key_transactions.push(transaction.entry);
+    conflicting_block.hash = "external-commit".to_string();
+    storage
+        .commit_block(&conflicting_block, &[Some(transaction_id)])
+        .await
+        .unwrap();
+
+    let failed_mine = router
+        .oneshot(post("/api/v1/chain/mine", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(failed_mine.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(chain.get_block_count(), 1, "失败不得留下内存区块");
+    assert_eq!(
+        chain.get_pending_key_tx_count(),
+        1,
+        "失败后 identity pending 队列必须恢复"
     );
 }

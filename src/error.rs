@@ -47,6 +47,9 @@ pub enum DataChainError {
     #[error("存储错误: {0}")]
     StorageError(String),
 
+    #[error("幂等键已用于不同的身份交易请求")]
+    IdentityTransactionConflict,
+
     #[error("配置错误: {0}")]
     ConfigError(String),
 
