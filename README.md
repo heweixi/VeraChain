@@ -5,6 +5,7 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 > **最后核实：2026-11-10**
 >
 > - ✅ 链完整性校验：`validate_chain` 与 `validate_loaded_blocks` 共用同一显式门禁；恢复遇到损坏区块会失败关闭，不加载、修复或写回该库。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。
+> - ⚠️ **未验证声明(分支 `feat/data-corruption-policy`，2026-11-11)**：数据损坏处置策略（见下文"数据损坏处置"）的代码**未编译、未测试**（本机无 Rust 工具链，247 根分区已满无法运行 docker）。上面的 107 passed 仅适用于基线 `96d08e8`，**不覆盖本分支改动**；仅有 reviewer 两轮读代码审查，待 247 恢复后补跑 `cargo test`/`fmt`/`clippy`。
 > - 实现状态与未完成需求见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。该文档是本独立仓库的状态入口。
 
 ## 适用场景
@@ -34,6 +35,20 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 - ⚠️ **语义目录的治理能力未完成。** Claim 集中分类字典、动态认证机构治理与跨机构争议裁决尚未实现。
 
 完整限制、证据和后续项以 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) 为准。
+
+## 数据损坏处置（`feat/data-corruption-policy`，⚠️ 未编译未测试）
+
+- 新增 `DataChainError::DataCorruption{category,table,key,reason}`；`reason` 为固定词表，不回显行内容、`password_hash` 或 JSON 片段。
+- 权威源 fail-closed：blocks、users、versions、pending metadata、pending catalog、anchor_outbox（全表扫描，未知 status 报错，不再当 pending）、aggregations（由调度器写入，非纯区块导出，不重建）。
+- 可重建投影：metadata、catalog_subjects/revisions/artifacts/claims。启动时在链完整校验通过后检测（行数 + 可解析性），不一致则单事务清表并按区块重放。
+- 启动时序：链校验 → 权威源只读扫描（先于 pending 去重、投影重建、backfill、purge 等写）→ 投影检测重建 → 继续；空库会先写创世块。
+- CLI 退出码：`0` 成功 / `1` 其他错误 / `2` 链无效 / `3` 数据损坏。`chain`/`metadata`/`aggregate`/`status` 统一走完整链校验。
+  - 🔺 **破坏性变更**：`chain validate` 在链无效时原退出码为 `0`，现为 `2`；数据损坏为 `3`。依赖旧行为的脚本需调整。
+  - `chain mine` 改用 `commit_block`，同事务写投影。
+- HTTP：`POST /api/v1/chain/validate` 保留 `valid`/`block_count`，新增可选 `corruption`、`invalid_block`（仅异常时出现），状态码仍为 200；`login`/`refresh` 遇数据损坏返回 `500`（原 `login` 会返回 401）。
+- 已知限制：投影检测不发现"合法但被篡改"的内容；p2p `import_blocks` 仍用 `save_block` 不写投影（依赖下次启动重建兜底）；其他业务端点的 500 body 含 table/key（无行内容），未按设计收窄；未提供 `storage check`/`rebuild-projections` 命令；旧用户/版本表兼容迁移未做。
+
+详情与状态标记见 [IMPLEMENTATION_STATUS.md §2.6](IMPLEMENTATION_STATUS.md) 与 `docs/superpowers/specs/2026-11-11-data-corruption-policy-design.md`。
 
 ## 架构与模块入口
 

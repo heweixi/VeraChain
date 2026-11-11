@@ -7,6 +7,7 @@
 > 可信根逐步来自把数据、身份及完整语义目录记录锚定到多个外部去中心化公共链。外链→本链的认证走正常上链路径(无特殊逻辑)。分层:L0 单链锚定(R5✅)
 > → L1 链上身份(✅ `8b5ecf1`)→ 语义目录基础(✅ `d97cd94`)→ Claim resolver(✅ 本次提交)→ L2 多外链批次锚定 → L3 回执回写 → L4 失信切换 → L5 自身失信封存重启(人工触发)。
 > 关键提交:R1 安全(fe93939 系列)、R5 跨链(4cf84f8)、R3 递归聚合(3c76ee4)、R2 原子提交(619e0eb)、R4 快照复核(095d1cd)、R6 P2P 广播/发现(4395546)、R7 集成测试(c90c65a)、backlog #4 WebSocket 集成测试(97eeee5)、backlog #3 refresh 持久化(1124baa)、语义目录(d97cd94)。
+> **⚠️ 本分支(`feat/data-corruption-policy`,HEAD `d82fa21`,基于 `fix/chain-integrity-validation` `96d08e8`)未验证声明**:数据损坏处置策略(见 §2.4「数据损坏处理」与 §2.6)的代码**尚未编译、尚未运行任何测试**(本机无 Rust 工具链;247 根分区 100% 满,无法运行 docker)。此前文档中各处"107 passed"是 `96d08e8` 及更早基线的验证结果,**不适用于本分支新增改动**,本分支不存在新的通过计数。已有证据仅为 reviewer 两轮读代码审查(最终无 Important 级问题),不等同于编译/测试通过。待 247 恢复后补跑 `cargo test` / `cargo fmt --check` / `cargo clippy --all-targets`。设计见 `docs/superpowers/specs/2026-11-11-data-corruption-policy-design.md`。
 > 状态标记:✅已实现 / ⚠️部分实现 / 🔺设计与实现有差异 / ⏳未实现 / 🧩预留能力 / 🗑️已废弃。
 > 本文档基于源码、README、配置、Docker/Compose 和原 monorepo 的设计基线核查。
 
@@ -42,7 +43,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 注册/登录/刷新 token | ✅ `1124baa`/247 已验证 | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。设备会话管理仍未做(单 family 不区分设备) |
 | 元数据创建/查询 | ✅ `b239df6`/247 已验证 | 创建(写路径)仍入链 pending(权威源);查询(读路径)走独立 `metadata` 投影表(migration 005),owner/时间下推 SQL、tag/分页应用层过滤,不再扫链。投影由 commit_block 同事务 upsert + 启动/CLI 代码级回填保证与区块一致。边界:只覆盖已上链元数据,pending 不出现在查询结果 |
 | 可验证语义目录 | ✅ 本次提交/247 端到端已验证 | `POST /api/v1/catalog/records` 提交由已上链有效身份公钥签名的 Subject/Revision/Artifact/Claim；校验对象关系、主标识唯一性与 Claim 证据/时间范围，记录进入普通新区块的 `catalog_records` 并作为完整语义 Merkle 叶子。原始 Claim 历史可查；`GET /catalog/subjects/:id/effective-claims` 按配置可信认证者、分类授权、权重、有效时间和覆盖关系解析有效结论，同权重不同状态返回 conflicts，未配可信认证者默认 fail-closed。边界:无集中分类字典和动态认证机构治理 |
-| 区块列表/详情/挖矿/验证 | ✅ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误)。`validate_chain` 与 `validate_loaded_blocks` 复用同一私有完整性门禁：非空链校验创世 index/previous_hash、连续 index、每块保存 hash、块自身 difficulty PoW、previous hash 及按既有 metadata/key transaction/catalog record 规则计算的 Merkle root；空内存链校验返回 `false`。HTTP validate 保持 200/success/data.valid bool，缺 token 为 401；CLI `chain validate` 保持有效/无效输出且无效仍成功退出。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
+| 区块列表/详情/挖矿/验证 | ✅ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误)。`validate_chain` 与 `validate_loaded_blocks` 复用同一私有完整性门禁：非空链校验创世 index/previous_hash、连续 index、每块保存 hash、块自身 difficulty PoW、previous hash 及按既有 metadata/key transaction/catalog record 规则计算的 Merkle root；空内存链校验返回 `false`。HTTP validate 保持 200/success/data.valid bool，缺 token 为 401；CLI `chain validate` 保持有效/无效输出(基线无效仍成功退出;**本分支起无效退出码为 2、损坏为 3,见 §2.3/§2.6,未验证**)。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
 | Merkle proof | ✅ `4cf84f8`/247 已验证 | 旧 `get_proof` 保留;新增 `GET /api/v1/crosschain/proof/:data_id`,经 `MerkleTree::get_structured_proof` 返回 leaf/index/siblings/sibling_is_left/root,服务端校验 `root==block.merkle_root` 且 `verify_structured_proof`;目标链可独立验证 data→root。处理奇数叶子自配对 |
 | 跨链锚定(ChainAnchor/AnchorReceipt) | ✅ `4cf84f8`/247 已验证 | `src/crosschain.rs`:`POST /api/v1/crosschain/anchor/:data_id` 由 Merkle proof 生成 ed25519 签名锚定并写入 `anchor_outbox`(pending);后台 worker 带重试投递(`HttpAttestationConnector`),成功记录 `AnchorReceipt`;`GET /crosschain/anchor/status/:id` 查状态;`GET /crosschain/identity` 返回节点公钥。进程重启可从 outbox 恢复未投递锚定 |
 | 节点签名身份 | ✅ `4cf84f8`/247 已验证 | `src/node_signing.rs`:ed25519 密钥对(生成/base64 种子恢复/签名/验签);配置 `DATACHAIN_NODE_SECRET` 持久化,未配置则启动随机生成并打印公钥 |
@@ -70,8 +71,10 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | Block/Chain/PoW/Merkle | ✅ `d97cd94` | 现有 metadata 叶子保持 `SHA256(data_id)` 兼容旧链；L1 key_tx 与新目录记录(`catalog_records`)的完整规范化语义均进入 merkle_root，受区块哈希/PoW 保护。旧 metadata 的完整字段仍非 Merkle 语义承诺，历史区块不重写 |
-| 启动恢复 | ✅ | server 从 SQLite 恢复 blocks/users/versions；对已加载的非空 blocks 在恢复前由 `validate_loaded_blocks` 复用 `validate_chain` 的私有完整性门禁，校验创世 index/previous_hash、连续 index、保存 hash、块自身 difficulty PoW、previous hash 与既有 metadata/key transaction/catalog record 叶子规则下的 Merkle root。损坏块会使启动失败关闭，不加载、修复或写回数据库；空库首次启动仍初始化创世块。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
-| 链验证 | ✅ | `Chain::validate_chain` 与加载区块验证复用同一私有完整性门禁。非空链校验创世 index/previous_hash、连续 index、保存 hash、块自身 difficulty PoW、previous hash 及按既有 metadata/key transaction/catalog record 叶子规则计算的 Merkle root；不改变当前 Chain difficulty 比较、Hash/Merkle 协议、P2P、路由或自动修复。空内存链返回 `false`。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
+| 启动恢复(本分支时序重排) | ⚠️ 代码已写/未编译未测试 | 本分支(`d82fa21`)把启动时序改为:打开 DB+migrations → `get_all_blocks` 严格解析 → `validate_loaded_blocks` → **权威源只读扫描**(users→versions→pending metadata→pending catalog→anchor_outbox→aggregations,任一损坏 fail-closed)→ pending 去重 → `ensure_projections`(投影检测与重建)→ backfill 等后续写。扫描发生在去重、投影重建、backfill、purge 等**写操作之前**,损坏时不改库。例外:空库首次启动会先写创世块。入口 `scan_authoritative_sources_and_ensure_projections`(`src/cli/server.rs`)。验证:未编译、未测试;仅 reviewer 读代码审查。 |
+| 启动恢复(基线) | ✅(`fix/chain-integrity-validation`,本分支基于它) | server 从 SQLite 恢复 blocks/users/versions；对已加载的非空 blocks 在恢复前由 `validate_loaded_blocks` 复用 `validate_chain` 的私有完整性门禁，校验创世 index/previous_hash、连续 index、保存 hash、块自身 difficulty PoW、previous hash 与既有 metadata/key transaction/catalog record 叶子规则下的 Merkle root。损坏块会使启动失败关闭，不加载、修复或写回数据库；空库首次启动仍初始化创世块。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
+| 链验证(CLI 统一校验,本分支) | 🔺 破坏性变更 / 未编译未测试 | `chain`/`metadata`/`aggregate`/`status` 等链相关命令统一经 `load_verified_chain`(读区块→`validate_loaded_blocks`→加载),此前除 `chain validate` 外均不校验直接 `load_blocks`。退出码约定:0 成功 / 1 其他错误 / 2 链无效 / 3 数据损坏。**🔺 `chain validate` 链无效原退出码为 0,现为 2;损坏为 3**(依赖旧行为的脚本需调整)。CLI `chain mine` 由 `save_block` 改为 `commit_block`,在同事务写 metadata/catalog 投影。验证:未编译、未测试(`tests/data_corruption_cli.rs` 已写未运行);`tests/chain_validation_cli.rs` 已随退出码变更修改,同样未运行。 |
+| 链验证(基线) | ✅ | `Chain::validate_chain` 与加载区块验证复用同一私有完整性门禁。非空链校验创世 index/previous_hash、连续 index、保存 hash、块自身 difficulty PoW、previous hash 及按既有 metadata/key transaction/catalog record 叶子规则计算的 Merkle root；不改变当前 Chain difficulty 比较、Hash/Merkle 协议、P2P、路由或自动修复。空内存链返回 `false`。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。 |
 | pending 原子性 | ✅ 247 已验证 | pending metadata 已 SQLite 持久化(进程退出不丢);挖矿经 `Storage::commit_block` 在同一事务内原子写区块+删对应 pending,失败回滚内存区块与 pending 队列,消除两步之间崩溃的不一致窗口。单测 `commit_block_atomically_removes_pending` |
 | attestation/identity/key transactions | ⚠️ `8b5ecf1`/247 端到端已验证 | 链上身份最小版(L1)已接入并经端到端集成测试(register→挖矿→查询→撤销链路真实可用):`POST /api/v1/identity/key-transaction`(register/revoke,ed25519 验签,register 自签)、`GET /identity/keys[/:pk]`(重放 key_transactions 得当前有效密钥集);key_transactions 进 merkle_root 受 PoW 保护(Block::calculate_merkle_root 选项 X);挖矿写 identity_snapshot_hash。签名负载不含 timestamp(服务端独立盖,`8b5ecf1` 修复)。**仍未做**:密钥轮换状态机、Merkle 身份树、pending key_tx 持久化(仅内存,重启丢未打包交易,幂等可重提);attestation 仍只在 verify_content 读、无专门提交流程 |
 | P2P/节点同步/冲突解决 | ⚠️ `R6`/247 双节点已验证 | `src/p2p.rs` + `/api/v1/peers`、`/api/v1/sync/blocks`:显式注册 + **主动广播**(挖矿后 `broadcast_blocks` 推新块给 peers)+ **认证 gossip 发现**(`exchange_peers` 从已知 peer 拉取 peer 列表并入,跳过自身)+ 种子 peer(DATACHAIN_P2P_SEED_PEERS)+ 认证拉取/导入 + 最长合法链替换 + 60s 定时同步。**仍无共识、同长度分叉选择**(⚠️ 单一诚实源假设)。双节点 smoke:a 挖矿→b 经广播增长, 双向 exchange_peers 互相发现 |
@@ -83,7 +86,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
 | 独立 metadata/aggregation/events 表 | ⚠️ `d97cd94` | metadata 查询投影表已建(migration 005);aggregation 已持久化(`aggregations` 表);语义目录新增 pending_catalog_records 与 catalog_subjects/catalog_revisions/catalog_artifacts/catalog_claims 查询投影(migration 006);事件通知仍无独立表(经 EventBus 内存广播,不落库) |
 | SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
-| 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
+| 数据损坏处理 | ⚠️ 代码已写,**未编译未测试**(`d82fa21`,reviewer 两轮读代码审查最终无 Important) | 新增 `DataChainError::DataCorruption{category,table,key,reason}`(`CorruptionCategory::{Authoritative,Rebuildable}`),Display 固定为 `data corruption [authoritative] table=users key=<id>: <reason>`。`reason` 取固定词表(`json_syntax line=L col=C`/`json_data`/`json_eof`/`json_io`/`unknown_status` 等),**不回显行内容、password_hash 或 JSON 片段**。详见下方 §2.6。 |
 | 聚合持久化 | ✅ | aggregation summaries 已写入 SQLite 的 `aggregations` 表，server 启动时加载并恢复查询结果和聚合计数。仍有的边界：时间/数量策略通常扫描全部历史 metadata，不区分未聚合部分。 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
 | 配置环境变量 | ✅基础已实现/待验证 | JWT、数据库 DSN、host、port 支持环境变量覆盖；默认 JWT secret/短 secret 启动拒绝；聚合等配置仍主要来自 TOML |
@@ -98,7 +101,33 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 版本差异 | ✅ 247 已验证 | `get_version_diff` 从两版本的不可变快照读取内容再 diff,不依赖当前文件;文件被覆盖/删除仍可比较历史 |
 | 文件路径安全 | ✅ 247 已验证 | `validate_version_path`:拒绝空/绝对/`..` 遍历,canonical 后必须位于 `DATACHAIN_VERSION_ROOT` 内,拒绝目录与越界符号链接。单测 `rejects_path_traversal_before_filesystem_access` 等 |
 
+### 2.6 数据损坏处置策略(`feat/data-corruption-policy` `d82fa21`,未编译未测试)
+
+> 核实日期:2026-11-11(读代码核实,未编译未运行)。设计:`docs/superpowers/specs/2026-11-11-data-corruption-policy-design.md`。
+
+| 项 | 状态 | 说明与证据 |
+|---|---|---|
+| `DataCorruption` 结构化错误 | ⚠️ 已写/未验证 | `src/error.rs`:`{category,table,key,reason}`;reason 固定词表,不含行内容/password_hash/JSON 片段;blocks 的 key 为区块索引,其余用主键,主键不可解析时用占位。验证:读代码审查;`error.rs` 内单测已写未运行 |
+| 权威源 fail-closed | ⚠️ 已写/未验证 | 范围:blocks、users、versions、pending metadata、pending catalog、anchor_outbox、aggregations。anchor_outbox 启动时**全表扫描**(`scan_anchor_outbox`),未知 status 报 `DataCorruption{anchor_outbox,unknown_status}`,不再当 Pending(`crosschain.rs` `parse_status` 改返回 `Result`)。aggregations 因由调度器写入、含递归合并状态而非纯区块导出,定为权威源,**不重建**。refresh 撤销表无 JSON 列,不做专门扫描 |
+| 可重建投影 | ⚠️ 已写/未验证 | 范围:metadata、catalog_subjects/revisions/artifacts/claims。启动在链完整校验通过后检测(行数与期望值比对 + `data` 列可解析),任一不一致则在**单事务**内清表并按区块高度升序重放 `project_block_tx`(失败整体回滚),保持 catalog 首写者胜(`DO NOTHING`)/metadata 后写者胜(`DO UPDATE`)语义。`commit_block` 与重建共用 `project_block_tx`。`metadata_projection_count` 出错不再 `unwrap_or(-1)`,改为传播错误 |
+| 启动时序 | ⚠️ 已写/未验证 | 链校验 → 权威源只读扫描(先于 pending 去重、投影重建、backfill、purge 等写)→ 投影检测重建 → 继续。例外:空库先写创世块 |
+| CLI 退出码 | 🔺 破坏性 / 未验证 | 0/1/2/3,见 §2.3。`main.rs` 改返回 `ExitCode`,错误一行输出到 stderr |
+| HTTP `/api/v1/chain/validate` | ⚠️ 已写/未验证 | 保留 `valid`/`block_count`,新增可选 `corruption`、`invalid_block`(仅异常时出现);状态码仍 200。`login`/`refresh` 遇 `DataCorruption` 返回 **500**(原 `login` 对所有错误返回 401) |
+| 新增测试文件(**均未运行**) | ⏳ 待执行 | `tests/data_corruption_authoritative.rs`、`data_corruption_outbox.rs`、`data_corruption_projection.rs`、`data_corruption_startup.rs`、`data_corruption_cli.rs`,辅助 `tests/common/corrupt.rs`;并修改 `tests/chain_validation_cli.rs`。不提供通过/失败计数 |
+
+**已知限制 / 遗留登记(本分支)**:
+- 🔺 投影检测只看行数与 JSON 可解析性;**合法但被篡改的内容检测不到**(例如字段值被改但仍是合法 JSON 且行数一致)。
+- ⚠️ p2p `import_blocks`(`handlers.rs` 区块同步导入)仍用 `save_block`,**不写投影**,依赖下次启动的数量不一致检测重建兜底;运行期间查询投影可能落后。
+- 🔺 其他业务端点遇 `DataCorruption` 返回 500,body 含 table/key(无行内容),**未按设计收窄**为仅 `{"error":"data_corruption","table":..}`。
+- ⏳ 未提供 `storage check` / `storage rebuild-projections` 命令(设计 S6,已裁剪)。
+- ⚠️ `/chain/validate` 的 `corruption` 目前只来自 blocks 读取;其他权威源损坏在启动时 fail-closed,不经此端点报告。
+- ⚠️ `updated_at` 读取仍为当前时间(既有行为,未改)。
+- ⏳ 旧用户/版本表的字段兼容迁移不做。
+- ⏳ 与 `legacy_unverified`(5b2ad61)的对接未做。
+
 ## 三、测试与验证状态
+
+> ⚠️ 本节"107 passed"等计数是基线(`96d08e8` 及更早)的验证结果。`feat/data-corruption-policy` 新增的数据损坏处置代码与 5 个 `tests/data_corruption_*.rs` 测试文件**未编译、未运行**,本分支无新的通过计数;待 247 恢复后补跑 `cargo test`/`cargo fmt --check`/`cargo clippy --all-targets`。
 
 - ✅ 核心算法与链完整性单元测试共 86 passed：覆盖 Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage，以及非法单块创世、metadata Merkle 篡改等完整性门禁回归。
 - ✅ 集成测试共 21 passed：`tests/api_integration.rs`（11，含语义目录端到端 Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥拒绝、**可信 Claim resolver 端到端**、HTTP validate 的 200/success/data.valid bool 与缺 token 401）、CLI 集成测试（1，`chain validate` 的有效/无效输出和无效成功退出），以及 `tests/websocket_integration.rs`（9，真实 axum 服务 + tokio-tungstenite 客户端：握手鉴权、EventBus 广播、16KiB 上限、256 连接上限，以及四路连接接收五种事件的频道隔离）。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。
