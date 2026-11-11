@@ -330,14 +330,58 @@ pub async fn mine_block(
 }
 
 #[derive(Serialize)]
+pub struct CorruptionInfo {
+    pub category: &'static str,
+    pub table: &'static str,
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
 pub struct ValidateResponse {
     pub valid: bool,
     pub block_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corruption: Option<CorruptionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_block: Option<i64>,
 }
 
+/// `{valid,block_count}` 字段语义不变(来自内存 Chain);新增只读扫描存储权威源,
+/// 检测是否存在数据损坏,仅在非空时附加 corruption/invalid_block。
+/// 状态码始终 200,不因损坏或链无效而改变(与此前行为兼容)。
 pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<ValidateResponse>> {
     let valid = state.chain.validate_chain();
     let block_count = state.chain.get_block_count();
+
+    let mut corruption = None;
+    let mut invalid_block = None;
+
+    match state.storage.get_all_blocks().await {
+        Err(crate::error::DataChainError::DataCorruption {
+            category,
+            table,
+            key,
+            reason,
+        }) => {
+            corruption = Some(CorruptionInfo {
+                category: match category {
+                    crate::error::CorruptionCategory::Authoritative => "authoritative",
+                    crate::error::CorruptionCategory::Rebuildable => "rebuildable",
+                },
+                table,
+                key,
+                reason,
+            });
+        }
+        Err(_) => {}
+        Ok(_) => {
+            if !valid {
+                invalid_block =
+                    crate::core::Chain::find_first_invalid_block_index(&state.chain.get_all_blocks());
+            }
+        }
+    }
 
     state.event_bus.publish(Event::new(
         EventType::ChainValidated,
@@ -346,6 +390,8 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
     Json(ApiResponse::success(ValidateResponse {
         valid,
         block_count,
+        corruption,
+        invalid_block,
     }))
 }
 

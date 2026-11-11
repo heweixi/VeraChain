@@ -315,6 +315,31 @@ impl Chain {
         Self::validate_blocks(blocks)
     }
 
+    /// 定位候选区块序列中第一个校验失败的区块索引。不改变 validate_blocks 本身的
+    /// 校验规则,只是在已知失败的前提下复用相同规则逐块重放以报告具体位置,
+    /// 供 `/chain/validate` 等需要展示 `invalid_block` 的场景使用。
+    /// 链本身通过校验或为空时返回 None。
+    pub fn find_first_invalid_block_index(blocks: &[Block]) -> Option<i64> {
+        if blocks.is_empty() {
+            return None;
+        }
+        let genesis = &blocks[0];
+        if genesis.index != 0 || genesis.previous_hash != "0" {
+            return Some(genesis.index);
+        }
+        for (position, block) in blocks.iter().enumerate() {
+            let invalid = block.index != position as i64
+                || block.hash != block.calculate_hash()
+                || !block.is_valid()
+                || block.merkle_root != block.calculate_merkle_root()
+                || (position > 0 && block.previous_hash != blocks[position - 1].hash);
+            if invalid {
+                return Some(block.index);
+            }
+        }
+        None
+    }
+
     /// 以统一的完整规则验证候选区块序列。
     fn validate_blocks(blocks: &[Block]) -> Result<()> {
         if blocks.is_empty() {
