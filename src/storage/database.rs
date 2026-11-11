@@ -6,7 +6,7 @@ use crate::auth::User;
 use crate::catalog::{CatalogPayload, CatalogRecord};
 use crate::core::{Block, MetadataEntry};
 use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
-use crate::error::{DataChainError, Result};
+use crate::error::{corruption_from_json, CorruptionCategory, DataChainError, Result};
 use crate::versioning::Version;
 
 /// 数据库存储
@@ -283,7 +283,8 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取区块
+    /// 获取区块。blocks 是权威源:JSON 解析失败视为数据损坏(fail-closed),
+    /// key 用区块索引(与"blocks 的 key 用区块索引"的错误契约一致)。
     pub async fn get_block(&self, index: i64) -> Result<Block> {
         let row: (String,) = sqlx::query_as("SELECT data FROM blocks WHERE block_index = ?")
             .bind(index)
@@ -291,19 +292,35 @@ impl Storage {
             .await
             .map_err(|_| DataChainError::BlockNotFound(index))?;
 
-        let block: Block = serde_json::from_str(&row.0)?;
-        Ok(block)
+        serde_json::from_str(&row.0).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "blocks",
+                Some(&index.to_string()),
+                &e,
+            )
+        })
     }
 
-    /// 获取所有区块
+    /// 获取所有区块。权威源严格读取:任一行 JSON 解析失败即整体 fail-closed,
+    /// 返回 DataCorruption{table:"blocks", key:<block_index>}。
     pub async fn get_all_blocks(&self) -> Result<Vec<Block>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM blocks ORDER BY block_index ASC")
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT block_index, data FROM blocks ORDER BY block_index ASC")
                 .fetch_all(&self.pool)
                 .await?;
 
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(block_index, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "blocks",
+                        Some(&block_index.to_string()),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -367,28 +384,42 @@ impl Storage {
                     is_active,
                     metadata,
                 )| {
-                    let role = role.parse().map_err(|e| {
-                        DataChainError::StorageError(format!("invalid user role: {}", e))
+                    // users 是权威源:任一字段解析失败即 fail-closed。key 统一用 user_id
+                    // 主键(不用 email/username),reason 只走固定词表,不回显 role/日期/
+                    // 原始 JSON 内容(避免间接泄露 password_hash 等敏感字段所在行)。
+                    let role = role.parse().map_err(|_| DataChainError::DataCorruption {
+                        category: CorruptionCategory::Authoritative,
+                        table: "users",
+                        key: user_id.clone(),
+                        reason: "missing_field".to_string(),
                     })?;
                     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
-                        .map_err(|e| {
-                            DataChainError::StorageError(format!("invalid user created_at: {}", e))
+                        .map_err(|_| DataChainError::DataCorruption {
+                            category: CorruptionCategory::Authoritative,
+                            table: "users",
+                            key: user_id.clone(),
+                            reason: "missing_field".to_string(),
                         })?
                         .with_timezone(&chrono::Utc);
                     let last_login = last_login
                         .map(|t| {
                             chrono::DateTime::parse_from_rfc3339(&t)
                                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                                .map_err(|e| {
-                                    DataChainError::StorageError(format!(
-                                        "invalid user last_login: {}",
-                                        e
-                                    ))
+                                .map_err(|_| DataChainError::DataCorruption {
+                                    category: CorruptionCategory::Authoritative,
+                                    table: "users",
+                                    key: user_id.clone(),
+                                    reason: "missing_field".to_string(),
                                 })
                         })
                         .transpose()?;
                     let metadata = serde_json::from_str(&metadata).map_err(|e| {
-                        DataChainError::StorageError(format!("invalid user metadata: {}", e))
+                        corruption_from_json(
+                            CorruptionCategory::Authoritative,
+                            "users",
+                            Some(&user_id),
+                            &e,
+                        )
                     })?;
                     Ok(User {
                         id: 0,
@@ -456,12 +487,13 @@ impl Storage {
                     message,
                     parent_version,
                 )| {
+                    // versions 是权威源:timestamp 解析失败即 fail-closed,key 用 version_id。
                     let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
-                        .map_err(|e| {
-                            DataChainError::StorageError(format!(
-                                "invalid version timestamp: {}",
-                                e
-                            ))
+                        .map_err(|_| DataChainError::DataCorruption {
+                            category: CorruptionCategory::Authoritative,
+                            table: "versions",
+                            key: version_id.clone(),
+                            reason: "missing_field".to_string(),
                         })?
                         .with_timezone(&chrono::Utc);
                     Ok(Version {
