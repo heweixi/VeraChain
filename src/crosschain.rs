@@ -40,11 +40,20 @@ impl AnchorStatus {
         }
     }
 
-    pub fn parse_status(s: &str) -> Self {
+    /// 解析数据库里的 status 列。未知值不再静默归类为 Pending(会掩盖数据损坏),
+    /// 改为报结构化 DataCorruption{table:"anchor_outbox", reason:"unknown_status"};
+    /// 调用方(database.rs)负责补充具体 anchor_id 作为 key。
+    pub fn parse_status(s: &str) -> Result<Self> {
         match s {
-            "confirmed" => AnchorStatus::Confirmed,
-            "failed" => AnchorStatus::Failed,
-            _ => AnchorStatus::Pending,
+            "pending" => Ok(AnchorStatus::Pending),
+            "confirmed" => Ok(AnchorStatus::Confirmed),
+            "failed" => Ok(AnchorStatus::Failed),
+            _ => Err(DataChainError::DataCorruption {
+                category: crate::error::CorruptionCategory::Authoritative,
+                table: "anchor_outbox",
+                key: crate::error::corruption_key(None),
+                reason: "unknown_status".to_string(),
+            }),
         }
     }
 }

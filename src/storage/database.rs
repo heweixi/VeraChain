@@ -525,15 +525,24 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取所有待打包元数据。
+    /// 获取所有待打包元数据。权威源严格读取:data_id 作 key。
     pub async fn get_pending_metadata(&self) -> Result<Vec<MetadataEntry>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM pending_metadata ORDER BY created_at ASC, data_id ASC",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT data_id, data FROM pending_metadata ORDER BY created_at ASC, data_id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(data_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "pending_metadata",
+                        Some(&data_id),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -619,14 +628,34 @@ impl Storage {
 
         rows.into_iter()
             .map(|(signed, status, attempts, last_error, receipt)| {
-                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
+                // anchor_id 在此次查询未选出(SELECT 列不含),信封里 signed 解析成功后才有;
+                // 为了错误 key 始终带 anchor_id,改成先解析 signed 取 anchor_id,再校验 status。
+                let signed: SignedChainAnchor = serde_json::from_str(&signed).map_err(|e| {
+                    corruption_from_json(CorruptionCategory::Authoritative, "anchor_outbox", None, &e)
+                })?;
+                let anchor_id = signed.anchor.anchor_id.clone();
+                let status = AnchorStatus::parse_status(&status).map_err(|_| {
+                    DataChainError::DataCorruption {
+                        category: CorruptionCategory::Authoritative,
+                        table: "anchor_outbox",
+                        key: anchor_id.clone(),
+                        reason: "unknown_status".to_string(),
+                    }
+                })?;
                 let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r)?),
+                    Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
+                        corruption_from_json(
+                            CorruptionCategory::Authoritative,
+                            "anchor_outbox",
+                            Some(&anchor_id),
+                            &e,
+                        )
+                    })?),
                     None => None,
                 };
                 Ok(AnchorOutboxEntry {
                     signed,
-                    status: AnchorStatus::parse_status(&status),
+                    status,
                     attempts,
                     last_error,
                     receipt,
@@ -696,14 +725,36 @@ impl Storage {
         match row {
             None => Ok(None),
             Some((signed, status, attempts, last_error, receipt)) => {
-                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
+                let signed: SignedChainAnchor = serde_json::from_str(&signed).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "anchor_outbox",
+                        Some(anchor_id),
+                        &e,
+                    )
+                })?;
+                let status = AnchorStatus::parse_status(&status).map_err(|_| {
+                    DataChainError::DataCorruption {
+                        category: CorruptionCategory::Authoritative,
+                        table: "anchor_outbox",
+                        key: anchor_id.to_string(),
+                        reason: "unknown_status".to_string(),
+                    }
+                })?;
                 let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r)?),
+                    Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
+                        corruption_from_json(
+                            CorruptionCategory::Authoritative,
+                            "anchor_outbox",
+                            Some(anchor_id),
+                            &e,
+                        )
+                    })?),
                     None => None,
                 };
                 Ok(Some(AnchorOutboxEntry {
                     signed,
-                    status: AnchorStatus::parse_status(&status),
+                    status,
                     attempts,
                     last_error,
                     receipt,
@@ -957,15 +1008,24 @@ impl Storage {
         Ok(())
     }
 
-    /// 恢复所有待打包目录记录。
+    /// 恢复所有待打包目录记录。权威源严格读取:record_id 作 key。
     pub async fn get_pending_catalog_records(&self) -> Result<Vec<CatalogRecord>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM pending_catalog_records ORDER BY created_at ASC, record_id ASC",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT record_id, data FROM pending_catalog_records ORDER BY created_at ASC, record_id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(record_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "pending_catalog_records",
+                        Some(&record_id),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
