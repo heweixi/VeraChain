@@ -79,37 +79,62 @@ enum Commands {
     },
 }
 
+/// 退出码契约(设计文档第3节):0 成功;1 其他错误;2 链校验失败(valid=false);
+/// 3 数据损坏。`exit_code_for` 依赖 downcast 出底层 `DataChainError`,因此各
+/// `run_*` 内部的 `anyhow::Result<()>` 错误链必须保留原始错误类型(不得用
+/// `.context(..)` 包装丢失 downcast 能力的场景除外——当前实现均用 `?` 直接
+/// 传播,downcast 仍可命中最内层 DataChainError)。
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     // info 无需加载配置/日志
     if let Commands::Info { detailed } = &cli.command {
         run_info(*detailed);
-        return Ok(());
+        return std::process::ExitCode::SUCCESS;
     }
 
-    let config = AppConfig::load(&cli.config)?;
+    let config = match AppConfig::load(&cli.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("配置加载失败: {}", e);
+            return std::process::ExitCode::from(1);
+        }
+    };
     // config::LogConfig 仅含 level;转成 logger 的 LogConfig(其余取默认)
     init_logger(&LogConfig {
         level: config.log.level.clone(),
         ..LogConfig::default()
     });
 
-    match cli.command {
-        Commands::Serve { port } => {
-            let p = port.unwrap_or(config.server.port);
-            run_server(config, p).await?;
+    let result: anyhow::Result<()> = async {
+        match cli.command {
+            Commands::Serve { port } => {
+                let p = port.unwrap_or(config.server.port);
+                run_server(config, p).await?;
+            }
+            Commands::Init => run_init(&config).await?,
+            Commands::Status => run_status(&config).await?,
+            Commands::Info { .. } => unreachable!("handled above"),
+            Commands::Chain { action } => run_chain(&config, action).await?,
+            Commands::Metadata { action } => run_metadata(&config, action).await?,
+            Commands::User { action } => run_user(&config, action).await?,
+            Commands::Aggregate { action } => run_aggregate(&config, action).await?,
+            Commands::Version { action } => run_version(&config, action).await?,
         }
-        Commands::Init => run_init(&config).await?,
-        Commands::Status => run_status(&config).await?,
-        Commands::Info { .. } => unreachable!("handled above"),
-        Commands::Chain { action } => run_chain(&config, action).await?,
-        Commands::Metadata { action } => run_metadata(&config, action).await?,
-        Commands::User { action } => run_user(&config, action).await?,
-        Commands::Aggregate { action } => run_aggregate(&config, action).await?,
-        Commands::Version { action } => run_version(&config, action).await?,
+        Ok(())
     }
+    .await;
 
-    Ok(())
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // stderr 一行固定格式(错误契约第3节);DataChainError 的 Display 已是
+            // `data corruption [..] table=.. key=..: ..` 或原有各变体的中文描述,
+            // 不含行内容/password_hash/secret。
+            eprintln!("{}", e);
+            let code = datachain::cli::common::exit_code_for(&e);
+            std::process::ExitCode::from(code)
+        }
+    }
 }

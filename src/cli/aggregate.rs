@@ -1,6 +1,7 @@
 use clap::Subcommand;
 
 use crate::aggregation::{create_aggregation_engine, StrategyType};
+use crate::cli::common::load_verified_chain;
 use crate::config::AppConfig;
 use crate::core::create_chain;
 use crate::storage::create_storage;
@@ -26,11 +27,8 @@ pub async fn run_aggregate(config: &AppConfig, action: AggregateAction) -> anyho
     let storage = create_storage(&config.database.dsn).await?;
     let chain = create_chain(config.blockchain.difficulty, config.blockchain.block_size);
 
-    // 加载区块
-    let blocks = storage.get_all_blocks().await?;
-    if !blocks.is_empty() {
-        chain.load_blocks(blocks);
-    }
+    // 严格加载:区块损坏或链无效时 fail-closed。
+    load_verified_chain(&storage, &chain).await?;
 
     let engine = create_aggregation_engine(
         chain,

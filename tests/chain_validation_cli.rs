@@ -31,9 +31,13 @@ fn write_config(path: &std::path::Path, dsn: &str) {
     std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
 }
 
+/// 退出码契约(本特性引入的破坏性变更,设计文档"默认决策#1"):
+/// 0=链有效,2=链无效,3=数据损坏。此前 `chain validate` 恒返回 0,
+/// 调用脚本若依赖旧的"恒 0"行为需要相应调整(见最终报告的破坏性变更说明)。
 #[tokio::test]
 async fn chain_validate_cli_reports_valid_and_invalid_chains_without_writing_storage() {
-    for (invalid_genesis, expected_output) in [(false, "✓ 链验证通过"), (true, "✗ 链验证失败")]
+    for (invalid_genesis, expected_output, expected_exit_code) in
+        [(false, "✓ 链验证通过", 0), (true, "✗ 链验证失败", 2)]
     {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("datachain.sqlite");
@@ -52,9 +56,10 @@ async fn chain_validate_cli_reports_valid_and_invalid_chains_without_writing_sto
             .output()
             .unwrap();
 
-        assert!(
-            output.status.success(),
-            "CLI 应保持成功退出: {}",
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit_code),
+            "退出码契约:0=valid,2=invalid。stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(

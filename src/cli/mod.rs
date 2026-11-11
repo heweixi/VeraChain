@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod chain;
+pub mod common;
 pub mod info;
 pub mod init;
 pub mod metadata;
