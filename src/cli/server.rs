@@ -40,6 +40,7 @@ async fn initialize_or_load_chain(
 /// 否则第 7 步重建会基于未经校验的区块。
 ///
 /// 返回权威源数据(users/versions)供调用方后续加载进内存服务,以及投影重建报告。
+#[derive(Debug)]
 pub struct StartupRecoveryResult {
     pub users: Vec<crate::auth::User>,
     pub versions: Vec<crate::versioning::Version>,

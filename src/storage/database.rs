@@ -581,26 +581,48 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取单个聚合结果。
+    /// 获取单个聚合结果。data 列坏 JSON 返回结构化 `DataCorruption`(权威源,key=summary_id)。
     pub async fn get_aggregation(&self, summary_id: &str) -> Result<AggregationSummary> {
-        let row: (String,) = sqlx::query_as("SELECT data FROM aggregations WHERE summary_id = ?")
-            .bind(summary_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| {
-                DataChainError::AggregationFailed(format!("aggregation not found: {}", summary_id))
-            })?;
-        Ok(serde_json::from_str(&row.0)?)
+        let row: (String, String) =
+            sqlx::query_as("SELECT summary_id, data FROM aggregations WHERE summary_id = ?")
+                .bind(summary_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| {
+                    DataChainError::AggregationFailed(format!(
+                        "aggregation not found: {}",
+                        summary_id
+                    ))
+                })?;
+        serde_json::from_str(&row.1).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "aggregations",
+                Some(&row.0),
+                &e,
+            )
+        })
     }
 
-    /// 获取全部聚合结果，按创建时间恢复历史顺序。
+    /// 获取全部聚合结果，按创建时间恢复历史顺序。任一行坏 JSON 即返回
+    /// 结构化 `DataCorruption`(权威源,key=summary_id)。
     pub async fn get_all_aggregations(&self) -> Result<Vec<AggregationSummary>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM aggregations ORDER BY created_at ASC, summary_id ASC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT summary_id, data FROM aggregations ORDER BY created_at ASC, summary_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(summary_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "aggregations",
+                        Some(&summary_id),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -623,58 +645,94 @@ impl Storage {
         Ok(())
     }
 
+    /// 将 outbox 行严格解析为条目;任何字段损坏均返回带 anchor_id 的 `DataCorruption`。
+    fn parse_anchor_row(
+        anchor_id: &str,
+        signed: &str,
+        status: &str,
+        attempts: i64,
+        last_error: Option<String>,
+        receipt: Option<String>,
+    ) -> Result<AnchorOutboxEntry> {
+        let signed: SignedChainAnchor = serde_json::from_str(signed).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "anchor_outbox",
+                Some(anchor_id),
+                &e,
+            )
+        })?;
+        let status = AnchorStatus::parse_status(status).map_err(|_| {
+            DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "anchor_outbox",
+                key: anchor_id.to_string(),
+                reason: "unknown_status".to_string(),
+            }
+        })?;
+        let receipt = match receipt {
+            Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
+                corruption_from_json(
+                    CorruptionCategory::Authoritative,
+                    "anchor_outbox",
+                    Some(anchor_id),
+                    &e,
+                )
+            })?),
+            None => None,
+        };
+        Ok(AnchorOutboxEntry {
+            signed,
+            status,
+            attempts,
+            last_error,
+            receipt,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
     /// 列出待投递锚定（pending），按创建时间升序，限制批量大小。
     pub async fn list_pending_anchors(&self, limit: i64) -> Result<Vec<AnchorOutboxEntry>> {
-        let rows: Vec<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT signed, status, attempts, last_error, receipt
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                r#"
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox
             WHERE status = 'pending'
             ORDER BY created_at ASC
             LIMIT ?
             "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
-            .map(|(signed, status, attempts, last_error, receipt)| {
-                // anchor_id 在此次查询未选出(SELECT 列不含),信封里 signed 解析成功后才有;
-                // 为了错误 key 始终带 anchor_id,改成先解析 signed 取 anchor_id,再校验 status。
-                let signed: SignedChainAnchor = serde_json::from_str(&signed).map_err(|e| {
-                    corruption_from_json(CorruptionCategory::Authoritative, "anchor_outbox", None, &e)
-                })?;
-                let anchor_id = signed.anchor.anchor_id.clone();
-                let status = AnchorStatus::parse_status(&status).map_err(|_| {
-                    DataChainError::DataCorruption {
-                        category: CorruptionCategory::Authoritative,
-                        table: "anchor_outbox",
-                        key: anchor_id.clone(),
-                        reason: "unknown_status".to_string(),
-                    }
-                })?;
-                let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
-                        corruption_from_json(
-                            CorruptionCategory::Authoritative,
-                            "anchor_outbox",
-                            Some(&anchor_id),
-                            &e,
-                        )
-                    })?),
-                    None => None,
-                };
-                Ok(AnchorOutboxEntry {
-                    signed,
-                    status,
-                    attempts,
-                    last_error,
-                    receipt,
-                    updated_at: chrono::Utc::now(),
-                })
+            .map(|(anchor_id, signed, status, attempts, last_error, receipt)| {
+                Self::parse_anchor_row(&anchor_id, &signed, &status, attempts, last_error, receipt)
             })
             .collect()
+    }
+
+    /// 启动期只读全表扫描 anchor_outbox(不按 status 过滤),逐行严格校验
+    /// status / signed / receipt。返回已校验行数;首个损坏行返回 `DataCorruption`。
+    pub async fn scan_anchor_outbox(&self) -> Result<usize> {
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                r#"
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
+            FROM anchor_outbox
+            ORDER BY created_at ASC, anchor_id ASC
+            "#,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+        let mut count = 0usize;
+        for (anchor_id, signed, status, attempts, last_error, receipt) in rows {
+            Self::parse_anchor_row(&anchor_id, &signed, &status, attempts, last_error, receipt)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// 标记锚定已确认，记录回执。
@@ -724,55 +782,22 @@ impl Storage {
 
     /// 查询单个锚定条目（供 API 查询状态）。
     pub async fn get_anchor(&self, anchor_id: &str) -> Result<Option<AnchorOutboxEntry>> {
-        let row: Option<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT signed, status, attempts, last_error, receipt
+        let row: Option<(String, String, String, i64, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                r#"
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox WHERE anchor_id = ?
             "#,
-        )
-        .bind(anchor_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(anchor_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         match row {
             None => Ok(None),
-            Some((signed, status, attempts, last_error, receipt)) => {
-                let signed: SignedChainAnchor = serde_json::from_str(&signed).map_err(|e| {
-                    corruption_from_json(
-                        CorruptionCategory::Authoritative,
-                        "anchor_outbox",
-                        Some(anchor_id),
-                        &e,
-                    )
-                })?;
-                let status = AnchorStatus::parse_status(&status).map_err(|_| {
-                    DataChainError::DataCorruption {
-                        category: CorruptionCategory::Authoritative,
-                        table: "anchor_outbox",
-                        key: anchor_id.to_string(),
-                        reason: "unknown_status".to_string(),
-                    }
-                })?;
-                let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
-                        corruption_from_json(
-                            CorruptionCategory::Authoritative,
-                            "anchor_outbox",
-                            Some(anchor_id),
-                            &e,
-                        )
-                    })?),
-                    None => None,
-                };
-                Ok(Some(AnchorOutboxEntry {
-                    signed,
-                    status,
-                    attempts,
-                    last_error,
-                    receipt,
-                    updated_at: chrono::Utc::now(),
-                }))
-            }
+            Some((id, signed, status, attempts, last_error, receipt)) => Ok(Some(
+                Self::parse_anchor_row(&id, &signed, &status, attempts, last_error, receipt)?,
+            )),
         }
     }
 
