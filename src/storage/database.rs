@@ -1627,12 +1627,14 @@ impl Storage {
     ) -> Result<Vec<String>> {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
-        let ids = Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+        let ids =
+            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now, None).await?;
         tx.commit().await?;
         Ok(ids)
     }
 
-    /// 事务内撤销用户全部会话。首条语句即为写操作(`UPDATE .. RETURNING`),
+    /// 事务内撤销用户全部未撤销会话(`except_session_id` 指定的会话除外)。
+    /// 首条语句即为写操作(`UPDATE .. RETURNING`),
     /// 避免"先读后写"在多连接下的读锁升级冲突。
     async fn revoke_user_sessions_in_tx(
         tx: &mut sqlx::Transaction<'_, Sqlite>,
@@ -1640,15 +1642,18 @@ impl Storage {
         reason: &str,
         ttl_secs: i64,
         now: i64,
+        except_session_id: Option<&str>,
     ) -> Result<Vec<String>> {
         let revoked: Vec<(String, String)> = sqlx::query_as(
             "UPDATE sessions SET revoked_at = ?, revoke_reason = ? \
-             WHERE user_id = ? AND revoked_at IS NULL \
+             WHERE user_id = ? AND revoked_at IS NULL AND id != ? \
              RETURNING id, refresh_family",
         )
         .bind(now)
         .bind(reason)
         .bind(user_id)
+        // 无保留会话时绑定空串:会话 id 恒为非空 uuid,`id != ''` 恒真。
+        .bind(except_session_id.unwrap_or(""))
         .fetch_all(&mut **tx)
         .await?;
         for (_, family_id) in &revoked {
@@ -1857,10 +1862,64 @@ impl Storage {
             return Ok(None);
         }
         let revoked =
-            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now, None).await?;
         tx.commit().await?;
         self.invalidate_active_cache(user_id);
         Ok(Some(revoked.len() as u64))
+    }
+
+    /// 读取用户的 bcrypt 哈希(SQLite 为权威)。用户不存在返回 `None`。
+    pub async fn get_user_password_hash(&self, user_id: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT password_hash FROM users WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(hash,)| hash))
+    }
+
+    /// 单事务:把密码哈希从 `old_hash` 乐观更新为 `new_hash`,并撤销除 `keep_session_id`
+    /// 外的全部未撤销会话(写 family 哨兵)。
+    ///
+    /// 首条语句即为写操作(`UPDATE users .. WHERE user_id = ? AND password_hash = ?`),
+    /// 同时充当乐观并发控制:并发改密中后到者因哈希已变而更新 0 行。
+    /// - 返回 `Ok(Some(ids))`:更新成功,`ids` 为被撤销的会话 id;
+    /// - 返回 `Ok(None)`:0 行(用户不存在,或哈希已被并发改密/其他途径改变),
+    ///   调用方按 401 invalid credentials 处理。
+    pub async fn update_user_password_and_revoke_other_sessions(
+        &self,
+        user_id: &str,
+        old_hash: &str,
+        new_hash: &str,
+        keep_session_id: Option<&str>,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<Vec<String>>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE users SET password_hash = ? WHERE user_id = ? AND password_hash = ?",
+        )
+        .bind(new_hash)
+        .bind(user_id)
+        .bind(old_hash)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let ids = Self::revoke_user_sessions_in_tx(
+            &mut tx,
+            user_id,
+            reason,
+            ttl_secs,
+            now,
+            keep_session_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(ids))
     }
 
     /// 清本进程 is_active 缓存,并让在途的旧读不再回填。

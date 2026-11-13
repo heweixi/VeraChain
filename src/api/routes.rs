@@ -55,6 +55,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/auth/profile", get(handlers::get_profile))
         .route("/api/v1/auth/logout", post(handlers::logout))
         .route("/api/v1/auth/logout-all", post(handlers::logout_all))
+        .route("/api/v1/auth/password", post(handlers::change_password))
         .route("/api/v1/auth/sessions", get(handlers::list_sessions))
         .route(
             "/api/v1/auth/sessions/:id",

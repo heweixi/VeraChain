@@ -2,7 +2,10 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{JwtHandler, LoginRequest, LoginResponse, RegisterRequest, Role, User};
+use super::{
+    validate_new_password, ChangePasswordRequest, JwtHandler, LoginRequest, LoginResponse,
+    RegisterRequest, Role, User,
+};
 use crate::crypto::{hash_password, verify_password};
 use crate::error::{DataChainError, Result};
 use crate::storage::{AuditEvent, SessionRecord, Storage};
@@ -96,6 +99,12 @@ fn normalize_username_key(username: &str) -> String {
         .flat_map(char::to_lowercase)
         .take(USERNAME_KEY_MAX_CHARS)
         .collect()
+}
+
+/// 限速门拒绝信息:建议的 Retry-After(秒)与审计 reason。
+struct RateDenial {
+    retry_after_secs: u64,
+    reason: &'static str,
 }
 
 /// 不存在用户时用于抹平耗时的 bcrypt 哈希,cost 与真实密码一致(同为 `hash_password`)。
@@ -288,6 +297,199 @@ impl AuthService {
         .await;
     }
 
+    /// 限速门(登录与改密共用,key 由调用方决定):
+    /// 1. `user_key` 处于指数退避锁定期 => 直接拒绝,不计数;
+    /// 2. 对 `ip_key`、`user_key` 原子递增固定窗口计数;
+    /// 3. `user_key` 超限 => 落指数退避锁;`ip_key` 超限 => 固定窗口 Retry-After;同时超限取较大值。
+    ///
+    /// 通过返回 `Ok(Ok(()))`(名额已占用,成功后应调用 [`Self::release_rate_gate`] 归还);
+    /// 被拒返回 `Ok(Err(denial))`;存储故障返回 `Err`。
+    async fn enter_rate_gate(
+        &self,
+        user_key: &str,
+        ip_key: &str,
+        now: i64,
+    ) -> Result<std::result::Result<(), RateDenial>> {
+        let limits = self.login_limits;
+        if let Some(locked_until) = self.storage.get_login_lock(user_key, now).await? {
+            return Ok(Err(RateDenial {
+                retry_after_secs: (locked_until - now).max(1) as u64,
+                reason: "account locked",
+            }));
+        }
+
+        let (ip_count, window_start) = self
+            .storage
+            .incr_login_counter(ip_key, now, limits.window_secs)
+            .await?;
+        let (user_count, _) = self
+            .storage
+            .incr_login_counter(user_key, now, limits.window_secs)
+            .await?;
+        let ip_exceeded = ip_count > limits.ip_max_attempts;
+        let user_exceeded = user_count > limits.user_max_attempts;
+        if !(ip_exceeded || user_exceeded) {
+            return Ok(Ok(()));
+        }
+
+        let mut retry_after = 0i64;
+        if user_exceeded {
+            let locked_until = self
+                .storage
+                .lock_login_key(
+                    user_key,
+                    now,
+                    self.lockout.base_secs,
+                    self.lockout.max_secs,
+                    self.lockout.reset_secs,
+                )
+                .await?;
+            retry_after = retry_after.max(locked_until - now);
+        }
+        if ip_exceeded {
+            retry_after = retry_after.max(window_start + limits.window_secs - now);
+        }
+        Ok(Err(RateDenial {
+            retry_after_secs: retry_after.max(1) as u64,
+            reason: if user_exceeded {
+                "account locked"
+            } else {
+                "rate limit exceeded"
+            },
+        }))
+    }
+
+    /// 归还 [`Self::enter_rate_gate`] 本次占用的两个名额(不会低于 0,也不清零他人累积的失败)。
+    async fn release_rate_gate(&self, user_key: &str, ip_key: &str, now: i64) -> Result<()> {
+        let window_secs = self.login_limits.window_secs;
+        self.storage
+            .decr_login_counter(user_key, now, window_secs)
+            .await?;
+        self.storage
+            .decr_login_counter(ip_key, now, window_secs)
+            .await?;
+        Ok(())
+    }
+
+    /// 改密:顺序为 策略校验 → 限速门(`pwchg:<user_id>` + `ip:<hash>`)→ 验旧密码
+    /// → 新旧相同检查 → 哈希新密码并归还名额 → 单事务更新哈希并撤销其他会话
+    /// → 同步内存哈希 → 审计。
+    ///
+    /// `claims.sid` 为 `None`(旧 token)时无法确定当前会话,撤销全部会话。
+    pub async fn change_password(
+        &self,
+        claims: &super::Claims,
+        req: &ChangePasswordRequest,
+        ctx: &LoginContext,
+    ) -> Result<()> {
+        // 1. 策略校验:失败不消耗配额。
+        validate_new_password(&req.new_password, self.password_min_length)
+            .map_err(DataChainError::PasswordRejected)?;
+
+        let user_id = claims.sub.as_str();
+        let ip_hash = self.ctx_ip_hash(ctx);
+        let audit_event = |event_type: &str, result: &str, reason: &str| {
+            let mut event = AuditEvent::new(event_type, result)
+                .user(user_id)
+                .client(ip_hash.as_deref(), ctx.user_agent.as_deref())
+                .reason(reason);
+            if let Some(sid) = claims.sid.as_deref() {
+                event = event.session(sid);
+            }
+            event
+        };
+
+        // 2. 限速门:独立 key,锁定不影响登录。
+        let now = self.storage.now_secs();
+        let user_key = format!("pwchg:{}", user_id);
+        let ip_key = format!(
+            "ip:{}",
+            self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
+        );
+        if let Err(denial) = self.enter_rate_gate(&user_key, &ip_key, now).await? {
+            self.audit(audit_event(
+                "password_change_locked",
+                "denied",
+                denial.reason,
+            ))
+            .await;
+            return Err(DataChainError::TooManyAttempts {
+                retry_after_secs: denial.retry_after_secs,
+            });
+        }
+
+        // 3. 以 SQLite 中的哈希验证旧密码;用户行缺失也走同 cost 的 bcrypt 抹平耗时。
+        let stored_hash = self.storage.get_user_password_hash(user_id).await?;
+        let old_ok = match stored_hash.as_deref() {
+            Some(hash) => verify_password(&req.old_password, hash),
+            None => {
+                let _ = verify_password(&req.old_password, dummy_password_hash());
+                false
+            }
+        };
+        let old_hash = match stored_hash {
+            Some(hash) if old_ok => hash,
+            _ => {
+                // 配额不归还:失败计入 pwchg 锁定。
+                self.audit(audit_event(
+                    "password_change_failure",
+                    "failure",
+                    "bad old password",
+                ))
+                .await;
+                return Err(DataChainError::InvalidCredentials);
+            }
+        };
+
+        // 4. 旧密码通过后才比较新旧是否相同,避免探测。
+        if req.new_password == req.old_password {
+            return Err(DataChainError::PasswordRejected(
+                "new password must differ from old password",
+            ));
+        }
+
+        // 5. 哈希新密码,归还两个名额。
+        let new_hash = hash_password(&req.new_password)
+            .map_err(|e| DataChainError::Internal(e.to_string()))?;
+        self.release_rate_gate(&user_key, &ip_key, now).await?;
+
+        // 6. 单事务:乐观更新哈希(旧哈希已被并发改密替换则 0 行)+ 撤销其他会话。
+        let revoked = self
+            .storage
+            .update_user_password_and_revoke_other_sessions(
+                user_id,
+                &old_hash,
+                &new_hash,
+                claims.sid.as_deref(),
+                "password changed",
+                self.jwt_handler.refresh_expire_secs(),
+            )
+            .await?;
+        let Some(revoked) = revoked else {
+            self.audit(audit_event(
+                "password_change_failure",
+                "failure",
+                "concurrent change",
+            ))
+            .await;
+            return Err(DataChainError::InvalidCredentials);
+        };
+
+        // 7. 提交后同步内存哈希(login 校验用内存副本)。
+        if let Some(user) = self.users.write().get_mut(user_id) {
+            user.password_hash = new_hash;
+        }
+
+        // 8. 审计(不含任何密码内容)。
+        self.audit(audit_event(
+            "password_changed",
+            "success",
+            &format!("revoked {} other sessions", revoked.len()),
+        ))
+        .await;
+        Ok(())
+    }
+
     /// 请求上下文里的客户端 IP 摘要(无对端地址时为 `None`)。
     fn ctx_ip_hash(&self, ctx: &LoginContext) -> Option<String> {
         ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip))
@@ -342,59 +544,17 @@ impl AuthService {
         // 限速:先在事务外对 IP 与用户名两个维度原子递增(不先读后写),超限直接 429。
         // 失败/成功都先计数,成功后再归还名额,避免并发请求绕过阈值。
         let now = self.storage.now_secs();
-        let limits = self.login_limits;
         let ip_key = format!(
             "ip:{}",
             self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
         );
         let user_key = format!("user:{}", normalize_username_key(&req.username));
 
-        // 用户名维度已处于指数退避锁定期:直接拒绝,不计数、不验密(不跑 bcrypt),
-        // 对不存在的用户名同样生效,保持同形。
-        if let Some(locked_until) = self.storage.get_login_lock(&user_key, now).await? {
-            self.audit_login_locked(req, ctx, "account locked").await;
+        // 限速门(锁定检查 + 计数 + 落锁),登录与改密共用。
+        if let Err(denial) = self.enter_rate_gate(&user_key, &ip_key, now).await? {
+            self.audit_login_locked(req, ctx, denial.reason).await;
             return Err(DataChainError::TooManyAttempts {
-                retry_after_secs: (locked_until - now).max(1) as u64,
-            });
-        }
-
-        let (ip_count, window_start) = self
-            .storage
-            .incr_login_counter(&ip_key, now, limits.window_secs)
-            .await?;
-        let (user_count, _) = self
-            .storage
-            .incr_login_counter(&user_key, now, limits.window_secs)
-            .await?;
-        let ip_exceeded = ip_count > limits.ip_max_attempts;
-        let user_exceeded = user_count > limits.user_max_attempts;
-        if ip_exceeded || user_exceeded {
-            // 同时超限取较大的 Retry-After;用户名维度落指数退避锁,IP 维度仍是固定窗口。
-            let mut retry_after = 0i64;
-            if user_exceeded {
-                let locked_until = self
-                    .storage
-                    .lock_login_key(
-                        &user_key,
-                        now,
-                        self.lockout.base_secs,
-                        self.lockout.max_secs,
-                        self.lockout.reset_secs,
-                    )
-                    .await?;
-                retry_after = retry_after.max(locked_until - now);
-            }
-            if ip_exceeded {
-                retry_after = retry_after.max(window_start + limits.window_secs - now);
-            }
-            let reason = if user_exceeded {
-                "account locked"
-            } else {
-                "rate limit exceeded"
-            };
-            self.audit_login_locked(req, ctx, reason).await;
-            return Err(DataChainError::TooManyAttempts {
-                retry_after_secs: retry_after.max(1) as u64,
+                retry_after_secs: denial.retry_after_secs,
             });
         }
 
@@ -444,19 +604,17 @@ impl AuthService {
         // 绝不清零用户名计数——否则能登录大小写变体账户("BOB" 与 "bob" 归一化后同 key)
         // 的攻击者可抵消对受害者累积的失败计数,绕过限速。
         // 归还不会低于 0,也不会让他人累积的失败减少:本次名额是本请求刚递增的那一份。
-        self.storage
-            .decr_login_counter(&user_key, now, limits.window_secs)
-            .await?;
-        self.storage
-            .decr_login_counter(&ip_key, now, limits.window_secs)
-            .await?;
+        self.release_rate_gate(&user_key, &ip_key, now).await?;
 
-        // 更新最后登录时间
-        user.update_last_login();
+        // 更新最后登录时间:只原地改内存里的 last_login,不整条覆盖用户
+        // (整条覆盖会把并发改密刚写入的新哈希换回旧哈希)。
         {
             let mut users = self.users.write();
-            users.insert(user.user_id.clone(), user.clone());
+            if let Some(stored) = users.get_mut(&user.user_id) {
+                stored.update_last_login();
+            }
         }
+        user.update_last_login();
 
         // 生成令牌；登录新建 token-family。
         // 注意：login 不向撤销表写入任何记录，新 family 的令牌默认有效，

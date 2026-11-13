@@ -10,7 +10,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 
 use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
-use crate::auth::{Claims, LoginContext, LoginRequest, RegisterRequest};
+use crate::auth::{ChangePasswordRequest, Claims, LoginContext, LoginRequest, RegisterRequest};
 use crate::core::{metadata_leaf_hash, MerkleTree};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::net::ClientIp;
@@ -199,6 +199,40 @@ pub async fn logout_all(
     match state.auth_service.logout_all(&claims.sub, &ctx).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error("全部登出失败", e),
+    }
+}
+
+/// `POST /api/v1/auth/password`:修改本人密码,成功 204 无体。
+/// 400 固定词表(策略/新旧相同)、401 invalid credentials(旧密码错或并发改密落败)、
+/// 429 + Retry-After、500 internal error。缺字段由 `Json` 提取器返回 422。
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> axum::response::Response {
+    use crate::error::DataChainError;
+    let ctx = client_context(client_ip, &headers);
+    match state.auth_service.change_password(&claims, &req, &ctx).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(DataChainError::PasswordRejected(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(msg)),
+        )
+            .into_response(),
+        Err(DataChainError::InvalidCredentials) => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::error("invalid credentials")),
+        )
+            .into_response(),
+        Err(DataChainError::TooManyAttempts { retry_after_secs }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(ApiResponse::error("too many attempts")),
+        )
+            .into_response(),
+        Err(e) => internal_error("修改密码失败", e),
     }
 }
 

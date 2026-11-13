@@ -139,6 +139,21 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// 改密请求
+#[derive(Clone, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+// 不派生 Debug,防止密码经日志泄露。
+impl std::fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangePasswordRequest")
+            .finish_non_exhaustive()
+    }
+}
+
 /// 登录响应
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginResponse {
