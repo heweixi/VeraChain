@@ -3148,7 +3148,7 @@ mod tests {
             .fetch_one(&storage.pool)
             .await
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let index_sql: (String,) = sqlx::query_as(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_identity_transactions_submitter_idempotency'",
         )
