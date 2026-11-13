@@ -295,10 +295,7 @@ impl AppConfig {
     }
 
     /// 与 [`AppConfig::load`] 相同,但环境变量经 `env` 读取(测试 seam,避免 `set_var` 并行污染)。
-    pub fn load_with_env(
-        path: &str,
-        env: impl Fn(&str) -> Option<String>,
-    ) -> anyhow::Result<Self> {
+    pub fn load_with_env(path: &str, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let mut config = if Path::new(path).exists() {
             let content = std::fs::read_to_string(path)?;
             toml::from_str::<AppConfig>(&content)?
@@ -430,8 +427,18 @@ impl AppConfig {
                 self.jwt.expire_hours
             );
         }
-        check_range("auth.login_user_max_attempts", a.login_user_max_attempts, 1, 1000)?;
-        check_range("auth.login_ip_max_attempts", a.login_ip_max_attempts, 1, 10000)?;
+        check_range(
+            "auth.login_user_max_attempts",
+            a.login_user_max_attempts,
+            1,
+            1000,
+        )?;
+        check_range(
+            "auth.login_ip_max_attempts",
+            a.login_ip_max_attempts,
+            1,
+            10000,
+        )?;
         check_range("auth.login_window_secs", a.login_window_secs, 60, 86400)?;
         check_range("auth.lockout_base_secs", a.lockout_base_secs, 60, 86400)?;
         check_range("auth.lockout_max_secs", a.lockout_max_secs, 1, 604800)?;
@@ -451,8 +458,18 @@ impl AppConfig {
             );
         }
         check_range("auth.audit_retention_days", a.audit_retention_days, 1, 3650)?;
-        check_range("auth.active_cache_ttl_secs", a.active_cache_ttl_secs, 0, 300)?;
-        check_range("auth.password_min_length", a.password_min_length as u64, 4, 72)?;
+        check_range(
+            "auth.active_cache_ttl_secs",
+            a.active_cache_ttl_secs,
+            0,
+            300,
+        )?;
+        check_range(
+            "auth.password_min_length",
+            a.password_min_length as u64,
+            4,
+            72,
+        )?;
         TrustedProxies::parse(&a.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("auth.trusted_proxies is invalid: {}", e))?;
         Ok(())

@@ -179,7 +179,10 @@ const FULL_AUTH_TOML: &str = "[auth]\n\
 #[test]
 fn toml_overrides_every_auth_and_jwt_key() {
     let cfg = load(
-        &toml_text("expire_hours = 48\nrefresh_expire_days = 14\n", FULL_AUTH_TOML),
+        &toml_text(
+            "expire_hours = 48\nrefresh_expire_days = 14\n",
+            FULL_AUTH_TOML,
+        ),
         &[],
     )
     .expect("合法覆盖应加载成功");
@@ -204,7 +207,10 @@ fn toml_overrides_every_auth_and_jwt_key() {
 #[test]
 fn auth_settings_reflects_loaded_config() {
     let cfg = load(
-        &toml_text("expire_hours = 48\nrefresh_expire_days = 14\n", FULL_AUTH_TOML),
+        &toml_text(
+            "expire_hours = 48\nrefresh_expire_days = 14\n",
+            FULL_AUTH_TOML,
+        ),
         &[],
     )
     .unwrap();
@@ -232,8 +238,11 @@ fn boundary_values_are_accepted() {
         audit_retention_days = 3650\n\
         active_cache_ttl_secs = 300\n\
         password_min_length = 72\n";
-    load(&toml_text("expire_hours = 720\nrefresh_expire_days = 365\n", max_auth), &[])
-        .expect("上边界应被接受");
+    load(
+        &toml_text("expire_hours = 720\nrefresh_expire_days = 365\n", max_auth),
+        &[],
+    )
+    .expect("上边界应被接受");
 
     let min_auth = "[auth]\n\
         login_user_max_attempts = 1\n\
@@ -245,15 +254,21 @@ fn boundary_values_are_accepted() {
         audit_retention_days = 1\n\
         active_cache_ttl_secs = 0\n\
         password_min_length = 4\n";
-    load(&toml_text("expire_hours = 1\nrefresh_expire_days = 1\n", min_auth), &[])
-        .expect("下边界应被接受");
+    load(
+        &toml_text("expire_hours = 1\nrefresh_expire_days = 1\n", min_auth),
+        &[],
+    )
+    .expect("下边界应被接受");
 }
 
 // ---------- 环境变量覆盖 TOML ----------
 
 #[test]
 fn environment_overrides_toml_for_every_new_key() {
-    let toml = toml_text("expire_hours = 48\nrefresh_expire_days = 14\n", FULL_AUTH_TOML);
+    let toml = toml_text(
+        "expire_hours = 48\nrefresh_expire_days = 14\n",
+        FULL_AUTH_TOML,
+    );
     let cfg = load(
         &toml,
         &[
@@ -268,7 +283,10 @@ fn environment_overrides_toml_for_every_new_key() {
             ("DATACHAIN_AUTH_AUDIT_RETENTION_DAYS", "15"),
             ("DATACHAIN_AUTH_ACTIVE_CACHE_TTL_SECS", "20"),
             ("DATACHAIN_AUTH_PASSWORD_MIN_LENGTH", "10"),
-            ("DATACHAIN_AUTH_TRUSTED_PROXIES", "172.16.0.0/12,203.0.113.7"),
+            (
+                "DATACHAIN_AUTH_TRUSTED_PROXIES",
+                "172.16.0.0/12,203.0.113.7",
+            ),
         ],
     )
     .expect("环境变量覆盖应加载成功");
@@ -300,8 +318,8 @@ fn environment_alone_overrides_defaults_without_config_file() {
         "DATACHAIN_AUTH_LOGIN_USER_MAX_ATTEMPTS".to_string(),
         "3".to_string(),
     );
-    let cfg = AppConfig::load_with_env(path.to_str().unwrap(), move |k| map.get(k).cloned())
-        .unwrap();
+    let cfg =
+        AppConfig::load_with_env(path.to_str().unwrap(), move |k| map.get(k).cloned()).unwrap();
     assert_eq!(cfg.auth.login_user_max_attempts, 3);
     assert_eq!(cfg.auth.login_ip_max_attempts, 20, "未设置的键保持默认");
 }
@@ -571,8 +589,11 @@ async fn with_settings_login_limits_user_max_two_blocks_third_attempt() {
         },
         ..AuthSettings::default()
     };
-    let service =
-        AuthService::with_settings("with-settings-secret".to_string(), storage.clone(), settings);
+    let service = AuthService::with_settings(
+        "with-settings-secret".to_string(),
+        storage.clone(),
+        settings,
+    );
     register_and_save(&service, &storage, "erin").await;
 
     for attempt in 1..=2 {
@@ -593,7 +614,11 @@ async fn with_settings_login_limits_user_max_two_blocks_third_attempt() {
         .unwrap_err();
     match err {
         DataChainError::TooManyAttempts { retry_after_secs } => {
-            assert!(retry_after_secs >= 1, "retry_after_secs={}", retry_after_secs)
+            assert!(
+                retry_after_secs >= 1,
+                "retry_after_secs={}",
+                retry_after_secs
+            )
         }
         other => panic!("第 3 次应为 TooManyAttempts,实际 {:?}", other),
     }
