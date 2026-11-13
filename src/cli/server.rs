@@ -11,6 +11,76 @@ use crate::metadata::create_metadata_manager;
 use crate::storage::create_storage;
 use crate::versioning::create_version_tracker;
 
+/// 从持久化存储恢复已验证区块；空存储则创建并持久化创世区块。
+async fn initialize_or_load_chain(
+    chain: &Arc<crate::core::Chain>,
+    storage: &Arc<crate::storage::Storage>,
+) -> anyhow::Result<()> {
+    let blocks = storage.get_all_blocks().await?;
+    if !blocks.is_empty() {
+        chain.validate_loaded_blocks(&blocks)?;
+        chain.load_blocks(blocks);
+        info!("已加载 {} 个区块", chain.get_block_count());
+    } else {
+        let genesis = chain.init();
+        storage.save_block(&genesis).await?;
+        info!("已创建创世区块");
+    }
+    Ok(())
+}
+
+/// 启动时序第 4-7 步的核心逻辑,抽成独立可测函数:
+/// 4) 权威源只读扫描(users/versions/pending metadata/pending catalog/anchor_outbox,
+///    任一损坏即 fail-closed,此时尚无任何写操作)
+/// 5) (无写)
+/// 6) pending 去重(复用调用方已加载的区块判断)
+/// 7) ensure_projections(&blocks)(区块校验通过后,检测并重建可重建投影)
+///
+/// 要求:调用方必须已对 `chain` 完成 `initialize_or_load_chain`(即区块已校验并加载),
+/// 否则第 7 步重建会基于未经校验的区块。
+///
+/// 返回权威源数据(users/versions)供调用方后续加载进内存服务,以及投影重建报告。
+#[derive(Debug)]
+pub struct StartupRecoveryResult {
+    pub users: Vec<crate::auth::User>,
+    pub versions: Vec<crate::versioning::Version>,
+    pub pending_metadata: Vec<crate::core::MetadataEntry>,
+    pub pending_catalog_records: Vec<crate::catalog::CatalogRecord>,
+    /// 权威源只读扫描阶段读取的历史聚合结果(调度器写入,非可重建投影)。
+    pub aggregations: Vec<crate::aggregation::AggregationSummary>,
+    pub projection_report: crate::storage::ProjectionReport,
+}
+
+pub async fn scan_authoritative_sources_and_ensure_projections(
+    chain: &Arc<crate::core::Chain>,
+    storage: &Arc<crate::storage::Storage>,
+) -> crate::error::Result<StartupRecoveryResult> {
+    // 第 4 步:权威源只读扫描,严格顺序 users → versions → refresh 撤销(无 JSON 列,
+    // 由 purge_expired_refresh/is_* 按需查询,此处不整表扫描)→ pending metadata
+    // → pending catalog → anchor_outbox → aggregations。任一失败立即返回 Err,不执行任何写操作。
+    let users = storage.get_all_users().await?;
+    let versions = storage.get_all_versions().await?;
+    let pending_metadata = storage.get_pending_metadata().await?;
+    let pending_catalog_records = storage.get_pending_catalog_records().await?;
+    // anchor_outbox 全表扫描(不按 status 过滤),status/signed/receipt 任一损坏即失败。
+    storage.scan_anchor_outbox().await?;
+    // aggregations 同为权威源,必须在任何写操作之前读取并校验,后续直接复用。
+    let aggregations = storage.get_all_aggregations().await?;
+
+    // 第 7 步:区块校验已由调用方完成(initialize_or_load_chain),此处检测并重建
+    // 可重建投影。
+    let projection_report = storage.ensure_projections(&chain.get_all_blocks()).await?;
+
+    Ok(StartupRecoveryResult {
+        users,
+        versions,
+        pending_metadata,
+        pending_catalog_records,
+        aggregations,
+        projection_report,
+    })
+}
+
 /// 运行服务器
 pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("正在启动 DataChain 服务...");
@@ -24,22 +94,23 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     // 创建区块链
     let chain = create_chain(config.blockchain.difficulty, config.blockchain.block_size);
 
-    // 从存储加载区块
-    let blocks = storage.get_all_blocks().await?;
-    if !blocks.is_empty() {
-        chain.validate_loaded_blocks(&blocks)?;
-        chain.load_blocks(blocks);
-        info!("已加载 {} 个区块", chain.get_block_count());
-    } else {
-        // 初始化创世区块
-        let genesis = chain.init();
-        storage.save_block(&genesis).await?;
-        info!("已创建创世区块");
-    }
+    initialize_or_load_chain(&chain, &storage).await?;
 
-    // 恢复尚未打包的元数据；它们不会出现在 blocks 快照中。
+    // 启动时序第 4/7 步:权威源只读扫描(任一损坏 fail-closed,此时无写操作)+
+    // 区块校验通过后检测并重建可重建投影。
+    let recovery = scan_authoritative_sources_and_ensure_projections(&chain, &storage).await?;
+    if !recovery.projection_report.rebuilt_tables.is_empty() {
+        info!(
+            event = "projection_rebuild",
+            tables = ?recovery.projection_report.rebuilt_tables,
+            "可重建投影与区块不一致,已重建"
+        );
+    }
+    let users = recovery.users;
+    let versions = recovery.versions;
+
+    // 第 6 步:pending 去重。恢复尚未打包的元数据；它们不会出现在 blocks 快照中。
     // 若上次进程在 save_block 成功后删除 pending 失败，启动时丢弃已提交的重复行。
-    let pending = storage.get_pending_metadata().await?;
     let committed_data_ids: std::collections::HashSet<String> = chain
         .get_all_blocks()
         .iter()
@@ -51,7 +122,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         })
         .collect();
     let mut pending_to_load = Vec::new();
-    for entry in pending {
+    for entry in recovery.pending_metadata {
         if committed_data_ids.contains(&entry.data_id) {
             storage.delete_pending_metadata(&entry.data_id).await?;
         } else {
@@ -62,8 +133,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     info!("已加载 {} 条待打包元数据", chain.get_pending_count());
 
     // 恢复已被接受但尚未打包的完整语义目录记录(subject/revision/artifact/claim)。
-    let pending_catalog_records = storage.get_pending_catalog_records().await?;
-    chain.load_pending_catalog_records(pending_catalog_records);
+    chain.load_pending_catalog_records(recovery.pending_catalog_records);
     info!(
         "已加载 {} 条待打包语义目录记录",
         chain.get_pending_catalog_record_count()
@@ -78,9 +148,8 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
 
     // 回填 metadata 查询投影(backlog #5):把已加载区块里的元数据幂等 upsert 进投影表。
-    // 代码级 reconcile 而非纯 SQL migration——历史元数据存于 blocks.data 的区块 JSON 中,
-    // 由已反序列化的 Block 对象回填最稳妥(避免依赖 SQLite JSON 扩展解析)。
-    // data_id upsert 幂等:重启重复回填无副作用。
+    // ensure_projections 已在权威源扫描通过后、此前完成检测与必要的整体重建;
+    // 此处的回填针对"投影已一致但仍可能缺少极少量历史条目"的边界场景,保持幂等。
     {
         let backfilled = storage
             .backfill_metadata_from_blocks(&chain.get_all_blocks())
@@ -88,7 +157,7 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         info!(
             "metadata 投影回填完成: {} 条(投影表共 {} 条)",
             backfilled,
-            storage.metadata_projection_count().await.unwrap_or(-1)
+            storage.metadata_projection_count().await?
         );
     }
 
@@ -99,8 +168,6 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         config.aggregation.count_threshold,
     );
 
-    // 加载用户
-    let users = storage.get_all_users().await?;
     for user in users {
         auth_service.load_user(user);
     }
@@ -131,15 +198,13 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("清理过期认证审计记录失败: {}", e),
     }
 
-    // 加载版本
-    let versions = storage.get_all_versions().await?;
     for version in versions {
         version_tracker.load_version(version);
     }
 
-    // 加载历史聚合结果，恢复查询结果和聚合计数。
-    let aggregations = storage.get_all_aggregations().await?;
-    for summary in aggregations {
+    // 加载历史聚合结果，恢复查询结果和聚合计数。aggregations 非可重建投影
+    // (前置核实:含递归合并历史状态,不是纯区块导出),已在启动扫描阶段读取并 fail-closed。
+    for summary in recovery.aggregations {
         aggregation_engine.load_aggregation(summary);
     }
 
@@ -274,4 +339,58 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Block;
+
+    #[tokio::test]
+    async fn initialize_or_load_chain_creates_and_persists_genesis_for_empty_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let dsn = directory.path().join("datachain.sqlite");
+        let storage = create_storage(dsn.to_str().unwrap()).await.unwrap();
+        let chain = create_chain(1, 100);
+
+        initialize_or_load_chain(&chain, &storage).await.unwrap();
+
+        assert_eq!(chain.get_block_count(), 1);
+        let stored_blocks = storage.get_all_blocks().await.unwrap();
+        assert_eq!(stored_blocks.len(), 1);
+        assert_eq!(stored_blocks[0].index, 0);
+        assert_eq!(stored_blocks[0].previous_hash, "0");
+        assert!(chain.validate_loaded_blocks(&stored_blocks).is_ok());
+    }
+
+    #[tokio::test]
+    async fn initialize_or_load_chain_rejects_corrupt_storage_without_mutating_memory_or_database()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let dsn = directory.path().join("datachain.sqlite");
+        let storage = create_storage(dsn.to_str().unwrap()).await.unwrap();
+        let mut corrupt = Block::new(0, "0".to_string(), 1);
+        corrupt.mine();
+        corrupt.metadata_list.push(crate::core::MetadataEntry {
+            data_id: "tampered-after-mining".to_string(),
+            data_size: 1,
+            created_at: chrono::Utc::now(),
+            modified_at: chrono::Utc::now(),
+            owner: "tester".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        });
+        storage.save_block(&corrupt).await.unwrap();
+        let blocks_before = serde_json::to_value(storage.get_all_blocks().await.unwrap()).unwrap();
+        let chain = create_chain(1, 100);
+
+        assert!(initialize_or_load_chain(&chain, &storage).await.is_err());
+        assert_eq!(chain.get_block_count(), 0);
+        assert_eq!(
+            serde_json::to_value(storage.get_all_blocks().await.unwrap()).unwrap(),
+            blocks_before
+        );
+    }
 }

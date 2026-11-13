@@ -289,28 +289,7 @@ impl Chain {
     /// 验证整条链的完整性
     pub fn validate_chain(&self) -> bool {
         let blocks = self.blocks.read();
-
-        for i in 1..blocks.len() {
-            let current = &blocks[i];
-            let previous = &blocks[i - 1];
-
-            // 验证哈希
-            if current.hash != current.calculate_hash() {
-                return false;
-            }
-
-            // 验证链接
-            if current.previous_hash != previous.hash {
-                return false;
-            }
-
-            // 验证工作量证明
-            if !current.is_valid() {
-                return false;
-            }
-        }
-
-        true
+        Self::validate_blocks(&blocks).is_ok()
     }
 
     /// 获取链信息
@@ -333,6 +312,36 @@ impl Chain {
 
     /// 验证待加载区块，不通过时不替换当前内存链。
     pub fn validate_loaded_blocks(&self, blocks: &[Block]) -> Result<()> {
+        Self::validate_blocks(blocks)
+    }
+
+    /// 定位候选区块序列中第一个校验失败的区块索引。不改变 validate_blocks 本身的
+    /// 校验规则,只是在已知失败的前提下复用相同规则逐块重放以报告具体位置,
+    /// 供 `/chain/validate` 等需要展示 `invalid_block` 的场景使用。
+    /// 链本身通过校验或为空时返回 None。
+    pub fn find_first_invalid_block_index(blocks: &[Block]) -> Option<i64> {
+        if blocks.is_empty() {
+            return None;
+        }
+        let genesis = &blocks[0];
+        if genesis.index != 0 || genesis.previous_hash != "0" {
+            return Some(genesis.index);
+        }
+        for (position, block) in blocks.iter().enumerate() {
+            let invalid = block.index != position as i64
+                || block.hash != block.calculate_hash()
+                || !block.is_valid()
+                || block.merkle_root != block.calculate_merkle_root()
+                || (position > 0 && block.previous_hash != blocks[position - 1].hash);
+            if invalid {
+                return Some(block.index);
+            }
+        }
+        None
+    }
+
+    /// 以统一的完整规则验证候选区块序列。
+    fn validate_blocks(blocks: &[Block]) -> Result<()> {
         if blocks.is_empty() {
             return Err(DataChainError::InvalidChain);
         }
@@ -419,6 +428,44 @@ pub fn create_chain(difficulty: u32, block_size: usize) -> Arc<Chain> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{CatalogPayload, Subject};
+
+    fn metadata_entry(data_id: &str) -> MetadataEntry {
+        MetadataEntry {
+            data_id: data_id.to_string(),
+            data_size: 1,
+            created_at: Utc::now(),
+            modified_at: Utc::now(),
+            owner: "tester".to_string(),
+            hashes: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            parent_id: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn valid_two_block_chain() -> Vec<Block> {
+        let mut genesis = Block::new(0, "0".to_string(), 1);
+        genesis.mine();
+        let mut next = Block::new(1, genesis.hash.clone(), 1);
+        next.mine();
+        vec![genesis, next]
+    }
+
+    fn assert_validation_entrypoints_agree(blocks: Vec<Block>, expected_valid: bool) {
+        let chain = Chain::new(1, 100);
+        assert_eq!(
+            chain.validate_loaded_blocks(&blocks).is_ok(),
+            expected_valid,
+            "validate_loaded_blocks 的结果不符合预期"
+        );
+        chain.load_blocks(blocks);
+        assert_eq!(
+            chain.validate_chain(),
+            expected_valid,
+            "validate_chain 的结果不符合预期"
+        );
+    }
 
     #[test]
     fn test_chain_init() {
@@ -451,5 +498,133 @@ mod tests {
             tags: Vec::new(),
         });
         assert!(chain.validate_loaded_blocks(&[genesis]).is_err());
+    }
+
+    #[test]
+    fn validate_chain_rejects_reminted_genesis_with_invalid_previous_hash() {
+        let chain = Chain::new(1, 100);
+        let mut genesis = Block::new(0, "not-the-genesis-parent".to_string(), 1);
+        genesis.mine();
+        chain.load_blocks(vec![genesis]);
+
+        assert!(!chain.validate_chain());
+    }
+
+    #[test]
+    fn validate_chain_rejects_metadata_tampered_after_mining() {
+        let chain = Chain::new(1, 100);
+        let mut genesis = Block::new(0, "0".to_string(), 1);
+        genesis.add_metadata(metadata_entry("original-data-id"));
+        genesis.mine();
+        genesis.metadata_list[0].data_id = "tampered-data-id".to_string();
+        chain.load_blocks(vec![genesis]);
+
+        assert!(!chain.validate_chain());
+    }
+
+    #[test]
+    fn validation_entrypoints_accept_valid_chain_and_reject_empty_chain() {
+        assert_validation_entrypoints_agree(valid_two_block_chain(), true);
+        assert_validation_entrypoints_agree(Vec::new(), false);
+    }
+
+    #[test]
+    fn validation_entrypoints_reject_invalid_genesis_and_index_sequence() {
+        let mut invalid_genesis_index = valid_two_block_chain();
+        invalid_genesis_index[0].index = 1;
+        invalid_genesis_index[0].mine();
+        invalid_genesis_index[1].previous_hash = invalid_genesis_index[0].hash.clone();
+        invalid_genesis_index[1].mine();
+        assert_validation_entrypoints_agree(invalid_genesis_index, false);
+
+        let mut invalid_genesis_parent = valid_two_block_chain();
+        invalid_genesis_parent[0].previous_hash = "invalid-parent".to_string();
+        invalid_genesis_parent[0].mine();
+        invalid_genesis_parent[1].previous_hash = invalid_genesis_parent[0].hash.clone();
+        invalid_genesis_parent[1].mine();
+        assert_validation_entrypoints_agree(invalid_genesis_parent, false);
+
+        let mut non_continuous_indexes = valid_two_block_chain();
+        non_continuous_indexes[1].index = 2;
+        non_continuous_indexes[1].mine();
+        assert_validation_entrypoints_agree(non_continuous_indexes, false);
+    }
+
+    #[test]
+    fn validation_entrypoints_reject_invalid_hash_pow_and_link() {
+        let mut invalid_saved_hash = valid_two_block_chain();
+        invalid_saved_hash[1].hash = "invalid-saved-hash".to_string();
+        assert_validation_entrypoints_agree(invalid_saved_hash, false);
+
+        let mut invalid_pow = valid_two_block_chain();
+        invalid_pow[1].difficulty = 4;
+        while invalid_pow[1]
+            .calculate_hash()
+            .starts_with(&"0".repeat(invalid_pow[1].difficulty as usize))
+        {
+            invalid_pow[1].nonce += 1;
+        }
+        invalid_pow[1].hash = invalid_pow[1].calculate_hash();
+        assert!(
+            !invalid_pow[1].is_valid(),
+            "反例必须不满足该区块自身的 difficulty"
+        );
+        assert_validation_entrypoints_agree(invalid_pow, false);
+
+        let mut invalid_link = valid_two_block_chain();
+        invalid_link[1].previous_hash = "invalid-previous-hash".to_string();
+        invalid_link[1].mine();
+        assert_validation_entrypoints_agree(invalid_link, false);
+    }
+
+    #[test]
+    fn validation_entrypoints_reject_tampered_merkle_payloads() {
+        let mut invalid_metadata = valid_two_block_chain();
+        invalid_metadata[1].add_metadata(metadata_entry("original-metadata"));
+        invalid_metadata[1].mine();
+        invalid_metadata[1].metadata_list[0].data_id = "tampered-metadata".to_string();
+        assert_validation_entrypoints_agree(invalid_metadata, false);
+
+        let mut invalid_key_transaction = valid_two_block_chain();
+        invalid_key_transaction[1]
+            .key_transactions
+            .push(KeyTransactionEntry {
+                tx_type: "register".to_string(),
+                target_key: "original-key".to_string(),
+                role: "node".to_string(),
+                label: String::new(),
+                signed_by: "original-key".to_string(),
+                signature: "signature".to_string(),
+                timestamp: 1,
+                reason: String::new(),
+            });
+        invalid_key_transaction[1].mine();
+        invalid_key_transaction[1].key_transactions[0].target_key = "tampered-key".to_string();
+        assert_validation_entrypoints_agree(invalid_key_transaction, false);
+
+        let mut invalid_catalog_record = valid_two_block_chain();
+        invalid_catalog_record[1]
+            .catalog_records
+            .push(CatalogRecord {
+                record_id: "record-1".to_string(),
+                payload: CatalogPayload::Subject(Subject {
+                    subject_id: "subject-1".to_string(),
+                    subject_type: "repository".to_string(),
+                    display_name: "Original subject".to_string(),
+                    source_ref: String::new(),
+                }),
+                issuer_identity: "issuer".to_string(),
+                issuer_key: "key".to_string(),
+                signature: "signature".to_string(),
+                recorded_at: 1,
+            });
+        invalid_catalog_record[1].mine();
+        let CatalogPayload::Subject(subject) =
+            &mut invalid_catalog_record[1].catalog_records[0].payload
+        else {
+            panic!("测试夹具应为 Subject 目录记录");
+        };
+        subject.display_name = "Tampered subject".to_string();
+        assert_validation_entrypoints_agree(invalid_catalog_record, false);
     }
 }

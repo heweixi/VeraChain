@@ -139,7 +139,8 @@ pub async fn login(
         )
             .into_response(),
         Err(e) => {
-            // 存储等内部故障:不向客户端泄露细节。
+            // 数据损坏(DataCorruption)与存储等内部故障一律 500,
+            // 不伪装成凭证错误,也不向客户端泄露细节(详情仅写日志)。
             tracing::error!("登录失败(内部错误): {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -255,14 +256,22 @@ pub async fn refresh_token(
         Err(e) => {
             // 区分 HTTP 语义：令牌无效/过期/复用等客户端凭证问题 => 401；
             // 底层数据库/存储故障 => 500，避免把服务端故障伪装成鉴权失败而掩盖问题。
-            let status = match e {
+            // 数据损坏(DataCorruption)同属服务端故障 => 500,且不向客户端泄露细节(仅写日志)。
+            match e {
                 crate::error::DataChainError::DatabaseError(_)
-                | crate::error::DataChainError::StorageError(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                | crate::error::DataChainError::StorageError(_)
+                | crate::error::DataChainError::DataCorruption { .. } => {
+                    tracing::error!("刷新令牌失败(内部错误): {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("internal error")),
+                    ))
                 }
-                _ => StatusCode::UNAUTHORIZED,
-            };
-            Err((status, Json(ApiResponse::error(e.to_string()))))
+                _ => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiResponse::error(e.to_string())),
+                )),
+            }
         }
     }
 }
@@ -441,14 +450,59 @@ pub async fn mine_block(
 }
 
 #[derive(Serialize)]
+pub struct CorruptionInfo {
+    pub category: &'static str,
+    pub table: &'static str,
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
 pub struct ValidateResponse {
     pub valid: bool,
     pub block_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corruption: Option<CorruptionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_block: Option<i64>,
 }
 
+/// `{valid,block_count}` 字段语义不变(来自内存 Chain);新增只读扫描存储权威源,
+/// 检测是否存在数据损坏,仅在非空时附加 corruption/invalid_block。
+/// 状态码始终 200,不因损坏或链无效而改变(与此前行为兼容)。
 pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<ValidateResponse>> {
     let valid = state.chain.validate_chain();
     let block_count = state.chain.get_block_count();
+
+    let mut corruption = None;
+    let mut invalid_block = None;
+
+    match state.storage.get_all_blocks().await {
+        Err(crate::error::DataChainError::DataCorruption {
+            category,
+            table,
+            key,
+            reason,
+        }) => {
+            corruption = Some(CorruptionInfo {
+                category: match category {
+                    crate::error::CorruptionCategory::Authoritative => "authoritative",
+                    crate::error::CorruptionCategory::Rebuildable => "rebuildable",
+                },
+                table,
+                key,
+                reason,
+            });
+        }
+        Err(_) => {}
+        Ok(_) => {
+            if !valid {
+                invalid_block = crate::core::Chain::find_first_invalid_block_index(
+                    &state.chain.get_all_blocks(),
+                );
+            }
+        }
+    }
 
     state.event_bus.publish(Event::new(
         EventType::ChainValidated,
@@ -457,6 +511,8 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
     Json(ApiResponse::success(ValidateResponse {
         valid,
         block_count,
+        corruption,
+        invalid_block,
     }))
 }
 

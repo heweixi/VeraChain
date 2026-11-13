@@ -1,6 +1,8 @@
 //! 认证加固测试共用的最小 AppState 构建与 HTTP 辅助函数。
 #![allow(dead_code)]
 
+pub mod corrupt;
+
 use std::sync::Arc;
 
 use axum::body::Body;
