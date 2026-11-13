@@ -1,6 +1,8 @@
 use clap::Subcommand;
 
-use crate::auth::{create_auth_service, LoginContext, LoginRequest, RegisterRequest, Role};
+use crate::auth::{
+    create_auth_service_with_settings, LoginContext, LoginRequest, RegisterRequest, Role,
+};
 use crate::config::AppConfig;
 use crate::storage::create_storage;
 
@@ -52,10 +54,10 @@ pub enum UserAction {
 /// 运行用户命令
 pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<()> {
     let storage = create_storage(&config.database.dsn).await?;
-    let auth_service = create_auth_service(
+    let auth_service = create_auth_service_with_settings(
         config.jwt.secret.clone(),
-        config.jwt.expire_hours,
         storage.clone(),
+        config.auth_settings(),
     );
 
     // 加载用户

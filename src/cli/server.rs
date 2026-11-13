@@ -4,7 +4,7 @@ use tracing::info;
 use crate::aggregation::{create_aggregation_engine, create_scheduler};
 use crate::api;
 use crate::api::{Event, EventBus, EventType, NotificationService};
-use crate::auth::create_auth_service;
+use crate::auth::create_auth_service_with_settings;
 use crate::config::AppConfig;
 use crate::core::create_chain;
 use crate::metadata::create_metadata_manager;
@@ -190,10 +190,29 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     );
 
     // 创建服务
-    let auth_service = create_auth_service(
+    let auth_settings = config.auth_settings();
+    storage.set_active_cache_ttl(std::time::Duration::from_secs(
+        config.auth.active_cache_ttl_secs,
+    ));
+    info!(
+        access_expire_hours = auth_settings.access_expire_hours,
+        refresh_expire_days = auth_settings.refresh_expire_days,
+        login_user_max_attempts = auth_settings.login_limits.user_max_attempts,
+        login_ip_max_attempts = auth_settings.login_limits.ip_max_attempts,
+        login_window_secs = auth_settings.login_limits.window_secs,
+        lockout_base_secs = auth_settings.lockout.base_secs,
+        lockout_max_secs = auth_settings.lockout.max_secs,
+        lockout_reset_secs = auth_settings.lockout.reset_secs,
+        audit_retention_days = config.auth.audit_retention_days,
+        active_cache_ttl_secs = config.auth.active_cache_ttl_secs,
+        password_min_length = auth_settings.password_min_length,
+        trusted_proxies = config.auth.trusted_proxies.len(),
+        "认证参数已生效"
+    );
+    let auth_service = create_auth_service_with_settings(
         config.jwt.secret.clone(),
-        config.jwt.expire_hours,
         storage.clone(),
+        auth_settings,
     );
     let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
 
@@ -232,15 +251,16 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("清理过期刷新令牌撤销记录失败: {}", e),
     }
 
-    // 清理已过期的登录会话,以及超出保留期(90 天)的认证审计日志。
+    // 清理已过期的登录会话,以及超出保留期(`auth.audit_retention_days`,默认 90 天)的认证审计日志。
     let now_ts = chrono::Utc::now().timestamp();
     match storage.purge_expired_sessions(now_ts).await {
         Ok(n) if n > 0 => info!("已清理 {} 条过期会话", n),
         Ok(_) => {}
         Err(e) => tracing::warn!("清理过期会话失败: {}", e),
     }
+    let audit_retention_secs = config.auth.audit_retention_days as i64 * 86400;
     match storage
-        .purge_audit_before(now_ts - crate::storage::AUDIT_RETENTION_SECS)
+        .purge_audit_before(now_ts - audit_retention_secs)
         .await
     {
         Ok(n) if n > 0 => info!("已清理 {} 条过期认证审计记录", n),

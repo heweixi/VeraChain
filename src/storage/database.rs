@@ -1234,14 +1234,17 @@ impl Storage {
     /// 严格扫描 `auth_audit_log`(审计证据,启动时损坏只告警不阻塞,由调用方决定)。
     /// key 为自增主键 `id`;reason 同 [`Storage::scan_sessions`]。
     pub async fn scan_auth_audit_log(&self) -> Result<usize> {
+        use futures_util::TryStreamExt;
         use sqlx::Row;
-        let rows = sqlx::query(
+        // 流式逐行处理,审计表体量大时不会整表读入内存。
+        let mut scanned: usize = 0;
+        let mut rows = sqlx::query(
             "SELECT id, ts, event_type, user_id, username_attempted, session_id, ip_hash, \
              user_agent, result, reason FROM auth_audit_log ORDER BY id ASC",
         )
-        .fetch_all(&self.pool)
-        .await?;
-        for row in &rows {
+        .fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
+            scanned += 1;
             let key = row
                 .try_get::<i64, _>("id")
                 .map(|id| id.to_string())
@@ -1270,7 +1273,7 @@ impl Storage {
                     .map_err(|_| invalid(column))?;
             }
         }
-        Ok(rows.len())
+        Ok(scanned)
     }
 
     /// 扫描报错时的 key:优先取文本主键列,不可解码则退化为 `rowid=<n>`(不回显任何内容)。

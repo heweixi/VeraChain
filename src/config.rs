@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::auth::{AuthSettings, LockoutPolicy, LoginLimits};
+use crate::net::TrustedProxies;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -13,6 +16,45 @@ pub struct AppConfig {
     pub chain_identity: ChainIdentityConfig,
     #[serde(default)]
     pub claim_policy: ClaimPolicyConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// 认证参数(`[auth]` 段)。缺省值等于此前的硬编码行为;未知键直接报错,避免拼写错误被静默忽略。
+///
+/// 不能 `derive(Default)`:那会把数值置 0,绕过各字段的默认值(同 [`ClaimPolicyConfig`])。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    pub login_user_max_attempts: u64,
+    pub login_ip_max_attempts: u64,
+    pub login_window_secs: u64,
+    pub lockout_base_secs: u64,
+    pub lockout_max_secs: u64,
+    pub lockout_reset_secs: u64,
+    pub audit_retention_days: u64,
+    /// is_active 缓存 TTL(秒);0 表示禁用缓存。
+    pub active_cache_ttl_secs: u64,
+    pub password_min_length: usize,
+    /// 可信代理(IP 或 CIDR)。默认为空:不信任任何代理。
+    pub trusted_proxies: Vec<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            login_user_max_attempts: 5,
+            login_ip_max_attempts: 20,
+            login_window_secs: 900,
+            lockout_base_secs: 900,
+            lockout_max_secs: 3600,
+            lockout_reset_secs: 86400,
+            audit_retention_days: 90,
+            active_cache_ttl_secs: 5,
+            password_min_length: 8,
+            trusted_proxies: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +91,8 @@ pub struct JwtConfig {
     pub secret: String,
     #[serde(default = "default_expire")]
     pub expire_hours: u64,
+    #[serde(default = "default_refresh_expire_days")]
+    pub refresh_expire_days: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +212,9 @@ fn default_secret() -> String {
 fn default_expire() -> u64 {
     24
 }
+fn default_refresh_expire_days() -> u64 {
+    7
+}
 fn default_time_interval() -> u64 {
     3600
 }
@@ -207,6 +254,7 @@ impl Default for AppConfig {
             jwt: JwtConfig {
                 secret: default_secret(),
                 expire_hours: default_expire(),
+                refresh_expire_days: default_refresh_expire_days(),
             },
             aggregation: AggregationConfig {
                 time_interval_secs: default_time_interval(),
@@ -217,12 +265,40 @@ impl Default for AppConfig {
             },
             chain_identity: ChainIdentityConfig::default(),
             claim_policy: ClaimPolicyConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
 
+/// 解析数值型环境变量;失败时错误含变量名与期望格式(不回显取值以外的内容)。
+fn parse_env_number<T: std::str::FromStr>(name: &str, raw: &str) -> anyhow::Result<T> {
+    raw.trim().parse::<T>().map_err(|_| {
+        anyhow::anyhow!(
+            "environment variable {} must be a non-negative integer, got `{}`",
+            name,
+            raw
+        )
+    })
+}
+
+/// 校验 `[min, max]` 闭区间,错误含配置键名与实际值。
+fn check_range(key: &str, value: u64, min: u64, max: u64) -> anyhow::Result<()> {
+    if value < min || value > max {
+        anyhow::bail!("{} ({}) must be between {} and {}", key, value, min, max);
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
+        Self::load_with_env(path, |name| std::env::var(name).ok())
+    }
+
+    /// 与 [`AppConfig::load`] 相同,但环境变量经 `env` 读取(测试 seam,避免 `set_var` 并行污染)。
+    pub fn load_with_env(
+        path: &str,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
         let mut config = if Path::new(path).exists() {
             let content = std::fs::read_to_string(path)?;
             toml::from_str::<AppConfig>(&content)?
@@ -230,53 +306,156 @@ impl AppConfig {
             Self::default()
         };
 
-        config.apply_environment();
+        config.apply_environment(&env)?;
         config.validate()?;
         Ok(config)
     }
 
     /// 应用部署环境覆盖，避免把生产密钥写入配置文件。
-    fn apply_environment(&mut self) {
-        if let Ok(secret) = std::env::var("DATACHAIN_JWT_SECRET") {
+    ///
+    /// 既有键保持"解析失败即忽略"的旧行为;新增的认证相关键解析失败直接报错。
+    fn apply_environment(&mut self, env: &impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
+        if let Some(secret) = env("DATACHAIN_JWT_SECRET") {
             self.jwt.secret = secret;
-        } else if let Ok(secret) = std::env::var("JWT_SECRET") {
+        } else if let Some(secret) = env("JWT_SECRET") {
             self.jwt.secret = secret;
         }
-        if let Ok(dsn) = std::env::var("DATACHAIN_DATABASE_DSN") {
+        if let Some(dsn) = env("DATACHAIN_DATABASE_DSN") {
             self.database.dsn = dsn;
         }
-        if let Ok(host) = std::env::var("DATACHAIN_SERVER_HOST") {
+        if let Some(host) = env("DATACHAIN_SERVER_HOST") {
             self.server.host = host;
         }
-        if let Ok(port) = std::env::var("DATACHAIN_SERVER_PORT") {
+        if let Some(port) = env("DATACHAIN_SERVER_PORT") {
             if let Ok(port) = port.parse() {
                 self.server.port = port;
             }
         }
-        if let Ok(cert) = std::env::var("DATACHAIN_TLS_CERT") {
+        if let Some(cert) = env("DATACHAIN_TLS_CERT") {
             self.server.tls_cert = Some(cert);
         }
-        if let Ok(key) = std::env::var("DATACHAIN_TLS_KEY") {
+        if let Some(key) = env("DATACHAIN_TLS_KEY") {
             self.server.tls_key = Some(key);
         }
-        if let Ok(v) = std::env::var("DATACHAIN_CHAIN_ID") {
+        if let Some(v) = env("DATACHAIN_CHAIN_ID") {
             self.chain_identity.chain_id = v;
         }
-        if let Ok(v) = std::env::var("DATACHAIN_NODE_ID") {
+        if let Some(v) = env("DATACHAIN_NODE_ID") {
             self.chain_identity.node_id = v;
         }
-        if let Ok(v) = std::env::var("DATACHAIN_NODE_SECRET") {
+        if let Some(v) = env("DATACHAIN_NODE_SECRET") {
             self.chain_identity.node_secret = Some(v);
         }
-        if let Ok(v) = std::env::var("DATACHAIN_ANCHOR_ENDPOINT") {
+        if let Some(v) = env("DATACHAIN_ANCHOR_ENDPOINT") {
             self.chain_identity.anchor_endpoint = Some(v);
         }
-        if let Ok(v) = std::env::var("DATACHAIN_TARGET_CHAIN_ID") {
+        if let Some(v) = env("DATACHAIN_TARGET_CHAIN_ID") {
             self.chain_identity.target_chain_id = v;
         }
-        if let Ok(v) = std::env::var("DATACHAIN_ANCHOR_AUTH_TOKEN") {
+        if let Some(v) = env("DATACHAIN_ANCHOR_AUTH_TOKEN") {
             self.chain_identity.anchor_auth_token = Some(v);
         }
+
+        // 认证相关新键:非法取值启动即失败,错误含变量名。
+        macro_rules! env_number {
+            ($var:literal => $target:expr) => {
+                if let Some(raw) = env($var) {
+                    $target = parse_env_number($var, &raw)?;
+                }
+            };
+        }
+        env_number!("DATACHAIN_JWT_EXPIRE_HOURS" => self.jwt.expire_hours);
+        env_number!("DATACHAIN_JWT_REFRESH_EXPIRE_DAYS" => self.jwt.refresh_expire_days);
+        env_number!("DATACHAIN_AUTH_LOGIN_USER_MAX_ATTEMPTS" => self.auth.login_user_max_attempts);
+        env_number!("DATACHAIN_AUTH_LOGIN_IP_MAX_ATTEMPTS" => self.auth.login_ip_max_attempts);
+        env_number!("DATACHAIN_AUTH_LOGIN_WINDOW_SECS" => self.auth.login_window_secs);
+        env_number!("DATACHAIN_AUTH_LOCKOUT_BASE_SECS" => self.auth.lockout_base_secs);
+        env_number!("DATACHAIN_AUTH_LOCKOUT_MAX_SECS" => self.auth.lockout_max_secs);
+        env_number!("DATACHAIN_AUTH_LOCKOUT_RESET_SECS" => self.auth.lockout_reset_secs);
+        env_number!("DATACHAIN_AUTH_AUDIT_RETENTION_DAYS" => self.auth.audit_retention_days);
+        env_number!("DATACHAIN_AUTH_ACTIVE_CACHE_TTL_SECS" => self.auth.active_cache_ttl_secs);
+        env_number!("DATACHAIN_AUTH_PASSWORD_MIN_LENGTH" => self.auth.password_min_length);
+
+        if let Some(raw) = env("DATACHAIN_AUTH_TRUSTED_PROXIES") {
+            let items: Vec<String> = if raw.trim().is_empty() {
+                Vec::new()
+            } else {
+                raw.split(',').map(|s| s.trim().to_string()).collect()
+            };
+            TrustedProxies::parse(&items).map_err(|e| {
+                anyhow::anyhow!(
+                    "environment variable DATACHAIN_AUTH_TRUSTED_PROXIES is invalid \
+                     (expected comma-separated IPs or CIDRs, /0 not allowed): {}",
+                    e
+                )
+            })?;
+            self.auth.trusted_proxies = items;
+        }
+        Ok(())
+    }
+
+    /// 由配置派生认证服务参数(调用前应已通过 [`AppConfig::validate`])。
+    pub fn auth_settings(&self) -> AuthSettings {
+        AuthSettings {
+            access_expire_hours: self.jwt.expire_hours,
+            refresh_expire_days: self.jwt.refresh_expire_days,
+            login_limits: LoginLimits {
+                user_max_attempts: self.auth.login_user_max_attempts as i64,
+                ip_max_attempts: self.auth.login_ip_max_attempts as i64,
+                window_secs: self.auth.login_window_secs as i64,
+            },
+            lockout: LockoutPolicy {
+                base_secs: self.auth.lockout_base_secs as i64,
+                max_secs: self.auth.lockout_max_secs as i64,
+                reset_secs: self.auth.lockout_reset_secs as i64,
+            },
+            password_min_length: self.auth.password_min_length,
+        }
+    }
+
+    /// 校验认证相关参数的取值范围与相互约束。
+    fn validate_auth(&self) -> anyhow::Result<()> {
+        let a = &self.auth;
+        check_range("jwt.expire_hours", self.jwt.expire_hours, 1, 720)?;
+        check_range(
+            "jwt.refresh_expire_days",
+            self.jwt.refresh_expire_days,
+            1,
+            365,
+        )?;
+        if self.jwt.refresh_expire_days * 24 < self.jwt.expire_hours {
+            anyhow::bail!(
+                "jwt.refresh_expire_days ({} days) must not be shorter than jwt.expire_hours ({})",
+                self.jwt.refresh_expire_days,
+                self.jwt.expire_hours
+            );
+        }
+        check_range("auth.login_user_max_attempts", a.login_user_max_attempts, 1, 1000)?;
+        check_range("auth.login_ip_max_attempts", a.login_ip_max_attempts, 1, 10000)?;
+        check_range("auth.login_window_secs", a.login_window_secs, 60, 86400)?;
+        check_range("auth.lockout_base_secs", a.lockout_base_secs, 60, 86400)?;
+        check_range("auth.lockout_max_secs", a.lockout_max_secs, 1, 604800)?;
+        if a.lockout_max_secs < a.lockout_base_secs {
+            anyhow::bail!(
+                "auth.lockout_max_secs ({}) must be >= auth.lockout_base_secs ({})",
+                a.lockout_max_secs,
+                a.lockout_base_secs
+            );
+        }
+        check_range("auth.lockout_reset_secs", a.lockout_reset_secs, 1, 2592000)?;
+        if a.lockout_reset_secs < a.lockout_max_secs {
+            anyhow::bail!(
+                "auth.lockout_reset_secs ({}) must be >= auth.lockout_max_secs ({})",
+                a.lockout_reset_secs,
+                a.lockout_max_secs
+            );
+        }
+        check_range("auth.audit_retention_days", a.audit_retention_days, 1, 3650)?;
+        check_range("auth.active_cache_ttl_secs", a.active_cache_ttl_secs, 0, 300)?;
+        check_range("auth.password_min_length", a.password_min_length as u64, 4, 72)?;
+        TrustedProxies::parse(&a.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("auth.trusted_proxies is invalid: {}", e))?;
+        Ok(())
     }
 
     /// 校验生产安全前置条件。
@@ -314,6 +493,7 @@ impl AppConfig {
                 );
             }
         }
+        self.validate_auth()?;
         Ok(())
     }
 

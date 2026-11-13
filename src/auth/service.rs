@@ -37,6 +37,52 @@ impl Default for LoginLimits {
     }
 }
 
+/// 用户名维度的指数退避锁定策略(秒)。
+#[derive(Debug, Clone, Copy)]
+pub struct LockoutPolicy {
+    /// 首次锁定时长。
+    pub base_secs: i64,
+    /// 锁定时长上限。
+    pub max_secs: i64,
+    /// 距上次锁定结束超过该时长后,退避级别归零。
+    pub reset_secs: i64,
+}
+
+impl Default for LockoutPolicy {
+    fn default() -> Self {
+        Self {
+            base_secs: 900,
+            max_secs: 3600,
+            reset_secs: 86400,
+        }
+    }
+}
+
+/// 认证服务的可配置参数;`Default` 等于此前的硬编码行为。
+#[derive(Debug, Clone, Copy)]
+pub struct AuthSettings {
+    /// access token 有效期(小时)。
+    pub access_expire_hours: u64,
+    /// refresh token 有效期(天)。
+    pub refresh_expire_days: u64,
+    pub login_limits: LoginLimits,
+    pub lockout: LockoutPolicy,
+    /// 改密时新密码的最小字符数。
+    pub password_min_length: usize,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            access_expire_hours: 24,
+            refresh_expire_days: 7,
+            login_limits: LoginLimits::default(),
+            lockout: LockoutPolicy::default(),
+            password_min_length: 8,
+        }
+    }
+}
+
 /// 无法取得对端地址时(如进程内 oneshot 测试)IP 维度使用的占位值。
 const UNKNOWN_CLIENT_IP: &str = "unknown";
 
@@ -141,20 +187,51 @@ pub struct AuthService {
     /// 由 JWT 密钥派生的 IP 摘要密钥(与签名用途域分离)。
     ip_hash_key: Vec<u8>,
     login_limits: LoginLimits,
+    lockout: LockoutPolicy,
+    password_min_length: usize,
 }
 
 impl AuthService {
-    /// 创建认证服务
+    /// 创建认证服务(其余参数取默认值)
     pub fn new(jwt_secret: String, jwt_expire_hours: u64, storage: Arc<Storage>) -> Self {
+        Self::with_settings(
+            jwt_secret,
+            storage,
+            AuthSettings {
+                access_expire_hours: jwt_expire_hours,
+                ..AuthSettings::default()
+            },
+        )
+    }
+
+    /// 按完整参数创建认证服务。
+    pub fn with_settings(
+        jwt_secret: String,
+        storage: Arc<Storage>,
+        settings: AuthSettings,
+    ) -> Self {
         Self {
             users: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
             email_index: RwLock::new(HashMap::new()),
-            login_limits: LoginLimits::default(),
+            login_limits: settings.login_limits,
+            lockout: settings.lockout,
+            password_min_length: settings.password_min_length,
             ip_hash_key: format!("datachain-ip-hash:{}", jwt_secret).into_bytes(),
-            jwt_handler: JwtHandler::new(jwt_secret, jwt_expire_hours),
+            jwt_handler: JwtHandler::new(jwt_secret, settings.access_expire_hours)
+                .with_refresh_expire_days(settings.refresh_expire_days),
             storage,
         }
+    }
+
+    /// 当前生效的锁定策略(锁定逻辑由后续切片接入)。
+    pub fn lockout_policy(&self) -> LockoutPolicy {
+        self.lockout
+    }
+
+    /// 当前生效的改密最小密码长度(改密接口由后续切片接入)。
+    pub fn password_min_length(&self) -> usize {
+        self.password_min_length
     }
 
     /// 覆盖登录限速参数(默认 5 次/用户名、20 次/IP、15 分钟窗口)。
@@ -820,6 +897,15 @@ pub fn create_auth_service(
     storage: Arc<Storage>,
 ) -> Arc<AuthService> {
     Arc::new(AuthService::new(jwt_secret, jwt_expire_hours, storage))
+}
+
+/// 按完整参数创建共享的 AuthService 实例。
+pub fn create_auth_service_with_settings(
+    jwt_secret: String,
+    storage: Arc<Storage>,
+    settings: AuthSettings,
+) -> Arc<AuthService> {
+    Arc::new(AuthService::with_settings(jwt_secret, storage, settings))
 }
 
 #[cfg(test)]

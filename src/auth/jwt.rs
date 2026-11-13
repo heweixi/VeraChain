@@ -61,6 +61,12 @@ impl JwtHandler {
         }
     }
 
+    /// 覆盖刷新令牌有效期(天,默认 7)。
+    pub fn with_refresh_expire_days(mut self, days: u64) -> Self {
+        self.refresh_expire_days = days;
+        self
+    }
+
     /// 刷新令牌有效期（秒）。供撤销表哨兵行推导 TTL，避免魔法数。
     pub fn refresh_expire_secs(&self) -> i64 {
         self.refresh_expire_days as i64 * 24 * 3600

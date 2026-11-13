@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod error;
 pub mod identity;
 pub mod metadata;
+pub mod net;
 pub mod node_signing;
 pub mod p2p;
 pub mod storage;

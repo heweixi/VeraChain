@@ -15,6 +15,7 @@ block_size = 100
 [jwt]
 secret = "your-secret-key-change-in-production"
 expire_hours = 24
+# refresh_expire_days = 7
 
 [aggregation]
 time_interval_secs = 3600
@@ -22,3 +23,17 @@ count_threshold = 100
 
 [log]
 level = "info"
+
+# 认证参数(可选,缺省值即下列取值;未知键会使启动失败)。
+# jwt.refresh_expire_days 默认 7(范围 1..=365,且不得短于 expire_hours)。
+# [auth]
+# login_user_max_attempts = 5
+# login_ip_max_attempts = 20
+# login_window_secs = 900
+# lockout_base_secs = 900
+# lockout_max_secs = 3600
+# lockout_reset_secs = 86400
+# audit_retention_days = 90
+# active_cache_ttl_secs = 5
+# password_min_length = 8
+# trusted_proxies = []   # IP 或 CIDR,不允许 /0
