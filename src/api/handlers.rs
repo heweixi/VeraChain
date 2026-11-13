@@ -1,16 +1,17 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
 
 use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
-use crate::auth::{Claims, LoginRequest, RegisterRequest};
+use crate::auth::{Claims, LoginContext, LoginRequest, RegisterRequest};
 use crate::core::{metadata_leaf_hash, MerkleTree};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::p2p::{PeerRegistration, SyncBlocksRequest, SyncBlocksResponse, SyncQuery};
@@ -106,9 +107,18 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.auth_service.login(&req) {
+    let ctx = LoginContext {
+        // 仅使用对端地址;不信任 X-Forwarded-For。
+        client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
+    };
+    match state.auth_service.login(&req, &ctx).await {
         Ok(resp) => Ok((StatusCode::OK, Json(ApiResponse::success(resp)))),
         Err(e) => Err((
             StatusCode::UNAUTHORIZED,

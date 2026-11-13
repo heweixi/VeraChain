@@ -1,6 +1,6 @@
 use clap::Subcommand;
 
-use crate::auth::{create_auth_service, LoginRequest, RegisterRequest, Role};
+use crate::auth::{create_auth_service, LoginContext, LoginRequest, RegisterRequest, Role};
 use crate::config::AppConfig;
 use crate::storage::create_storage;
 
@@ -119,7 +119,7 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
         UserAction::Login { username, password } => {
             let req = LoginRequest { username, password };
 
-            match auth_service.login(&req) {
+            match auth_service.login(&req, &LoginContext::default()).await {
                 Ok(resp) => {
                     println!("✓ 登录成功");
                     println!("  用户: {}", resp.user.username);

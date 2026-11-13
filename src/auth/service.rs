@@ -5,7 +5,53 @@ use std::sync::Arc;
 use super::{JwtHandler, LoginRequest, LoginResponse, RegisterRequest, Role, User};
 use crate::crypto::{hash_password, verify_password};
 use crate::error::{DataChainError, Result};
-use crate::storage::Storage;
+use crate::storage::{SessionRecord, Storage};
+
+/// 登录请求的客户端上下文,用于会话审计字段。
+#[derive(Debug, Clone, Default)]
+pub struct LoginContext {
+    /// 对端 IP(来自连接信息,不信任 XFF)。仅用于计算 HMAC 摘要,不落盘、不进日志。
+    pub client_ip: Option<String>,
+    /// 原始 User-Agent,入库前会去控制字符并截断。
+    pub user_agent: Option<String>,
+}
+
+/// user_agent 入库长度上限(字符数)。
+const USER_AGENT_MAX_CHARS: usize = 200;
+
+/// 去控制字符并截断,防止日志注入与超长写入。
+fn sanitize_user_agent(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(USER_AGENT_MAX_CHARS)
+        .collect()
+}
+
+/// HMAC-SHA256(RFC 2104)。仅用于派生 IP 摘要,避免引入额外依赖。
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for ((inner_byte, outer_byte), key_byte) in ipad.iter_mut().zip(opad.iter_mut()).zip(k.iter()) {
+        *inner_byte ^= key_byte;
+        *outer_byte ^= key_byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
 
 /// 认证服务
 pub struct AuthService {
@@ -14,6 +60,8 @@ pub struct AuthService {
     email_index: RwLock<HashMap<String, String>>, // email -> user_id
     jwt_handler: JwtHandler,
     storage: Arc<Storage>,
+    /// 由 JWT 密钥派生的 IP 摘要密钥(与签名用途域分离)。
+    ip_hash_key: Vec<u8>,
 }
 
 impl AuthService {
@@ -23,9 +71,15 @@ impl AuthService {
             users: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
             email_index: RwLock::new(HashMap::new()),
+            ip_hash_key: format!("datachain-ip-hash:{}", jwt_secret).into_bytes(),
             jwt_handler: JwtHandler::new(jwt_secret, jwt_expire_hours),
             storage,
         }
+    }
+
+    /// 客户端 IP 的 HMAC 摘要:取前 16 字节的十六进制(32 字符)。
+    pub fn hash_client_ip(&self, ip: &str) -> String {
+        hex::encode(&hmac_sha256(&self.ip_hash_key, ip.as_bytes())[..16])
     }
 
     /// 公开注册:始终创建普通用户,不接受客户端指定高权限角色。
@@ -72,8 +126,8 @@ impl AuthService {
         Ok(user)
     }
 
-    /// 用户登录
-    pub fn login(&self, req: &LoginRequest) -> Result<LoginResponse> {
+    /// 用户登录。成功时在同一流程内创建会话,access token 携带 `sid`。
+    pub async fn login(&self, req: &LoginRequest, ctx: &LoginContext) -> Result<LoginResponse> {
         // 获取用户
         let user_id = {
             let username_index = self.username_index.read();
@@ -112,11 +166,27 @@ impl AuthService {
         // 注意：login 不向撤销表写入任何记录，新 family 的令牌默认有效，
         // 进程重启后仍有效直至过期——设计上可接受。
         let family_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let session = SessionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: user.user_id.clone(),
+            refresh_family: family_id.clone(),
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now + self.jwt_handler.refresh_expire_secs(),
+            revoked_at: None,
+            revoke_reason: None,
+            ip_hash: ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip)),
+            user_agent: ctx.user_agent.as_deref().map(sanitize_user_agent),
+        };
+        self.storage.create_session(&session).await?;
+
         let token_pair = self.jwt_handler.generate_token_pair(
             &user.user_id,
             &user.username,
             user.role,
             &family_id,
+            Some(session.id.as_str()),
         )?;
 
         Ok(LoginResponse {
@@ -227,6 +297,8 @@ impl AuthService {
             &user.username,
             user.role,
             &next_family_id,
+            // 刷新尚未接入会话(后续切片处理),暂不携带 sid。
+            None,
         )?;
 
         Ok(LoginResponse {
@@ -339,7 +411,7 @@ mod tests {
         create_auth_service("test-secret".to_string(), 24, storage)
     }
 
-    fn register_login(service: &AuthService) -> LoginResponse {
+    async fn register_login(service: &AuthService) -> LoginResponse {
         let req = RegisterRequest {
             username: "alice".to_string(),
             password: "password123".to_string(),
@@ -348,17 +420,37 @@ mod tests {
         };
         service.register(&req).unwrap();
         service
-            .login(&LoginRequest {
-                username: "alice".to_string(),
-                password: "password123".to_string(),
-            })
+            .login(
+                &LoginRequest {
+                    username: "alice".to_string(),
+                    password: "password123".to_string(),
+                },
+                &LoginContext::default(),
+            )
+            .await
             .unwrap()
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn sanitize_user_agent_strips_controls_and_truncates() {
+        let cleaned = sanitize_user_agent(&format!("a\u{1b}[0m\n{}", "b".repeat(500)));
+        assert!(!cleaned.chars().any(|c| c.is_control()));
+        assert_eq!(cleaned.chars().count(), 200);
     }
 
     #[tokio::test]
     async fn refresh_rotates_and_invalidates_old_token() {
         let service = build_service().await;
-        let login = register_login(&service);
+        let login = register_login(&service).await;
 
         // 正常轮换成功，拿到新刷新令牌。
         let rotated = service.refresh_token(&login.refresh_token).await.unwrap();
@@ -372,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn reusing_old_refresh_token_triggers_family_revocation() {
         let service = build_service().await;
-        let login = register_login(&service);
+        let login = register_login(&service).await;
 
         // 第一次轮换：旧 token 被撤销。
         let rotated = service.refresh_token(&login.refresh_token).await.unwrap();
@@ -395,7 +487,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_double_spend_yields_single_success() {
         let service = build_service().await;
-        let login = register_login(&service);
+        let login = register_login(&service).await;
 
         let token_a = login.refresh_token.clone();
         let token_b = login.refresh_token.clone();
@@ -442,7 +534,7 @@ mod tests {
             .unwrap();
 
         let service1 = create_auth_service("s".to_string(), 24, storage.clone());
-        let login = register_login(&service1);
+        let login = register_login(&service1).await;
         let rotated = service1.refresh_token(&login.refresh_token).await.unwrap();
 
         // 新建一个 AuthService（不共享内存撤销状态，仅共享 Storage）。
