@@ -9,8 +9,8 @@
 mod common;
 
 use chrono::Utc;
-use datachain::crosschain::{AnchorStatus, ChainAnchor, SignedChainAnchor};
 use datachain::core::MerkleProof;
+use datachain::crosschain::{AnchorStatus, ChainAnchor, SignedChainAnchor};
 use datachain::error::{CorruptionCategory, DataChainError};
 use datachain::storage::create_storage;
 
@@ -42,9 +42,18 @@ fn sample_signed(anchor_id: &str) -> SignedChainAnchor {
 async fn parse_status_rejects_unknown_value_instead_of_defaulting_to_pending() {
     // 直接验证 seam 本身:parse_status 面对未知值不得静默归类为 Pending。
     assert!(AnchorStatus::parse_status("bogus").is_err());
-    assert_eq!(AnchorStatus::parse_status("pending").unwrap(), AnchorStatus::Pending);
-    assert_eq!(AnchorStatus::parse_status("confirmed").unwrap(), AnchorStatus::Confirmed);
-    assert_eq!(AnchorStatus::parse_status("failed").unwrap(), AnchorStatus::Failed);
+    assert_eq!(
+        AnchorStatus::parse_status("pending").unwrap(),
+        AnchorStatus::Pending
+    );
+    assert_eq!(
+        AnchorStatus::parse_status("confirmed").unwrap(),
+        AnchorStatus::Confirmed
+    );
+    assert_eq!(
+        AnchorStatus::parse_status("failed").unwrap(),
+        AnchorStatus::Failed
+    );
 }
 
 #[tokio::test]
@@ -122,7 +131,10 @@ async fn list_pending_anchors_reports_anchor_id_key_for_bad_signed_json() {
     let dsn = dsn.to_str().unwrap();
     let storage = create_storage(dsn).await.unwrap();
 
-    storage.enqueue_anchor(&sample_signed("anchor-2")).await.unwrap();
+    storage
+        .enqueue_anchor(&sample_signed("anchor-2"))
+        .await
+        .unwrap();
     corrupt_outbox(
         dsn,
         "UPDATE anchor_outbox SET signed = ? WHERE anchor_id = ?",
@@ -142,8 +154,14 @@ async fn scan_anchor_outbox_reports_unknown_status_row_filtered_by_pending_query
     let dsn = dsn.to_str().unwrap();
     let storage = create_storage(dsn).await.unwrap();
 
-    storage.enqueue_anchor(&sample_signed("anchor-ok")).await.unwrap();
-    storage.enqueue_anchor(&sample_signed("anchor-bogus")).await.unwrap();
+    storage
+        .enqueue_anchor(&sample_signed("anchor-ok"))
+        .await
+        .unwrap();
+    storage
+        .enqueue_anchor(&sample_signed("anchor-bogus"))
+        .await
+        .unwrap();
     corrupt_outbox(
         dsn,
         "UPDATE anchor_outbox SET status = ? WHERE anchor_id = ?",
@@ -165,7 +183,10 @@ async fn scan_anchor_outbox_reports_bad_receipt_json_on_confirmed_row() {
     let dsn = dsn.to_str().unwrap();
     let storage = create_storage(dsn).await.unwrap();
 
-    storage.enqueue_anchor(&sample_signed("anchor-conf")).await.unwrap();
+    storage
+        .enqueue_anchor(&sample_signed("anchor-conf"))
+        .await
+        .unwrap();
     let pool = common::corrupt::connect(dsn).await;
     sqlx::query("UPDATE anchor_outbox SET status = 'confirmed', receipt = ? WHERE anchor_id = ?")
         .bind("{not valid json")

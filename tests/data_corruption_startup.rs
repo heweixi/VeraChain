@@ -30,12 +30,37 @@ async fn body_json(resp: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
-fn post(uri: &str) -> Request<Body> {
+fn post(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
+        .header("authorization", format!("Bearer {}", token))
         .body(Body::empty())
         .unwrap()
+}
+
+/// `/chain/validate` 是受保护路由:在内存认证服务中注册只读用户并签发合法 token。
+/// token 不依赖 blocks/users 表,可在损坏数据之前或之后获取。
+fn reader_token(state: &AppState) -> String {
+    use datachain::auth::{LoginRequest, RegisterRequest, Role};
+    let req = RegisterRequest {
+        username: "reader".to_string(),
+        password: "readerpass123".to_string(),
+        email: "reader@test.local".to_string(),
+        role: Some(Role::User),
+    };
+    state
+        .auth_service
+        .register_with_role(&req, Role::User)
+        .unwrap();
+    state
+        .auth_service
+        .login(&LoginRequest {
+            username: "reader".to_string(),
+            password: "readerpass123".to_string(),
+        })
+        .unwrap()
+        .token
 }
 
 async fn build_state(dsn: &str) -> AppState {
@@ -49,7 +74,11 @@ async fn build_state(dsn: &str) -> AppState {
         chain.load_blocks(blocks);
     }
 
-    let auth_service = create_auth_service("test-secret-0123456789abcdef".to_string(), 24, storage.clone());
+    let auth_service = create_auth_service(
+        "test-secret-0123456789abcdef".to_string(),
+        24,
+        storage.clone(),
+    );
     let metadata_manager = create_metadata_manager(chain.clone(), storage.clone());
     let version_tracker = {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -93,6 +122,7 @@ async fn chain_validate_http_reports_corruption_without_leaking_sensitive_fields
     let dsn_str = dsn.to_str().unwrap();
 
     let state = build_state(dsn_str).await;
+    let token = reader_token(&state);
     // 用底层接口写一个 users 行,再直接改坏其 metadata 列。
     let user = datachain::auth::User::new(
         "tester".to_string(),
@@ -115,7 +145,10 @@ async fn chain_validate_http_reports_corruption_without_leaking_sensitive_fields
     corrupt_genesis_pool.close().await;
 
     let router = api::create_router(state);
-    let resp = router.oneshot(post("/api/v1/chain/validate")).await.unwrap();
+    let resp = router
+        .oneshot(post("/api/v1/chain/validate", &token))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "损坏时状态码仍保持 200");
     let json = body_json(resp).await;
     let data = &json["data"];
@@ -123,7 +156,10 @@ async fn chain_validate_http_reports_corruption_without_leaking_sensitive_fields
     assert_eq!(data["corruption"]["category"], "authoritative");
 
     let body_str = json.to_string();
-    assert!(!body_str.contains("SECRET-XYZ"), "HTTP body 不得泄露 password_hash");
+    assert!(
+        !body_str.contains("SECRET-XYZ"),
+        "HTTP body 不得泄露 password_hash"
+    );
 }
 
 #[tokio::test]
@@ -131,9 +167,13 @@ async fn chain_validate_http_fields_unchanged_when_healthy() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("dc.db");
     let state = build_state(dsn.to_str().unwrap()).await;
+    let token = reader_token(&state);
     let router = api::create_router(state);
 
-    let resp = router.oneshot(post("/api/v1/chain/validate")).await.unwrap();
+    let resp = router
+        .oneshot(post("/api/v1/chain/validate", &token))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let data = &json["data"];
@@ -188,9 +228,9 @@ async fn startup_scan_fails_closed_on_corrupt_users_before_any_projection_or_pen
 
 #[tokio::test]
 async fn startup_scan_rebuilds_projection_when_only_metadata_table_is_corrupt() {
+    use chrono::Utc;
     use datachain::cli::server::scan_authoritative_sources_and_ensure_projections;
     use datachain::core::MetadataEntry;
-    use chrono::Utc;
 
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("dc.db");
@@ -227,7 +267,10 @@ async fn startup_scan_rebuilds_projection_when_only_metadata_table_is_corrupt() 
         .await
         .unwrap();
     assert!(
-        recovery.projection_report.rebuilt_tables.contains(&"metadata".to_string()),
+        recovery
+            .projection_report
+            .rebuilt_tables
+            .contains(&"metadata".to_string()),
         "got: {:?}",
         recovery.projection_report.rebuilt_tables
     );

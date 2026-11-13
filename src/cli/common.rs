@@ -17,10 +17,7 @@ use crate::storage::Storage;
 /// 读取全部区块、校验、加载进内存链,返回已加载的区块列表供调用方复用
 /// (如 ensure_projections、CLI 输出)。校验失败或读取损坏时返回 Err,
 /// 不会把未经验证的区块加载进 chain。
-pub async fn load_verified_chain(
-    storage: &Arc<Storage>,
-    chain: &Arc<Chain>,
-) -> Result<Vec<Block>> {
+pub async fn load_verified_chain(storage: &Arc<Storage>, chain: &Arc<Chain>) -> Result<Vec<Block>> {
     let blocks = storage.get_all_blocks().await?;
     if !blocks.is_empty() {
         chain.validate_loaded_blocks(&blocks)?;

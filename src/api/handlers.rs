@@ -384,8 +384,9 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
         Err(_) => {}
         Ok(_) => {
             if !valid {
-                invalid_block =
-                    crate::core::Chain::find_first_invalid_block_index(&state.chain.get_all_blocks());
+                invalid_block = crate::core::Chain::find_first_invalid_block_index(
+                    &state.chain.get_all_blocks(),
+                );
             }
         }
     }

@@ -69,7 +69,10 @@ async fn get_block_reports_structured_corruption_with_block_index_key() {
     let err = storage.get_block(0).await.unwrap_err();
     match err {
         DataChainError::DataCorruption {
-            category, table, key, ..
+            category,
+            table,
+            key,
+            ..
         } => {
             assert_eq!(category, CorruptionCategory::Authoritative);
             assert_eq!(table, "blocks");

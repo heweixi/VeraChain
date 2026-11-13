@@ -74,7 +74,12 @@ async fn ensure_projections_rebuilds_metadata_projection_after_row_deleted() {
 
     assert_eq!(storage.metadata_projection_count().await.unwrap(), 2);
     assert_eq!(
-        storage.get_metadata_by_id("m1").await.unwrap().unwrap().owner,
+        storage
+            .get_metadata_by_id("m1")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner,
         "bob"
     );
 }
@@ -89,23 +94,29 @@ async fn ensure_projections_rebuilds_catalog_projection_after_row_corrupted() {
     let storage = create_storage(dsn).await.unwrap();
 
     let mut genesis = Block::new(0, "0".to_string(), 1);
-    genesis.catalog_records.push(datachain::catalog::CatalogRecord {
-        record_id: "rec-1".to_string(),
-        payload: CatalogPayload::Subject(Subject {
-            subject_id: "subj-1".to_string(),
-            subject_type: "package".to_string(),
-            display_name: "demo".to_string(),
-            source_ref: String::new(),
-        }),
-        issuer_identity: "issuer-1".to_string(),
-        issuer_key: "key-1".to_string(),
-        signature: "sig-1".to_string(),
-        recorded_at: Utc::now().timestamp(),
-    });
+    genesis
+        .catalog_records
+        .push(datachain::catalog::CatalogRecord {
+            record_id: "rec-1".to_string(),
+            payload: CatalogPayload::Subject(Subject {
+                subject_id: "subj-1".to_string(),
+                subject_type: "package".to_string(),
+                display_name: "demo".to_string(),
+                source_ref: String::new(),
+            }),
+            issuer_identity: "issuer-1".to_string(),
+            issuer_key: "key-1".to_string(),
+            signature: "sig-1".to_string(),
+            recorded_at: Utc::now().timestamp(),
+        });
     genesis.mine();
     storage.commit_block(&genesis).await.unwrap();
 
-    assert!(storage.get_catalog_subject("subj-1").await.unwrap().is_some());
+    assert!(storage
+        .get_catalog_subject("subj-1")
+        .await
+        .unwrap()
+        .is_some());
 
     // 把投影行的 data 列改成非法 JSON,模拟解析失败型损坏(而非数量不一致)。
     let pool = common::corrupt::connect(dsn).await;
@@ -120,12 +131,18 @@ async fn ensure_projections_rebuilds_catalog_projection_after_row_corrupted() {
         .await
         .unwrap();
     assert!(
-        report.rebuilt_tables.contains(&"catalog_subjects".to_string()),
+        report
+            .rebuilt_tables
+            .contains(&"catalog_subjects".to_string()),
         "解析失败应触发 catalog_subjects 重建, got: {:?}",
         report.rebuilt_tables
     );
 
-    let restored = storage.get_catalog_subject("subj-1").await.unwrap().unwrap();
+    let restored = storage
+        .get_catalog_subject("subj-1")
+        .await
+        .unwrap()
+        .unwrap();
     if let CatalogPayload::Subject(s) = restored.payload {
         assert_eq!(s.display_name, "demo");
     } else {

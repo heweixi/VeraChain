@@ -662,14 +662,13 @@ impl Storage {
                 &e,
             )
         })?;
-        let status = AnchorStatus::parse_status(status).map_err(|_| {
-            DataChainError::DataCorruption {
+        let status =
+            AnchorStatus::parse_status(status).map_err(|_| DataChainError::DataCorruption {
                 category: CorruptionCategory::Authoritative,
                 table: "anchor_outbox",
                 key: anchor_id.to_string(),
                 reason: "unknown_status".to_string(),
-            }
-        })?;
+            })?;
         let receipt = match receipt {
             Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
                 corruption_from_json(
@@ -708,9 +707,13 @@ impl Storage {
             .await?;
 
         rows.into_iter()
-            .map(|(anchor_id, signed, status, attempts, last_error, receipt)| {
-                Self::parse_anchor_row(&anchor_id, &signed, &status, attempts, last_error, receipt)
-            })
+            .map(
+                |(anchor_id, signed, status, attempts, last_error, receipt)| {
+                    Self::parse_anchor_row(
+                        &anchor_id, &signed, &status, attempts, last_error, receipt,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -1157,10 +1160,7 @@ impl Storage {
     /// 做检测;任一失败都视为该表需要重建。
     async fn projection_needs_rebuild(&self, table: &'static str, expected: i64) -> bool {
         let count_sql = format!("SELECT COUNT(*) FROM {}", table);
-        let actual: Option<(i64,)> = sqlx::query_as(&count_sql)
-            .fetch_one(&self.pool)
-            .await
-            .ok();
+        let actual: Option<(i64,)> = sqlx::query_as(&count_sql).fetch_one(&self.pool).await.ok();
         let actual = match actual {
             Some((n,)) => n,
             None => return true,
@@ -1171,12 +1171,13 @@ impl Storage {
 
         // 数量一致时再抽样校验可解析性:逐行尝试反序列化 data 列。
         let data_sql = format!("SELECT data FROM {}", table);
-        let rows: Option<Vec<(String,)>> = sqlx::query_as(&data_sql).fetch_all(&self.pool).await.ok();
+        let rows: Option<Vec<(String,)>> =
+            sqlx::query_as(&data_sql).fetch_all(&self.pool).await.ok();
         match rows {
             None => true,
-            Some(rows) => rows.iter().any(|(data,)| {
-                serde_json::from_str::<serde_json::Value>(data).is_err()
-            }),
+            Some(rows) => rows
+                .iter()
+                .any(|(data,)| serde_json::from_str::<serde_json::Value>(data).is_err()),
         }
     }
 

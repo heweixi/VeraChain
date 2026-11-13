@@ -107,7 +107,10 @@ async fn metadata_list_fails_closed_with_exit_3_on_corrupt_users_table_via_statu
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("SECRET-XYZ"), "stderr 不得泄露 password_hash");
+    assert!(
+        !stderr.contains("SECRET-XYZ"),
+        "stderr 不得泄露 password_hash"
+    );
 }
 
 #[tokio::test]
@@ -158,11 +161,11 @@ async fn chain_mine_projects_metadata_in_same_commit_as_cli_import() {
 
     let storage = create_storage(dsn_str).await.unwrap();
     let blocks = storage.get_all_blocks().await.unwrap();
-    let expected_metadata_count: i64 = blocks
-        .iter()
-        .map(|b| b.metadata_list.len() as i64)
-        .sum();
-    assert!(expected_metadata_count >= 1, "挖矿区块应至少打包 1 条元数据");
+    let expected_metadata_count: i64 = blocks.iter().map(|b| b.metadata_list.len() as i64).sum();
+    assert!(
+        expected_metadata_count >= 1,
+        "挖矿区块应至少打包 1 条元数据"
+    );
     assert_eq!(
         storage.metadata_projection_count().await.unwrap(),
         expected_metadata_count,
