@@ -207,7 +207,13 @@ async fn non_admin_roles_get_403_on_all_admin_endpoints() {
         for req in reqs {
             let label = format!("{} {}", req.method(), req.uri());
             let status = f.status(req).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{} 用 {} 应 403", label, name);
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{} 用 {} 应 403",
+                label,
+                name
+            );
         }
     }
 
@@ -295,7 +301,10 @@ async fn admin_lists_target_sessions_without_sensitive_fields() {
     assert_eq!(items.len(), 2, "只列出目标用户的未撤销会话");
     let ids: Vec<&str> = items.iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&first.sid.as_str()) && ids.contains(&second.sid.as_str()));
-    assert!(!ids.contains(&admin.sid.as_str()), "不应混入管理员自己的会话");
+    assert!(
+        !ids.contains(&admin.sid.as_str()),
+        "不应混入管理员自己的会话"
+    );
 
     for item in items {
         let obj = item.as_object().unwrap();
@@ -317,7 +326,10 @@ async fn admin_lists_target_sessions_without_sensitive_fields() {
             assert!(!obj.contains_key(forbidden), "不得暴露字段 {}", forbidden);
         }
     }
-    let mine = items.iter().find(|s| s["id"] == first.sid.as_str()).unwrap();
+    let mine = items
+        .iter()
+        .find(|s| s["id"] == first.sid.as_str())
+        .unwrap();
     assert_eq!(mine["ip_hint"], "203.0.x.x");
 
     // 响应体不含任何 token / jti / family / ip_hash / 明文 IP。
