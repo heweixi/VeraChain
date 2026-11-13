@@ -1,5 +1,8 @@
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::aggregation::AggregationSummary;
 use crate::auth::User;
@@ -62,7 +65,16 @@ impl From<SessionRow> for SessionRecord {
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
+    /// 用户 is_active 的进程内短 TTL 缓存:user_id -> (是否启用, 写入时刻)。
+    active_cache: parking_lot::Mutex<HashMap<String, (bool, Instant)>>,
+    /// 缓存 TTL(毫秒);0 表示禁用缓存。
+    active_cache_ttl_ms: AtomicU64,
+    /// 每次 is_active 写入后自增,用于丢弃"读发生在写之前"的陈旧回填。
+    active_generation: AtomicU64,
 }
+
+/// is_active 缓存默认 TTL。
+const DEFAULT_ACTIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 impl Storage {
     /// 创建存储实例
@@ -77,7 +89,12 @@ impl Storage {
             .connect(&format!("sqlite:{}?mode=rwc", dsn))
             .await?;
 
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            active_cache: parking_lot::Mutex::new(HashMap::new()),
+            active_cache_ttl_ms: AtomicU64::new(DEFAULT_ACTIVE_CACHE_TTL.as_millis() as u64),
+            active_generation: AtomicU64::new(0),
+        };
         storage.init_tables().await?;
 
         Ok(storage)
@@ -964,6 +981,38 @@ impl Storage {
         Ok(true)
     }
 
+    /// 设置 is_active 缓存 TTL(默认 5 秒;`Duration::ZERO` 表示禁用缓存)。
+    pub fn set_active_cache_ttl(&self, ttl: Duration) {
+        self.active_cache_ttl_ms
+            .store(ttl.as_millis() as u64, Ordering::Relaxed);
+        self.active_cache.lock().clear();
+    }
+
+    /// 带短 TTL 缓存地读取用户启用状态(鉴权热路径使用)。
+    ///
+    /// 缓存只存成功查询的结果;查库失败直接返回 `Err`(调用方应 fail-closed)。
+    /// [`Storage::set_user_active`] 会同步清除本进程缓存,故本进程内的禁用/启用即时生效;
+    /// 其他进程直接改库的变更最多滞后一个 TTL。
+    pub async fn is_user_active_cached(&self, user_id: &str) -> Result<bool> {
+        let ttl = Duration::from_millis(self.active_cache_ttl_ms.load(Ordering::Relaxed));
+        if ttl.is_zero() {
+            return self.is_user_active(user_id).await;
+        }
+        if let Some((active, at)) = self.active_cache.lock().get(user_id).copied() {
+            if at.elapsed() < ttl {
+                return Ok(active);
+            }
+        }
+        let generation = self.active_generation.load(Ordering::SeqCst);
+        let active = self.is_user_active(user_id).await?;
+        let mut cache = self.active_cache.lock();
+        // 查询期间若发生过写入,结果可能已陈旧,不回填。
+        if self.active_generation.load(Ordering::SeqCst) == generation {
+            cache.insert(user_id.to_string(), (active, Instant::now()));
+        }
+        Ok(active)
+    }
+
     /// 读取用户启用状态(以 SQLite 为权威)。用户不存在视为非活跃(fail-closed)。
     pub async fn is_user_active(&self, user_id: &str) -> Result<bool> {
         let row: Option<(bool,)> = sqlx::query_as("SELECT is_active FROM users WHERE user_id = ?")
@@ -980,6 +1029,12 @@ impl Storage {
             .bind(user_id)
             .execute(&self.pool)
             .await?;
+        // 写入后同步清本进程缓存,并让在途的旧读不再回填。
+        {
+            let mut cache = self.active_cache.lock();
+            self.active_generation.fetch_add(1, Ordering::SeqCst);
+            cache.remove(user_id);
+        }
         Ok(result.rows_affected() > 0)
     }
 

@@ -279,6 +279,64 @@ async fn ws_handshake_with_valid_token_succeeds() {
     assert_eq!(welcome["data"]["message"], "connected");
 }
 
+/// 断言新的 WS 握手被 401 拒绝。
+async fn assert_handshake_unauthorized(server: &TestServer, token: &str) {
+    match connect_async(ws_request(&server.addr, "/ws", Some(token))).await {
+        Ok(_) => panic!("握手不应升级成功"),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), WsStatus::UNAUTHORIZED)
+        }
+        Err(e) => panic!("期望 HTTP 401,实际错误: {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ws_handshake_is_rejected_after_session_revoked() {
+    let server = start_server().await;
+    seed_user(&server.state, "wsuser", "wspass123456", Role::User).await;
+    let token = login_token(&server.addr, "wsuser", "wspass123456").await;
+    let (_ws, _) = connect_async(ws_request(&server.addr, "/ws", Some(&token)))
+        .await
+        .expect("撤销前握手应成功");
+    let sid = server
+        .state
+        .auth_service
+        .validate_token(&token)
+        .unwrap()
+        .sid
+        .unwrap();
+    assert!(server
+        .state
+        .storage
+        .revoke_session(&sid, "logout", 3600)
+        .await
+        .unwrap());
+    assert_handshake_unauthorized(&server, &token).await;
+}
+
+#[tokio::test]
+async fn ws_handshake_is_rejected_after_user_disabled() {
+    let server = start_server().await;
+    seed_user(&server.state, "wsuser", "wspass123456", Role::User).await;
+    let token = login_token(&server.addr, "wsuser", "wspass123456").await;
+    let user_id = server
+        .state
+        .auth_service
+        .get_user("wsuser")
+        .unwrap()
+        .user_id;
+    let (_ws, _) = connect_async(ws_request(&server.addr, "/ws", Some(&token)))
+        .await
+        .expect("禁用前握手应成功");
+    assert!(server
+        .state
+        .storage
+        .set_user_active(&user_id, false)
+        .await
+        .unwrap());
+    assert_handshake_unauthorized(&server, &token).await;
+}
+
 // ---------------------------------------------------------------------------
 // 验收点 2:业务事件经 EventBus 发布后,订阅的 WS 客户端能收到对应消息
 // ---------------------------------------------------------------------------

@@ -272,6 +272,38 @@ impl AuthService {
         self.jwt_handler.verify_access_token(token)
     }
 
+    /// 统一的 access token 鉴权:供 HTTP 鉴权中间件、可选鉴权中间件与 WS 握手共用。
+    ///
+    /// 依次校验:JWT 签名/过期 → (有 `sid` 时)会话存在、属于该用户、未撤销、未过期
+    /// → 用户 is_active(SQLite 权威,带短 TTL 缓存)→ 内存用户存在、启用且角色与 claims 一致。
+    /// 无 `sid` 的旧 token 跳过会话检查,只查 is_active。
+    /// 任一步失败(含查库失败)都返回 `Err`,调用方一律按 401 处理(fail-closed)。
+    pub async fn authenticate_access_token(&self, token: &str) -> Result<super::Claims> {
+        let claims = self.validate_token(token)?;
+
+        if let Some(sid) = claims.sid.as_deref() {
+            let now = chrono::Utc::now().timestamp();
+            match self.storage.get_session(sid).await? {
+                Some(s)
+                    if s.user_id == claims.sub && s.revoked_at.is_none() && s.expires_at > now => {}
+                _ => return Err(DataChainError::InvalidToken),
+            }
+        }
+
+        if !self.storage.is_user_active_cached(&claims.sub).await? {
+            return Err(DataChainError::InvalidToken);
+        }
+
+        // 角色必须与当前用户一致(角色被修改后旧 token 失效);内存侧禁用同样拒绝。
+        let user = self
+            .get_user_by_id(&claims.sub)
+            .map_err(|_| DataChainError::InvalidToken)?;
+        if !user.is_active || user.role.to_string() != claims.role {
+            return Err(DataChainError::InvalidToken);
+        }
+        Ok(claims)
+    }
+
     /// 刷新令牌。
     ///
     /// 采用 token-family 复用检测 + 抢占式撤销收口并发双花：
