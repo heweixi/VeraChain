@@ -6,9 +6,9 @@ use std::net::{IpAddr, SocketAddr};
 
 use axum::http::HeaderMap;
 
-/// `X-Forwarded-For` 最多处理的条目数(供 XFF 解析切片使用,超出视为不可信输入)。
+/// `X-Forwarded-For` 最多处理的条目数(由 `resolve_client_ip` 使用,超出视为不可信输入)。
 pub const MAX_XFF_ENTRIES: usize = 32;
-/// `X-Forwarded-For` 头总字节数上限(供 XFF 解析切片使用)。
+/// `X-Forwarded-For` 头总字节数上限(由 `resolve_client_ip` 使用)。
 pub const MAX_XFF_BYTES: usize = 2048;
 
 /// 一条已规整的网络前缀(地址已按掩码清零主机位)。

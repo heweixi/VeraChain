@@ -331,9 +331,10 @@ impl Storage {
     /// pending_metadata/aggregations/anchor_outbox/revoked_refresh_tokens 全部表与索引),
     /// 两套逻辑并存只会带来漂移风险。
     ///
-    /// 旧库兼容性:migration 全部为幂等 `CREATE TABLE/INDEX IF NOT EXISTS`。即便某个
-    /// 旧库此前仅靠兜底建过表、`schema_migrations` 为空,升级时 apply_migrations 会从
-    /// version 0 重跑所有迁移,已存在的表/索引被 IF NOT EXISTS 跳过,不会丢表或报错。
+    /// 旧库兼容性:迁移 001~012 为幂等 `CREATE TABLE/INDEX IF NOT EXISTS`,旧库此前仅靠
+    /// 兜底建过表、`schema_migrations` 为空时,从 version 0 重跑这些迁移不会丢表或报错。
+    /// 但**并非全部迁移幂等**:迁移 013 的 `ALTER TABLE ... ADD COLUMN` 不幂等,若
+    /// `schema_migrations` 记录丢失而列已存在,重跑会报 duplicate column 错误,需人工处理。
     ///
     /// 回滚约定:当前 migration 只前进(up-only),无自动 down。需要回滚时手动操作数据库;
     /// 需要数据回填(backfill)的迁移将在首次出现真实场景时(如独立 metadata 查询表)

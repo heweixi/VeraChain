@@ -272,12 +272,12 @@ impl AuthService {
         }
     }
 
-    /// 当前生效的锁定策略(锁定逻辑由后续切片接入)。
+    /// 当前生效的用户名维度指数退避锁定策略(登录流程已使用)。
     pub fn lockout_policy(&self) -> LockoutPolicy {
         self.lockout
     }
 
-    /// 当前生效的改密最小密码长度(改密接口由后续切片接入)。
+    /// 当前生效的改密最小密码长度(改密接口已使用)。
     pub fn password_min_length(&self) -> usize {
         self.password_min_length
     }
