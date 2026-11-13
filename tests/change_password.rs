@@ -223,29 +223,31 @@ async fn new_password_persists_across_state_rebuild_with_same_dsn() {
         StatusCode::NO_CONTENT
     );
 
-    // 同 dsn 重建 state/service(模拟重启),用户与哈希从库中重新加载。
-    let (state2, _) = build_state(&f.dsn).await;
-    let router2 = api::create_router(state2);
-    let ok = send(
-        &router2,
-        post(
-            "/api/v1/auth/login",
-            None,
-            json!({"username": "alice", "password": NEW}),
-        ),
-    )
-    .await;
-    assert_eq!(ok.status, StatusCode::OK, "重启后新密码应可登录");
-    let bad = send(
-        &router2,
-        post(
-            "/api/v1/auth/login",
-            None,
-            json!({"username": "alice", "password": OLD}),
-        ),
-    )
-    .await;
-    assert_eq!(bad.status, StatusCode::UNAUTHORIZED, "重启后旧密码应失效");
+    // 同 dsn 重建 storage/service(模拟重启),用户与哈希从库中重新加载。
+    // 不能再调 build_state:它会重复写入创世区块而失败。
+    let storage2 = datachain::storage::create_storage(&f.dsn).await.unwrap();
+    let service2 = datachain::auth::create_auth_service(JWT_SECRET.to_string(), 24, storage2.clone());
+    for user in storage2.get_all_users().await.unwrap() {
+        service2.load_user(user);
+    }
+    let login = |pw: &str| datachain::auth::LoginRequest {
+        username: "alice".to_string(),
+        password: pw.to_string(),
+    };
+    let ctx = datachain::auth::LoginContext::default();
+    service2
+        .login(&login(NEW), &ctx)
+        .await
+        .expect("重启后新密码应可登录");
+    let err = service2
+        .login(&login(OLD), &ctx)
+        .await
+        .expect_err("重启后旧密码应失效");
+    assert!(
+        matches!(err, datachain::error::DataChainError::InvalidCredentials),
+        "{:?}",
+        err
+    );
 }
 
 #[tokio::test]
