@@ -2748,6 +2748,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebuild_projections_leaves_identity_transaction_ledger_untouched() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rebuild-ledger.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let entry = pending_identity_entry("key-a");
+        let created = storage
+            .create_or_get_identity_transaction("user-a", Some("k"), "fp", &entry, 1)
+            .await
+            .unwrap();
+
+        storage.rebuild_projections(&[]).await.unwrap();
+
+        let after = storage
+            .get_identity_transaction(&created.transaction.transaction_id)
+            .await
+            .unwrap()
+            .expect("identity_transactions 是权威账本,重建投影不得清空");
+        assert_eq!(after.status, "pending");
+        assert_eq!(
+            storage
+                .get_pending_identity_transactions()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn schema_version_six_upgrades_identity_transactions_with_recovery_state() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("schema-v6.sqlite");
