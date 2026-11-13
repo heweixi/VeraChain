@@ -25,7 +25,11 @@ count_threshold = 100
 level = "info"
 
 # 认证参数(可选,缺省值即下列取值;未知键会使启动失败)。
-# jwt.refresh_expire_days 默认 7(范围 1..=365,且不得短于 expire_hours)。
+# jwt.expire_hours 范围 1..=720;jwt.refresh_expire_days 默认 7(范围 1..=365,且不得短于 expire_hours)。
+# 各键均可用环境变量覆盖(DATACHAIN_AUTH_*、DATACHAIN_JWT_EXPIRE_HOURS、DATACHAIN_JWT_REFRESH_EXPIRE_DAYS),
+# 完整参数表见 IMPLEMENTATION_STATUS.md §2.8。
+# lockout_max_secs 须 >= lockout_base_secs,lockout_reset_secs 须 >= lockout_max_secs。
+# trusted_proxies 的部署前提:可信代理必须把真实对端地址追加到 X-Forwarded-For。
 # [auth]
 # login_user_max_attempts = 5
 # login_ip_max_attempts = 20
