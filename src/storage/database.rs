@@ -116,6 +116,10 @@ impl Storage {
                 include_str!("../../migrations/006_catalog_semantic_records.sql"),
             ),
             (7, include_str!("../../migrations/007_sessions.sql")),
+            (
+                8,
+                include_str!("../../migrations/008_login_rate_counters_and_audit.sql"),
+            ),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -977,6 +981,62 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ==================== 登录限速计数器 ====================
+
+    /// 原子递增固定窗口计数器,返回 `(递增后的计数, 窗口起点)`。
+    ///
+    /// 单条 `INSERT .. ON CONFLICT DO UPDATE .. RETURNING`,不先读后写,并发不漏计。
+    /// 同时惰性清理该 key 已过期的旧窗口。
+    pub async fn incr_login_counter(
+        &self,
+        key: &str,
+        now: i64,
+        window_secs: i64,
+    ) -> Result<(i64, i64)> {
+        let window_start = now - now.rem_euclid(window_secs);
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO login_rate_counters (key, window_start, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(key, window_start) DO UPDATE SET count = count + 1
+            RETURNING count
+            "#,
+        )
+        .bind(key)
+        .bind(window_start)
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM login_rate_counters WHERE key = ? AND window_start < ?")
+            .bind(key)
+            .bind(window_start)
+            .execute(&self.pool)
+            .await?;
+        Ok((count, window_start))
+    }
+
+    /// 当前窗口计数减一(不低于 0)。用于成功登录归还 IP 维度的名额。
+    pub async fn decr_login_counter(&self, key: &str, now: i64, window_secs: i64) -> Result<()> {
+        let window_start = now - now.rem_euclid(window_secs);
+        sqlx::query(
+            "UPDATE login_rate_counters SET count = MAX(count - 1, 0) \
+             WHERE key = ? AND window_start = ?",
+        )
+        .bind(key)
+        .bind(window_start)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清空某 key 的全部计数(成功登录后重置用户名维度)。
+    pub async fn reset_login_counter(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM login_rate_counters WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ==================== metadata 查询投影(backlog #5) ====================

@@ -23,6 +23,10 @@ pub enum DataChainError {
     #[error("密码错误")]
     InvalidPassword,
 
+    #[error("invalid credentials")]
+    InvalidCredentials,
+    #[error("too many attempts")]
+    TooManyAttempts { retry_after_secs: u64 },
     #[error("无效的令牌")]
     InvalidToken,
 

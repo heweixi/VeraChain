@@ -16,6 +16,48 @@ pub struct LoginContext {
     pub user_agent: Option<String>,
 }
 
+/// 登录限速参数(固定窗口)。
+#[derive(Debug, Clone, Copy)]
+pub struct LoginLimits {
+    /// 单个用户名在一个窗口内允许的尝试次数。
+    pub user_max_attempts: i64,
+    /// 单个客户端 IP 在一个窗口内允许的尝试次数。
+    pub ip_max_attempts: i64,
+    /// 窗口长度(秒)。
+    pub window_secs: i64,
+}
+
+impl Default for LoginLimits {
+    fn default() -> Self {
+        Self {
+            user_max_attempts: 5,
+            ip_max_attempts: 20,
+            window_secs: 15 * 60,
+        }
+    }
+}
+
+/// 无法取得对端地址时(如进程内 oneshot 测试)IP 维度使用的占位值。
+const UNKNOWN_CLIENT_IP: &str = "unknown";
+
+/// 用户名限速 key 的最大字符数,防止超长用户名撑大计数器表。
+const USERNAME_KEY_MAX_CHARS: usize = 128;
+
+fn normalize_username_key(username: &str) -> String {
+    username
+        .chars()
+        .filter(|c| !c.is_control())
+        .flat_map(char::to_lowercase)
+        .take(USERNAME_KEY_MAX_CHARS)
+        .collect()
+}
+
+/// 不存在用户时用于抹平耗时的 bcrypt 哈希,cost 与真实密码一致(同为 `hash_password`)。
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password("datachain-dummy-password-for-timing").unwrap_or_default())
+}
+
 /// user_agent 入库长度上限(字符数)。
 const USER_AGENT_MAX_CHARS: usize = 200;
 
@@ -62,6 +104,7 @@ pub struct AuthService {
     storage: Arc<Storage>,
     /// 由 JWT 密钥派生的 IP 摘要密钥(与签名用途域分离)。
     ip_hash_key: Vec<u8>,
+    login_limits: LoginLimits,
 }
 
 impl AuthService {
@@ -71,10 +114,17 @@ impl AuthService {
             users: RwLock::new(HashMap::new()),
             username_index: RwLock::new(HashMap::new()),
             email_index: RwLock::new(HashMap::new()),
+            login_limits: LoginLimits::default(),
             ip_hash_key: format!("datachain-ip-hash:{}", jwt_secret).into_bytes(),
             jwt_handler: JwtHandler::new(jwt_secret, jwt_expire_hours),
             storage,
         }
+    }
+
+    /// 覆盖登录限速参数(默认 5 次/用户名、20 次/IP、15 分钟窗口)。
+    pub fn with_login_limits(mut self, limits: LoginLimits) -> Self {
+        self.login_limits = limits;
+        self
     }
 
     /// 客户端 IP 的 HMAC 摘要:取前 16 字节的十六进制(32 字符)。
@@ -128,32 +178,52 @@ impl AuthService {
 
     /// 用户登录。成功时在同一流程内创建会话,access token 携带 `sid`。
     pub async fn login(&self, req: &LoginRequest, ctx: &LoginContext) -> Result<LoginResponse> {
-        // 获取用户
-        let user_id = {
-            let username_index = self.username_index.read();
-            username_index
-                .get(&req.username)
-                .cloned()
-                .ok_or(DataChainError::UserNotFound(req.username.clone()))?
-        };
-
-        let mut user = {
-            let users = self.users.read();
-            users
-                .get(&user_id)
-                .cloned()
-                .ok_or(DataChainError::UserNotFound(req.username.clone()))?
-        };
-
-        // 检查账户状态
-        if !user.is_active {
-            return Err(DataChainError::UserNotFound(req.username.clone()));
+        // 限速:先在事务外对 IP 与用户名两个维度原子递增(不先读后写),超限直接 429。
+        // 失败/成功都先计数,成功后再归还名额,避免并发请求绕过阈值。
+        let now = chrono::Utc::now().timestamp();
+        let limits = self.login_limits;
+        let ip_key = format!(
+            "ip:{}",
+            self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
+        );
+        let user_key = format!("user:{}", normalize_username_key(&req.username));
+        let (ip_count, window_start) = self
+            .storage
+            .incr_login_counter(&ip_key, now, limits.window_secs)
+            .await?;
+        let (user_count, _) = self
+            .storage
+            .incr_login_counter(&user_key, now, limits.window_secs)
+            .await?;
+        if ip_count > limits.ip_max_attempts || user_count > limits.user_max_attempts {
+            let retry_after_secs = (window_start + limits.window_secs - now).max(1) as u64;
+            return Err(DataChainError::TooManyAttempts { retry_after_secs });
         }
 
-        // 验证密码
-        if !verify_password(&req.password, &user.password_hash) {
-            return Err(DataChainError::InvalidPassword);
-        }
+        // 取用户;不存在时也对固定 dummy hash 做一次同 cost 的 bcrypt,抹平耗时差异。
+        // 两把读锁不嵌套持有,避免与 register 的写锁顺序形成死锁。
+        let found = {
+            let id = self.username_index.read().get(&req.username).cloned();
+            id.and_then(|id| self.users.read().get(&id).cloned())
+        };
+        let password_ok = match &found {
+            Some(user) => verify_password(&req.password, &user.password_hash),
+            None => {
+                let _ = verify_password(&req.password, dummy_password_hash());
+                false
+            }
+        };
+        // 用户不存在 / 密码错误 / 账户已禁用 统一返回同一错误(禁用账户也先验证密码)。
+        let mut user = match found {
+            Some(user) if password_ok && user.is_active => user,
+            _ => return Err(DataChainError::InvalidCredentials),
+        };
+
+        // 成功:重置用户名维度计数,归还 IP 维度的本次名额。
+        self.storage.reset_login_counter(&user_key).await?;
+        self.storage
+            .decr_login_counter(&ip_key, now, limits.window_secs)
+            .await?;
 
         // 更新最后登录时间
         user.update_last_login();
@@ -166,7 +236,6 @@ impl AuthService {
         // 注意：login 不向撤销表写入任何记录，新 family 的令牌默认有效，
         // 进程重启后仍有效直至过期——设计上可接受。
         let family_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp();
         let session = SessionRecord {
             id: uuid::Uuid::new_v4().to_string(),
             user_id: user.user_id.clone(),

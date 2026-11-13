@@ -110,7 +110,7 @@ pub async fn login(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+) -> axum::response::Response {
     let ctx = LoginContext {
         // 仅使用对端地址;不信任 X-Forwarded-For。
         client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
@@ -119,11 +119,27 @@ pub async fn login(
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
     };
     match state.auth_service.login(&req, &ctx).await {
-        Ok(resp) => Ok((StatusCode::OK, Json(ApiResponse::success(resp)))),
-        Err(e) => Err((
+        Ok(resp) => (StatusCode::OK, Json(ApiResponse::success(resp))).into_response(),
+        Err(crate::error::DataChainError::TooManyAttempts { retry_after_secs }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(ApiResponse::error("too many attempts")),
+        )
+            .into_response(),
+        Err(crate::error::DataChainError::InvalidCredentials) => (
             StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::error(e.to_string())),
-        )),
+            Json(ApiResponse::error("invalid credentials")),
+        )
+            .into_response(),
+        Err(e) => {
+            // 存储等内部故障:不向客户端泄露细节。
+            tracing::error!("登录失败(内部错误): {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("internal error")),
+            )
+                .into_response()
+        }
     }
 }
 
