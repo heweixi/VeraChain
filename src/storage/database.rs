@@ -1156,6 +1156,129 @@ impl Storage {
         Ok(count)
     }
 
+    // ==================== 认证状态严格只读扫描 ====================
+
+    /// 严格扫描 `sessions` 全表:逐行按列类型解码,任一列类型不符即返回
+    /// `DataCorruption{Authoritative, "sessions", key=id}`。
+    ///
+    /// 会话是访问决策依据(安全状态),损坏必须使启动 fail-closed。
+    /// reason 取固定词表 `invalid_column:<列名>`,不回显行内容。返回扫描行数。
+    pub async fn scan_sessions(&self) -> Result<usize> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT rowid, id, user_id, refresh_family, created_at, last_seen_at, expires_at, \
+             revoked_at, revoke_reason, ip_hash, ip_hint, user_agent FROM sessions \
+             ORDER BY rowid ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in &rows {
+            let key = Self::scan_row_key(row, "id");
+            let invalid = |column: &str| DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "sessions",
+                key: key.clone(),
+                reason: format!("invalid_column:{}", column),
+            };
+            for column in ["id", "user_id", "refresh_family"] {
+                row.try_get::<String, _>(column)
+                    .map_err(|_| invalid(column))?;
+            }
+            for column in ["created_at", "last_seen_at", "expires_at"] {
+                row.try_get::<i64, _>(column).map_err(|_| invalid(column))?;
+            }
+            row.try_get::<Option<i64>, _>("revoked_at")
+                .map_err(|_| invalid("revoked_at"))?;
+            for column in ["revoke_reason", "ip_hash", "ip_hint", "user_agent"] {
+                row.try_get::<Option<String>, _>(column)
+                    .map_err(|_| invalid(column))?;
+            }
+        }
+        Ok(rows.len())
+    }
+
+    /// 严格扫描 `login_rate_counters` 全表(限速计数器同为安全状态,损坏必须 fail-closed)。
+    /// key 为计数器 `key` 列(无法解码时退化为 `rowid=<n>`);reason 同 [`Storage::scan_sessions`]。
+    pub async fn scan_login_rate_counters(&self) -> Result<usize> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT rowid, key, window_start, count, locked_until FROM login_rate_counters \
+             ORDER BY rowid ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in &rows {
+            let key = Self::scan_row_key(row, "key");
+            let invalid = |column: &str| DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "login_rate_counters",
+                key: key.clone(),
+                reason: format!("invalid_column:{}", column),
+            };
+            row.try_get::<String, _>("key").map_err(|_| invalid("key"))?;
+            for column in ["window_start", "count"] {
+                row.try_get::<i64, _>(column).map_err(|_| invalid(column))?;
+            }
+            row.try_get::<Option<i64>, _>("locked_until")
+                .map_err(|_| invalid("locked_until"))?;
+        }
+        Ok(rows.len())
+    }
+
+    /// 严格扫描 `auth_audit_log`(审计证据,启动时损坏只告警不阻塞,由调用方决定)。
+    /// key 为自增主键 `id`;reason 同 [`Storage::scan_sessions`]。
+    pub async fn scan_auth_audit_log(&self) -> Result<usize> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT id, ts, event_type, user_id, username_attempted, session_id, ip_hash, \
+             user_agent, result, reason FROM auth_audit_log ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in &rows {
+            let key = row
+                .try_get::<i64, _>("id")
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| corruption_key(None));
+            let invalid = |column: &str| DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "auth_audit_log",
+                key: key.clone(),
+                reason: format!("invalid_column:{}", column),
+            };
+            row.try_get::<i64, _>("id").map_err(|_| invalid("id"))?;
+            row.try_get::<i64, _>("ts").map_err(|_| invalid("ts"))?;
+            for column in ["event_type", "result"] {
+                row.try_get::<String, _>(column)
+                    .map_err(|_| invalid(column))?;
+            }
+            for column in [
+                "user_id",
+                "username_attempted",
+                "session_id",
+                "ip_hash",
+                "user_agent",
+                "reason",
+            ] {
+                row.try_get::<Option<String>, _>(column)
+                    .map_err(|_| invalid(column))?;
+            }
+        }
+        Ok(rows.len())
+    }
+
+    /// 扫描报错时的 key:优先取文本主键列,不可解码则退化为 `rowid=<n>`(不回显任何内容)。
+    fn scan_row_key(row: &sqlx::sqlite::SqliteRow, key_column: &str) -> String {
+        use sqlx::Row;
+        match row.try_get::<String, _>(key_column) {
+            Ok(key) => key,
+            Err(_) => match row.try_get::<i64, _>("rowid") {
+                Ok(rowid) => format!("rowid={}", rowid),
+                Err(_) => corruption_key(None),
+            },
+        }
+    }
+
     /// 标记锚定已确认，记录回执。
     pub async fn mark_anchor_confirmed(
         &self,
