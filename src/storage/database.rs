@@ -9,7 +9,9 @@ use crate::auth::User;
 use crate::catalog::{CatalogPayload, CatalogRecord};
 use crate::core::{Block, KeyTransactionEntry, MetadataEntry};
 use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
-use crate::error::{corruption_from_json, CorruptionCategory, DataChainError, Result};
+use crate::error::{
+    corruption_from_json, corruption_key, CorruptionCategory, DataChainError, Result,
+};
 use crate::versioning::Version;
 
 /// 登录会话记录(sessions 表一行)。时间戳均为 Unix 秒。
@@ -687,7 +689,7 @@ impl Storage {
 
     /// 读取待打包身份交易，按首次接受顺序恢复。
     ///
-    /// 007 升级前的 pending 行没有 transaction-to-block 可信映射；区块协议不包含
+    /// 011 升级前(010 已建表)的 pending 行没有 transaction-to-block 可信映射；区块协议不包含
     /// transaction_id，不能用条目内容反推其是否已入块。此类记录必须拒绝启动恢复，
     /// 而不是有可能重复打包或误拒绝同内容的新交易。
     pub async fn get_pending_identity_transactions(
@@ -2909,6 +2911,65 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_projections_leaves_committed_identity_transaction_untouched() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rebuild-committed-ledger.sqlite");
+        let storage = Storage::new(path.to_str().unwrap()).await.unwrap();
+        let entry = pending_identity_entry("key-a");
+        let created = storage
+            .create_or_get_identity_transaction("user-a", Some("k"), "fp", &entry, 1)
+            .await
+            .unwrap()
+            .transaction;
+
+        // 经 commit_block 把 pending 身份交易转为 committed。
+        let mut block = Block::new(1, "0".repeat(64), 1);
+        block.key_transactions.push(entry);
+        block.hash = "h".repeat(16);
+        storage
+            .commit_block(&block, &[Some(created.transaction_id.clone())])
+            .await
+            .unwrap();
+        let before = storage
+            .get_identity_transaction(&created.transaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, "committed");
+        assert_eq!(before.committed_block_index, Some(1));
+
+        // 重建投影(重放该区块)不得改动 committed 账本行。
+        storage
+            .rebuild_projections(std::slice::from_ref(&block))
+            .await
+            .unwrap();
+
+        let after = storage
+            .get_identity_transaction(&created.transaction_id)
+            .await
+            .unwrap()
+            .expect("committed 账本行不得被重建投影清除");
+        assert_eq!(after.status, "committed");
+        assert_eq!(after.committed_block_index, Some(1));
+        assert_eq!(after.submitter_user_id, before.submitter_user_id);
+        assert_eq!(after.idempotency_key, before.idempotency_key);
+        assert_eq!(after.request_fingerprint, before.request_fingerprint);
+        assert_eq!(after.accepted_at, before.accepted_at);
+        assert_eq!(
+            serde_json::to_value(&after.entry).unwrap(),
+            serde_json::to_value(&before.entry).unwrap()
+        );
+        assert!(
+            storage
+                .get_pending_identity_transactions()
+                .await
+                .unwrap()
+                .is_empty(),
+            "committed 行不应回到 pending 列表"
         );
     }
 
