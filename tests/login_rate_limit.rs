@@ -17,6 +17,9 @@ use datachain::storage::create_storage;
 use serde_json::Value;
 use tower::ServiceExt;
 
+/// 已对齐 900 秒固定窗口起点的 epoch 秒(1_800_000_000 = 2_000_000 * 900)。
+const ALIGNED_T0: i64 = 1_800_000_000;
+
 async fn try_login(
     router: &axum::Router,
     username: &str,
@@ -41,7 +44,7 @@ async fn try_login(
 
 /// 固定在某个窗口起点之后 10 秒,使一个测试内的所有尝试必落在同一固定窗口。
 fn pin_clock(storage: &datachain::storage::Storage) {
-    let now: i64 = 1_800_000_000 - (1_800_000_000 % 900) + 10;
+    let now: i64 = ALIGNED_T0 + 10;
     storage.set_clock(Arc::new(move || now));
 }
 
@@ -340,7 +343,7 @@ async fn failed_attempts_reset_when_clock_crosses_window_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let (service, storage) = service_with_limits(&dir, LoginLimits::default()).await;
     // 任意 epoch 对齐的窗口起点(900 的整数倍)。
-    let window_start: i64 = 1_800_000_000 - (1_800_000_000 % 900);
+    let window_start: i64 = ALIGNED_T0;
     let now = Arc::new(AtomicI64::new(window_start + 895));
     storage.set_clock(fixed_clock(now.clone()));
 
