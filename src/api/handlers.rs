@@ -249,9 +249,16 @@ pub struct RefreshTokenRequest {
 
 pub async fn refresh_token(
     State(state): State<AppState>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
     Json(req): Json<RefreshTokenRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.auth_service.refresh_token(&req.refresh_token).await {
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .refresh_token_with_context(&req.refresh_token, &ctx)
+        .await
+    {
         Ok(resp) => Ok(Json(ApiResponse::success(resp))),
         Err(e) => {
             // 区分 HTTP 语义：令牌无效/过期/复用等客户端凭证问题 => 401；

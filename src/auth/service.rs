@@ -151,6 +151,31 @@ fn mask_ip(ip: &str) -> Option<String> {
 const REUSE_REASON: &str = "refresh token reuse detected";
 const DOUBLE_SPEND_REASON: &str = "refresh token double-spend detected";
 
+/// refresh 流程中逐步填充的失败审计线索(不含 token/jti/family)。
+#[derive(Debug, Default)]
+struct RefreshTrace {
+    user_id: Option<String>,
+    session_id: Option<String>,
+    /// 流程内显式指定的 reason;未指定时按错误类型推断。
+    reason: Option<&'static str>,
+}
+
+impl RefreshTrace {
+    /// 返回应审计的 reason;复用与 5xx 类(数据库/存储/数据损坏)返回 `None`,不写 `refresh_failure`。
+    fn failure_reason(&self, err: &DataChainError) -> Option<&'static str> {
+        match err {
+            DataChainError::TokenReuseDetected
+            | DataChainError::DatabaseError(_)
+            | DataChainError::StorageError(_)
+            | DataChainError::DataCorruption { .. } => None,
+            DataChainError::TokenExpired => Some("token_expired"),
+            DataChainError::UserNotFound(_) => Some("user_inactive"),
+            DataChainError::InvalidToken => Some(self.reason.unwrap_or("invalid_token")),
+            _ => None,
+        }
+    }
+}
+
 /// HMAC-SHA256(RFC 2104)。仅用于派生 IP 摘要,避免引入额外依赖。
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -542,8 +567,45 @@ impl AuthService {
     /// 只能退化为「单 jti 失效」而非整族失效。这是升级过渡期的已知弱化（旧令牌签发时
     /// 尚无 family 概念），并非安全绕过——过渡期结束、旧令牌全部过期后自然消失。
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<LoginResponse> {
+        self.refresh_token_with_context(refresh_token, &LoginContext::default())
+            .await
+    }
+
+    /// 带客户端上下文的刷新:流程与 [`Self::refresh_token`] 相同,
+    /// 失败时(复用与 5xx 类除外)额外写入 `refresh_failure` 审计行。
+    /// 审计只含 reason 词表、user_id、session_id、ip_hash、user_agent,不含 token/jti/family。
+    pub async fn refresh_token_with_context(
+        &self,
+        refresh_token: &str,
+        ctx: &LoginContext,
+    ) -> Result<LoginResponse> {
+        let mut trace = RefreshTrace::default();
+        let result = self.refresh_token_inner(refresh_token, &mut trace).await;
+        if let Err(err) = &result {
+            if let Some(reason) = trace.failure_reason(err) {
+                let mut event = AuditEvent::new("refresh_failure", "failure")
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                    .reason(reason);
+                if let Some(user_id) = trace.user_id.as_deref() {
+                    event = event.user(user_id);
+                }
+                if let Some(sid) = trace.session_id.as_deref() {
+                    event = event.session(sid);
+                }
+                self.audit(event).await;
+            }
+        }
+        result
+    }
+
+    async fn refresh_token_inner(
+        &self,
+        refresh_token: &str,
+        trace: &mut RefreshTrace,
+    ) -> Result<LoginResponse> {
         let claims = self.jwt_handler.parse_refresh_claims(refresh_token)?;
         let user_id = claims.sub.clone();
+        trace.user_id = Some(user_id.clone());
         let family_id = claims.family_id.clone();
         // 哨兵行 TTL 取自刷新令牌有效期，避免魔法数（见 Storage::revoke_family）。
         let ttl_secs = self.jwt_handler.refresh_expire_secs();
@@ -566,6 +628,8 @@ impl AuthService {
                         .as_deref()
                         .is_some_and(|r| r.starts_with("refresh token"));
                     if session.revoked_at.is_some() && !by_reuse {
+                        trace.session_id = Some(session.id.clone());
+                        trace.reason = Some("session_revoked");
                         return Err(DataChainError::InvalidToken);
                     }
                 }
@@ -580,6 +644,7 @@ impl AuthService {
 
         // 用户状态以 SQLite 为权威(CLI 可能在别的进程里停用)。
         if !self.storage.is_user_active(&user_id).await? {
+            trace.reason = Some("user_inactive");
             return Err(DataChainError::InvalidToken);
         }
         let user = {
@@ -596,9 +661,18 @@ impl AuthService {
         } else {
             match self.storage.get_session_by_family(&family_id).await? {
                 Some(s) if s.user_id == user_id && s.revoked_at.is_none() && s.expires_at > now => {
+                    trace.session_id = Some(s.id.clone());
                     Some(s)
                 }
-                _ => return Err(DataChainError::InvalidToken),
+                Some(s) if s.user_id == user_id && s.revoked_at.is_some() => {
+                    trace.session_id = Some(s.id.clone());
+                    trace.reason = Some("session_revoked");
+                    return Err(DataChainError::InvalidToken);
+                }
+                _ => {
+                    trace.reason = Some("session_invalid");
+                    return Err(DataChainError::InvalidToken);
+                }
             }
         };
 
@@ -642,6 +716,9 @@ impl AuthService {
                         .await?
                         .and_then(|s| s.revoke_reason)
                         .is_some_and(|r| r.starts_with("refresh token"));
+                    if !by_reuse {
+                        trace.reason = Some("session_invalid");
+                    }
                     return Err(if by_reuse {
                         DataChainError::TokenReuseDetected
                     } else {
