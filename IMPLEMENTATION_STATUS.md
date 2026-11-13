@@ -1,6 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> 核实日期:2026-11-10。本次 WebSocket 频道隔离已实现；验证证据为本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
+> 核实日期:2026-11-13。本次(分支 `feat/auth-hardening`)落地认证加固第一批 F1-F7,详见 §2.6;验证证据为本次提交 + 验证机 192.168.3.7 docker `rust:latest`:`cargo fmt --check` 通过、`cargo test --no-fail-fast` **168 passed / 0 failed**、`cargo clippy --all-targets` 无 error(lib 24 条警告与 main 基线持平)。设计文档:`docs/superpowers/specs/2026-11-13-auth-hardening-design.md`。
+> **历史基线说明**:下文及各行中出现的 97 / 107 / 78 / 75+17 / 62+12 等 passed 数字,是各自提交当时在 247 验证机上的**历史基线**,不适用于本次提交;本次权威数字为上面的 168 passed。旧基线只为追溯,不要当作当前测试总数。
+> 以下为 2026-11-10 的历史说明:WebSocket 频道隔离已实现；验证证据为当时提交 + 247 docker `rust:latest` `cargo test`（97 passed,历史基线）。
 > R0-R7、backlog #3/#4/#5/#6、认证网 L1、可验证语义目录与 Claim resolver 已在 247 服务器 docker `rust:latest` 完成 cargo test/fmt/clippy(--all-targets)验证。
 >
 > **跨链认证网主线(基调)**:DataChain 内部**有意不做拜占庭共识**(受信节点 + 最长合法链),
@@ -39,7 +41,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
 | 健康检查 | ✅ | `src/api/handlers.rs` 的 `health_check`；Docker healthcheck 请求 `/health` |
-| 注册/登录/刷新 token | ✅ `1124baa`/247 已验证 | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。设备会话管理仍未做(单 family 不区分设备) |
+| 注册/登录/刷新 token | ✅ `1124baa`/247 已验证(历史);本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed) | 注册失败写库回滚并返回 500(非旧述 201);refresh token 轮换 + 持久化撤销(SQLite)+ token-family 复用检测(复用触发整族撤销)+ 并发双花主键收口。**本次**:登录创建会话(会话 id 即 refresh family,access 携带 `sid`),refresh 校验 is_active 与会话有效并更新 `last_seen_at`、新 access 带 `sid`,旧 refresh(空 family)补建会话。🔺 登录失败统一返回 401 `invalid credentials`(原可区分用户不存在/密码错),超限 429 + `Retry-After`。⚠️ refresh 失败(停用/会话失效)未写审计事件;「`touch_session` 失败且为复用时返回 TokenReuseDetected」分支无专门测试 |
+| 会话与登出接口 | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:sessions_api 16、auth_middleware_session 12) | `POST /api/v1/auth/logout`(撤销当前会话,幂等,204)、`POST /api/v1/auth/logout-all`(撤销本人全部会话,幂等,204);`GET /api/v1/auth/sessions`(含 `current`、脱敏 `ip_hint`,不返回 token/jti/ip_hash/refresh family);`DELETE /api/v1/auth/sessions/{id}`(204;非本人/不存在/已失效统一 404)。四条均为受保护路由,CORS 放行 DELETE。⚠️ 无 `sid` 的旧 access token 登出无效(无会话可撤销),最长保持到自然过期(默认 24h) |
+| 登录限速与统一失败响应 | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:login_rate_limit 8) | 固定窗口,用户名维度 5 次、IP 维度 20 次 / 15 分钟,超限 429 + `Retry-After`;不存在用户同样计数且执行 dummy bcrypt 抹平时序;计数持久化 SQLite(`login_rate_counters`,重启不丢);**成功登录只归还本次名额,不清零**(reviewer 发现的 I1:原"成功即清零"可被大小写变体账户重置受害者计数,已修复并有回归测试)。⚠️ 纯固定窗口:窗口边界约 2 倍突发;指数退避与 `locked_until` 未实现(列保留未用,见 §2.6) |
 | 元数据创建/查询 | ✅ `b239df6`/247 已验证 | 创建(写路径)仍入链 pending(权威源);查询(读路径)走独立 `metadata` 投影表(migration 005),owner/时间下推 SQL、tag/分页应用层过滤,不再扫链。投影由 commit_block 同事务 upsert + 启动/CLI 代码级回填保证与区块一致。边界:只覆盖已上链元数据,pending 不出现在查询结果 |
 | 可验证语义目录 | ✅ 本次提交/247 端到端已验证 | `POST /api/v1/catalog/records` 提交由已上链有效身份公钥签名的 Subject/Revision/Artifact/Claim；校验对象关系、主标识唯一性与 Claim 证据/时间范围，记录进入普通新区块的 `catalog_records` 并作为完整语义 Merkle 叶子。原始 Claim 历史可查；`GET /catalog/subjects/:id/effective-claims` 按配置可信认证者、分类授权、权重、有效时间和覆盖关系解析有效结论，同权重不同状态返回 conflicts，未配可信认证者默认 fail-closed。边界:无集中分类字典和动态认证机构治理 |
 | 区块列表/详情/挖矿/验证 | ⚠️ | 路由存在；挖矿经 `commit_block` 原子落库(写库失败回滚并返回错误);链恢复/验证完整性仍待加强(见启动恢复项) |
@@ -55,15 +59,16 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
-| JWT access/refresh | ✅ `1124baa`/247 已验证 | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。仍缺:设备会话管理、access token 即时吊销(受 JWT 无状态固有限制,整族撤销对已签发 access 有最长一个 access 有效期的滞后) |
-| 用户持久化 | ⚠️ | 注册时若 `save_user` 失败，服务会回滚已写入内存的用户并返回 500；启动可从 SQLite 加载用户。仍缺运行时资料管理与密码管理 API。 |
+| JWT access/refresh | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:auth_claims 5、auth_middleware_session 12、storage_sessions 4);refresh 轮换/复用检测基线 `1124baa`/247(历史) | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。**本次**:原"仍缺:设备会话管理、access token 即时吊销"已实现(access 携带 `sid`,受保护路由经 `authenticate_access_token` 统一校验:JWT → 会话存在/属于该用户/未撤销/未过期 → SQLite `is_active`(进程内缓存 TTL 默认 5s,写路径清缓存)→ 内存用户存在且 role 与 claims 一致;查库失败 fail-closed 返回 401;WS 握手共用同一校验;`optional_auth_middleware` 对被撤销 token 按匿名)。🔺 `generate_access_token`/`generate_token_pair` 新增 `sid` 参数(库 API 变更)。⚠️ 残余限制:无 `sid` 的旧 token 仅查 `is_active`、不受登出影响,最长到自然过期(默认 24h 未改);跨进程停用/撤销最长滞后缓存 TTL(5s,TTL 目前仅代码 API `set_active_cache_ttl` 可调,无配置项);已建立的 WS 连接不会因撤销/禁用被主动断开(仅新握手被拒);refresh 与 access 仍共用同一 JWT 密钥(既有债务) |
+| 用户持久化 | ⚠️ | 注册时若 `save_user` 失败，服务会回滚已写入内存的用户并返回 500；启动可从 SQLite 加载用户。**本次**:启用/禁用状态以 SQLite 为权威(✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:cli_user_status 3、auth_middleware_session 12)):CLI `user deactivate\|activate <username>`;停用在同事务内撤销该用户全部会话与 refresh family,激活**不**恢复旧会话;登录/refresh/鉴权均以 SQLite `is_active` 为准;运行时 `deactivate_user`/`activate_user` 落库并清缓存、同步内存副本。🔺 `AuthService::deactivate_user`/`activate_user` 改 async(返回类型变化)。仍缺运行时资料管理、密码管理(改密 API,F9)与管理员用户禁用接口(F8),均为第二批 ⏳。 |
 | 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
 | RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
 | Claim 信任策略 | ✅ 本次提交/247 已验证 | `[claim_policy]` 配置可信认证者身份/公钥、分类授权和权重；resolver 仅接受满足最小权重及有效时间的声明，覆盖关系生效，同权重冲突不强行裁决。默认无可信认证者时 fail-closed |
 | 密码哈希 | ⚠️ | 实际认证使用 bcrypt；多算法 API 存在，但部分算法的 salt/dispatch 设计不适合作为统一生产密码方案 |
 | 默认 JWT secret | ✅代码已修复/待验证 | `AppConfig::load` 支持 `DATACHAIN_JWT_SECRET`/`JWT_SECRET` 覆盖，并拒绝短密钥和默认占位值 |
-| CORS/TLS/限流 | ⚠️ | CORS 使用 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时仅本地开发来源）；可选 TLS、10MiB 全局请求体限制与进程内全局限流已实现。仍缺登录专属限速/锁定和审计日志。 |
-| WebSocket 认证 | ✅ 本次提交 + 247 docker `rust:latest` `cargo test`（97 passed） | WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome)；Hub 保留全局 256 连接和单条文本 16 KiB 限制。频道按静态事件映射过滤，但不实施频道级授权；验证覆盖四路连接、五种事件的正向投递和非归属频道不投递。 |
+| CORS/TLS/限流 | ⚠️ | CORS 使用 `DATACHAIN_CORS_ORIGINS` 显式 allowlist（未配置时仅本地开发来源;本次放行 `DELETE`）；可选 TLS、10MiB 全局请求体限制与进程内全局限流已实现。**本次**:全局限流 IP 来源改为 `ConnectInfo` 对端地址(TLS 与非 TLS 两条 serve 路径均经 `make_service` 注入),不再信任 `X-Forwarded-For`/`X-Real-IP`,限流 map 增加过期淘汰(✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:connect_info_rate_limit 5))。🔺 **反向代理后所有客户端共享一个全局限流桶**(对端地址是代理 IP);`trusted_proxies` 留第二批(⏳)。⚠️ TLS 路径无真实握手测试(两条 serve 路径均改用 `make_service`,但 TLS 分支无测试覆盖)。登录专属限速已实现(见 §2.1「登录限速与统一失败响应」);**认证审计日志已实现**(✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:auth_audit 13),见 §2.6);**登录锁定**中的指数退避/`locked_until` 为 ⏳ 未实现,当前仅固定窗口限速。 |
+| 认证审计日志 | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:auth_audit 13) | 表 `auth_audit_log`;事件类型以代码为准,当前为 `login_success`、`login_failure`、`login_locked`、`refresh_success`、`refresh_reuse_detected`、`logout`、`logout_all`、`session_revoked`、`user_deactivated`、`user_activated`。不存密码/token/jti/明文 IP(仅 HMAC `ip_hash`),文本字段脱敏并转义控制字符、限长;写入失败只记 error 日志,不阻塞也不改变认证结果;启动时清理 90 天前的行。⚠️ refresh 失败(停用/会话失效等)不写事件 |
+| WebSocket 认证 | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed:websocket_integration 11,其中本次新增 2 个握手测试;频道隔离基线为历史 97 passed/247) | **本次**:握手与 HTTP 共用 `authenticate_access_token`(被撤销会话/已停用用户的 token 握手被拒 401)。⚠️ 已建立的连接不会因撤销/禁用被主动断开,仅新握手被拒。WebSocket 路由经 JWT 认证(无/无效 token 401、合法 token 101+welcome)；Hub 保留全局 256 连接和单条文本 16 KiB 限制。频道按静态事件映射过滤，但不实施频道级授权；验证覆盖四路连接、五种事件的正向投递和非归属频道不投递。 |
 
 ### 2.3 区块链核心与数据完整性
 
@@ -82,7 +87,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 |---|---|---|
 | SQLite + SQLx | ✅基础 | `src/storage/database.rs` 创建 SQLite pool、blocks/users/versions 表及基础 CRUD |
 | 独立 metadata/aggregation/events 表 | ⚠️ `d97cd94` | metadata 查询投影表已建(migration 005);aggregation 已持久化(`aggregations` 表);语义目录新增 pending_catalog_records 与 catalog_subjects/catalog_revisions/catalog_artifacts/catalog_claims 查询投影(migration 006);事件通知仍无独立表(经 EventBus 内存广播,不落库) |
-| SQLx 版本迁移 | ✅ `13ded24`/247 已验证 | `migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
+| SQLx 版本迁移 | ✅ `13ded24`/247 已验证(历史);本次新增 007-009 经 192.168.3.7 cargo test(168 passed)覆盖 | **本次**:新增 `007_sessions`、`008_login_rate_counters_and_audit`、`009_session_ip_hint`(`ALTER TABLE sessions ADD COLUMN ip_hint`),详见 §2.6。⚠️ 与 pending identity 等同样占用 007/008 的分支合并时,须将本分支 007/008/009 顺延编号(已执行较大版本号的库因 `MAX(version)` 会跳过较小版本号)。以下为此前 001~006 的说明:`migrations/001~006` + `schema_migrations` 版本表为建表唯一事实源;`apply_migrations` 按版本顺序执行幂等 DDL;`init_tables` 已移除重叠兜底,仅调 `apply_migrations`。旧库(无 schema_migrations)升级经回归测试 `legacy_db_without_schema_migrations_upgrades_safely` 验证不丢表、数据保留。**仍无自动 down 回滚**(有意收敛,up-only + 手动回滚约定)。数据回填在 #5(`b239df6`)落地为**代码级 reconcile**(启动/CLI 从已反序列化 Block 幂等 upsert 投影),而非纯 SQL migration——因 apply_migrations 的 `split(';')` 对复杂 SQL/JSON 解析脆弱,代码侧回填更稳 |
 | 数据损坏处理 | ⚠️已改善/待验证 | block/user/version/新 pending/aggregation JSON 解析错误会返回错误；旧用户/版本表的字段兼容迁移和坏数据恢复策略仍需补充 |
 | 聚合持久化 | ✅ | aggregation summaries 已写入 SQLite 的 `aggregations` 表，server 启动时加载并恢复查询结果和聚合计数。仍有的边界：时间/数量策略通常扫描全部历史 metadata，不区分未聚合部分。 |
 | Scheduler 运行 | ✅代码已启动/待验证 | `src/cli/server.rs` 创建、注册回调并启动 Scheduler；自动聚合结果异步写入 SQLite 并发布 EventBus 事件 |
@@ -98,8 +103,91 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 | 版本差异 | ✅ 247 已验证 | `get_version_diff` 从两版本的不可变快照读取内容再 diff,不依赖当前文件;文件被覆盖/删除仍可比较历史 |
 | 文件路径安全 | ✅ 247 已验证 | `validate_version_path`:拒绝空/绝对/`..` 遍历,canonical 后必须位于 `DATACHAIN_VERSION_ROOT` 内,拒绝目录与越界符号链接。单测 `rejects_path_traversal_before_filesystem_access` 等 |
 
+### 2.6 认证加固(第一批 F1-F7,分支 `feat/auth-hardening`)
+
+最后核实:2026-11-13。设计:`docs/superpowers/specs/2026-11-13-auth-hardening-design.md`。验证:本次提交 + 192.168.3.7 docker `rust:latest`(作业 authfinal2,HEAD `ce889bb`):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 168 passed、0 failed;`cargo clippy --all-targets`(无 `-D warnings`)无 error,lib 24 条警告与 main 基线(4cc5646)持平。代码审查(reviewer)发现 1 个 Important(I1:用户名限速可被"成功登录重置"绕过),已修复并有回归测试。
+
+#### 能力
+
+| 编号 | 能力 | 状态 | 证据与差异 |
+|---|---|---|---|
+| F1 | 会话(设备)模型 | ✅ | `sessions` 表;登录创建会话行(会话 id 即 refresh family),access 带 `sid`;记录截断/去控制字符的 `user_agent` 与 `ip_hash`(HMAC,不存明文 IP);refresh 更新 `last_seen_at`、新 access 带 `sid`;旧 refresh(空 family)补建会话。测试:storage_sessions 4、auth_claims 5、auth_middleware_session 12。⚠️ 无「`touch_session` 失败且为复用 → TokenReuseDetected」分支的专门测试 |
+| F2 | 会话接口 | ✅ | `logout`、`logout-all`、`GET sessions`、`DELETE sessions/{id}`,契约见下表。测试:sessions_api 16 |
+| F3 | access 即时吊销 | ⚠️ | 统一校验链路见 §2.2「JWT access/refresh」。测试:auth_middleware_session 12 + websocket_integration 新增 2。限制:无 `sid` 旧 token 不受登出影响;跨进程滞后 ≤ 缓存 TTL(5s);已建立 WS 连接不主动断开 |
+| F4 | 登录限速 | ⚠️ | 见 §2.1。测试:login_rate_limit 8。限制:纯固定窗口(边界约 2 倍突发);指数退避、`locked_until` ⏳ 未实现 |
+| F5 | 全局限流 IP 来源 | ⚠️ | 见 §2.2「CORS/TLS/限流」。测试:connect_info_rate_limit 5。🔺 反代后共享单桶;TLS 路径无真实握手测试 |
+| F6 | 认证审计日志 | ✅ | 见 §2.2「认证审计日志」。测试:auth_audit 13。⚠️ refresh 失败未写事件 |
+| F7 | 用户禁用(SQLite 权威)与 CLI | ✅ | 见 §2.2「用户持久化」。测试:cli_user_status 3 |
+
+#### 接口契约
+
+| 方法 + 路径 | 认证 | 成功响应 | 失败/边界 |
+|---|---|---|---|
+| `POST /api/v1/auth/login` | 公开 | 200 + token 对 | 401 `invalid credentials`(用户不存在/密码错/账户禁用同一消息);429 + `Retry-After`(秒);内部故障 500 `internal error` |
+| `POST /api/v1/auth/logout` | Bearer | 204(幂等) | 无 `sid` 旧 token 视为成功但无会话可撤销 |
+| `POST /api/v1/auth/logout-all` | Bearer | 204(幂等) | — |
+| `GET /api/v1/auth/sessions` | Bearer | 200,会话列表(`id`、`created_at`、`last_seen_at`、`expires_at`、`user_agent`、`ip_hint`、`current`) | 不返回 token/jti/ip_hash/refresh family |
+| `DELETE /api/v1/auth/sessions/{id}` | Bearer | 204 | 非本人/不存在/已失效统一 404 |
+
+#### 迁移
+
+| 迁移 | 内容 |
+|---|---|
+| `007_sessions` | `sessions` 表(id、user_id、refresh_family、created_at/last_seen_at/expires_at、revoked_at/revoke_reason、ip_hash、user_agent)+ 索引 |
+| `008_login_rate_counters_and_audit` | `login_rate_counters`(key、window_start、count、`locked_until` 预留未用)与 `auth_audit_log` + `idx_audit_ts` |
+| `009_session_ip_hint` | `ALTER TABLE sessions ADD COLUMN ip_hint TEXT`(会话列表脱敏 IP 提示) |
+
+up-only,无自动 down。🔺 合并编号冲突见 §2.4「SQLx 版本迁移」。
+
+#### 破坏性变更(🔺)
+
+- 🔺 登录失败消息统一为 `invalid credentials`(原可区分用户不存在/密码错误);新增 429 与 `Retry-After`。
+- 🔺 `AuthService::login` 改 async 并新增 `&LoginContext` 参数。
+- 🔺 `generate_access_token` / `generate_token_pair` 新增 `sid` 参数。
+- 🔺 `AuthService::deactivate_user` / `activate_user` 改 async。
+- 🔺 全局限流 key 改为 TCP 对端地址(不再读 `X-Forwarded-For`/`X-Real-IP`):反向代理后所有客户端共享一个桶;`trusted_proxies` 留第二批。
+- 🔺 新增 4 条受保护路由,CORS 放行 `DELETE`。
+- ✅ 顺带修复预先存在的缺陷:`ClaimPolicyConfig` 的 `#[derive(Default)]` 把 `min_weight` 置 0,使用不存在的配置文件启动时 `AppConfig::validate` 失败;已改为手写 `Default`(取 `default_min_claim_weight()`)。⚠️ 无专门回归测试(未核实现有测试是否间接覆盖该启动路径,故不标 ✅ 已覆盖)。
+
+#### 已知限制与偏离(未做项登记)
+
+- ⏳ 指数退避与 `locked_until`:未实现,`locked_until` 为预留死列。
+- ⚠️ 无 `sid` 的旧 access token 登出无效,最长保持到自然过期(默认 24h,未改)。
+- ⚠️ 跨进程停用/撤销最长滞后缓存 TTL(默认 5s)。
+- ⚠️ 已建立的 WS 连接不会因撤销/禁用主动断开,仅新握手被拒。
+- ⏳ 第二批:`trusted_proxies` 与认证参数完整配置化(F10)、改密 API(F9)、管理员会话/用户禁用接口(F8)。
+- ⚠️ refresh 失败(停用/会话失效)未写审计事件;`touch_session` 失败复用分支无专门测试;TLS 路径无真实握手测试。
+- ⚠️ refresh 与 access 仍共用同一 JWT 密钥(既有债务)。
+- ⚠️ 迁移编号顺延:与 pending identity 分支(迁移 007/008)合并时,须把本分支 007/008/009 顺延编号。
+
+#### 登记项(差异清单,本仓库以本文档为登记处)
+
+| 编号 | 项 | 状态 |
+|---|---|---|
+| A-1 | 反向代理后共享全局限流桶 / `trusted_proxies` | 🔺/⏳ 第二批 |
+| A-2 | 指数退避与 `locked_until` | ⏳ |
+| A-3 | 无 `sid` 旧 token 登出无效、WS 连接不主动断开、跨进程 ≤5s 滞后 | ⚠️ |
+| A-4 | 认证参数完整配置化(F10)、改密 API(F9)、管理员接口(F8) | ⏳ 第二批 |
+| A-5 | 迁移 007/008/009 与 pending identity 分支合并需顺延 | ⚠️ 合并时处理 |
+| A-6 | refresh/access 共用 JWT 密钥;access 默认 24h | ⚠️ 既有债务 |
+
+#### 新增测试(均在本次提交,192.168.3.7 docker `rust:latest` cargo test,168 passed 中)
+
+| 测试文件 | 通过数 |
+|---|---|
+| `tests/storage_sessions.rs` | 4 |
+| `tests/auth_claims.rs` | 5 |
+| `tests/login_rate_limit.rs` | 8 |
+| `tests/connect_info_rate_limit.rs` | 5 |
+| `tests/auth_middleware_session.rs` | 12 |
+| `tests/sessions_api.rs` | 16 |
+| `tests/auth_audit.rs` | 13 |
+| `tests/cli_user_status.rs` | 3 |
+| `tests/websocket_integration.rs`(新增 2 个握手测试,现共 11) | 11 |
+
 ## 三、测试与验证状态
 
+- ✅ **本次(认证加固)验证总览**:192.168.3.7 docker `rust:latest`,`cargo test --no-fail-fast` 共 168 passed、0 failed——lib 81、bin 0、api_integration 10、auth_audit 13、auth_claims 5、auth_middleware_session 12、cli_user_status 3、connect_info_rate_limit 5、login_rate_limit 8、sessions_api 16、storage_sessions 4、websocket_integration 11、doctest 0;`cargo fmt --check` rc=0;`cargo clippy --all-targets` 无 error。下面各条中的 97 / 78 / 19 等数字为**历史基线**(各自提交时 247 验证机结果),仅供追溯。
 - ✅ 核心算法已有单元测试：Block、Chain、Merkle/canonical、密码哈希、JWT、权限、版本 diff/content storage 等。
 - ✅ 集成测试共 19 passed:`tests/api_integration.rs`(10，含语义目录端到端 Subject→Revision→Artifact→风险 Claim→上链查询、未登记签发公钥拒绝、**可信 Claim resolver 端到端**)+ `tests/websocket_integration.rs`(9，真实 axum 服务 + tokio-tungstenite 客户端：握手鉴权、EventBus 广播、16KiB 上限、256 连接上限，以及四路连接接收五种事件的频道隔离)。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ 核心算法 + 新增能力单测共 78 passed(含 Claim resolver 的可信签发者/分类授权/覆盖关系/冲突/fail-closed 覆盖)。
@@ -124,6 +212,9 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 - ✅ #4 WebSocket 收发自动化集成测试 — 历史握手/广播/消息与连接上限覆盖已扩展为频道隔离端到端覆盖：四路连接、五种事件、正向投递和非归属频道不投递。本次提交 + 247 docker `rust:latest` `cargo test`（97 passed）。
 - ✅ #3 refresh token 持久化 + token-family 复用检测 — `1124baa` 247 lib 62 + 集成 12 passed(撤销落 SQLite/复用整族撤销/并发双花主键收口/启动清理)。
 - ✅ 可验证语义目录 — `d97cd94` Subject→Revision→Artifact + 完整语义 Merkle 承诺 + signed Claim + pending 持久化/查询投影，247 lib 75 + 集成 17 passed。
+- ✅ 认证加固第一批 F1-F7 — 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(168 passed),详见 §2.6。
+- ⏳ 认证加固第二批:`trusted_proxies`(解决反代共享桶)与认证参数完整配置化(F10)、改密 API(F9)、管理员会话/用户禁用接口(F8);指数退避与 `locked_until`;refresh 失败审计事件;TLS 真实握手测试;refresh/access 分密钥;主动断开被撤销用户的 WS 连接;缩短 access 默认有效期。
+- ⚠️ 与 pending identity 分支合并前:先把本分支迁移 007/008/009 顺延编号,并在含旧库的环境验证升级。
 - P2P 内部去中心化共识与自动分叉裁决：有意不实现，可信根由外部认证链锚定提供。
 - 跨链认证网后续: L2 多外链批次锚定 / L3 锚定回执回写本链 / L4 外链失信切换 / L5 自身失信封存重启(人工触发,涉创世块语义单独设计)。
 - ✅ Claim 信任策略与有效状态 resolver — 本次提交:按可信认证者、分类授权、权重、观察/生效时间与 supersedes/withdrawn 链解析；同权重状态冲突显式返回，默认无可信认证者 fail-closed。
