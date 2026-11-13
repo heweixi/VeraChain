@@ -95,6 +95,8 @@ pub struct AuditEvent {
     /// `success` / `failure` / `denied`。
     pub result: String,
     pub reason: Option<String>,
+    /// 管理员操作的操作者 user_id;`user_id` 仍表示被操作对象。CLI/自助操作为 `None`。
+    pub actor_user_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -133,6 +135,12 @@ impl AuditEvent {
         self.reason = Some(reason.to_string());
         self
     }
+
+    /// 设置操作者(管理员)的 user_id。
+    pub fn actor(mut self, actor_user_id: &str) -> Self {
+        self.actor_user_id = Some(actor_user_id.to_string());
+        self
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -147,6 +155,7 @@ struct AuditRow {
     user_agent: Option<String>,
     result: String,
     reason: Option<String>,
+    actor_user_id: Option<String>,
 }
 
 /// 截断到 `max_chars` 个字符,并把控制字符(换行、ESC/ANSI 序列等)转义为可见文本,
@@ -295,6 +304,7 @@ impl Storage {
                 include_str!("../../migrations/011_identity_transaction_recovery_state.sql"),
             ),
             (12, include_str!("../../migrations/012_login_lockouts.sql")),
+            (13, include_str!("../../migrations/013_audit_actor.sql")),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -1241,7 +1251,7 @@ impl Storage {
         let mut scanned: usize = 0;
         let mut rows = sqlx::query(
             "SELECT id, ts, event_type, user_id, username_attempted, session_id, ip_hash, \
-             user_agent, result, reason FROM auth_audit_log ORDER BY id ASC",
+             user_agent, result, reason, actor_user_id FROM auth_audit_log ORDER BY id ASC",
         )
         .fetch(&self.pool);
         while let Some(row) = rows.try_next().await? {
@@ -1269,6 +1279,7 @@ impl Storage {
                 "ip_hash",
                 "user_agent",
                 "reason",
+                "actor_user_id",
             ] {
                 row.try_get::<Option<String>, _>(column)
                     .map_err(|_| invalid(column))?;
@@ -1715,12 +1726,16 @@ impl Storage {
             .reason
             .as_deref()
             .map(|r| sanitize_audit_text(r, AUDIT_REASON_MAX_CHARS));
+        let actor_user_id = event
+            .actor_user_id
+            .as_deref()
+            .map(|a| sanitize_audit_text(a, AUDIT_USERNAME_MAX_CHARS));
         sqlx::query(
             r#"
             INSERT INTO auth_audit_log
                 (ts, event_type, user_id, username_attempted, session_id,
-                 ip_hash, user_agent, result, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ip_hash, user_agent, result, reason, actor_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(event.ts)
@@ -1732,6 +1747,7 @@ impl Storage {
         .bind(user_agent)
         .bind(sanitize_audit_text(&event.result, 32))
         .bind(reason)
+        .bind(actor_user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1741,7 +1757,7 @@ impl Storage {
     pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEvent>> {
         let rows = sqlx::query_as::<_, AuditRow>(
             "SELECT id, ts, event_type, user_id, username_attempted, session_id, \
-                    ip_hash, user_agent, result, reason \
+                    ip_hash, user_agent, result, reason, actor_user_id \
              FROM auth_audit_log ORDER BY id ASC LIMIT ?",
         )
         .bind(limit)
@@ -1760,6 +1776,7 @@ impl Storage {
                 user_agent: r.user_agent,
                 result: r.result,
                 reason: r.reason,
+                actor_user_id: r.actor_user_id,
             })
             .collect())
     }
@@ -1826,6 +1843,15 @@ impl Storage {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|(active,)| active).unwrap_or(false))
+    }
+
+    /// 用户是否存在于 SQLite(不看启用状态)。
+    pub async fn user_exists(&self, user_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     /// 写入用户启用状态。**仅启用路径使用**;停用必须用
@@ -3207,7 +3233,7 @@ mod tests {
             .fetch_one(&storage.pool)
             .await
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let index_sql: (String,) = sqlx::query_as(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_identity_transactions_submitter_idempotency'",
         )

@@ -1,5 +1,5 @@
 use axum::{
-    http::{header, HeaderName, HeaderValue, Method},
+    http::{header, HeaderName, HeaderValue, Method, StatusCode},
     middleware,
     routing::{delete, get, post},
     Router,
@@ -9,7 +9,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use super::{
-    handlers, middleware::auth_middleware, rate_limit::rate_limit_middleware, websocket, AppState,
+    handlers,
+    middleware::{admin_prefix_auth, auth_middleware},
+    rate_limit::rate_limit_middleware,
+    websocket, AppState,
 };
 
 /// 创建路由
@@ -60,6 +63,19 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/auth/sessions/:id",
             delete(handlers::delete_session),
+        )
+        // 管理员(前缀由 auth_middleware 统一 fail-closed)
+        .route(
+            "/api/v1/admin/users/:user_id/sessions",
+            get(handlers::admin_list_sessions).delete(handlers::admin_revoke_sessions),
+        )
+        .route(
+            "/api/v1/admin/users/:user_id/deactivate",
+            post(handlers::admin_deactivate_user),
+        )
+        .route(
+            "/api/v1/admin/users/:user_id/activate",
+            post(handlers::admin_activate_user),
         )
         // 元数据
         .route("/api/v1/metadata", post(handlers::create_metadata))
@@ -160,11 +176,22 @@ pub fn create_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
+    // 兜底路由:管理员前缀下未实现的路径也必须先过认证与权限(fail-closed),
+    // 其余未知路径仍是 404。注意:`Router::merge` 只保留自定义 fallback,
+    // 对其他路由器被 layer 包裹的默认 fallback 会丢弃,因此需显式声明。
+    let fallback_routes = Router::new()
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_prefix_auth,
+        ));
+
     // 合并路由
     Router::new()
         .merge(public_routes)
         .merge(ws_routes)
         .merge(protected_routes)
+        .merge(fallback_routes)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))

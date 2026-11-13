@@ -46,6 +46,9 @@ pub enum DataChainError {
     /// 新密码被策略拒绝;载荷为固定词表,可直接作为 400 响应的 error 文本。
     #[error("{0}")]
     PasswordRejected(&'static str),
+    /// 管理员尝试停用自己(409)。
+    #[error("cannot deactivate yourself")]
+    SelfDeactivation,
     #[error("无效的令牌")]
     InvalidToken,
 

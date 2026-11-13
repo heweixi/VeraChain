@@ -81,6 +81,28 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     if path == "/api/v1/sync/blocks" {
         return Some(Permission::SystemAdmin);
     }
+    // 管理员接口:整个前缀 fail-closed,未知子路径也要求 SystemAdmin。
+    if is_admin_path(path) {
+        if let Some(rest) = path.strip_prefix("/api/v1/admin/users/") {
+            // rest 形如 `<user_id>/sessions` 或 `<user_id>/deactivate`。
+            let mut parts = rest.split('/');
+            let user_id = parts.next();
+            let action = parts.next();
+            let extra = parts.next();
+            if user_id.is_some_and(|u| !u.is_empty()) && extra.is_none() {
+                match (action, method) {
+                    (Some("sessions"), &Method::GET | &Method::DELETE) => {
+                        return Some(Permission::UserSessionAdmin);
+                    }
+                    (Some("deactivate" | "activate"), &Method::POST) => {
+                        return Some(Permission::UserStatusAdmin);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Some(Permission::SystemAdmin);
+    }
     None
 }
 
@@ -122,6 +144,29 @@ pub async fn auth_middleware(
 
     request.extensions_mut().insert(claims);
     Ok(next.run(request).await)
+}
+
+/// 管理员前缀(`/api/v1/admin`)是否覆盖该路径。
+fn is_admin_path(path: &str) -> bool {
+    path == "/api/v1/admin" || path.starts_with("/api/v1/admin/")
+}
+
+/// 兜底路由专用:仅对 `/api/v1/admin` 前缀下未实现的路径先做认证与权限校验,
+/// 使非管理员得 403、无 token 得 401(fail-closed),管理员才看到 404;其余路径保持原 404。
+pub async fn admin_prefix_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use axum::response::IntoResponse;
+    if is_admin_path(request.uri().path()) {
+        match auth_middleware(State(state), request, next).await {
+            Ok(response) => response,
+            Err(status) => status.into_response(),
+        }
+    } else {
+        next.run(request).await
+    }
 }
 
 /// 从请求中提取用户信息

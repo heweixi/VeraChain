@@ -37,6 +37,10 @@ pub enum Permission {
     SystemConfig,
     SystemMonitor,
     SystemAdmin,
+
+    // 管理员接口权限
+    UserSessionAdmin,
+    UserStatusAdmin,
 }
 
 impl std::fmt::Display for Permission {
@@ -61,6 +65,8 @@ impl std::fmt::Display for Permission {
             Permission::SystemConfig => "system:config",
             Permission::SystemMonitor => "system:monitor",
             Permission::SystemAdmin => "system:admin",
+            Permission::UserSessionAdmin => "user:session_admin",
+            Permission::UserStatusAdmin => "user:status_admin",
         };
         write!(f, "{}", s)
     }
@@ -104,6 +110,8 @@ impl PermissionManager {
             Permission::SystemConfig,
             Permission::SystemMonitor,
             Permission::SystemAdmin,
+            Permission::UserSessionAdmin,
+            Permission::UserStatusAdmin,
         ]
         .into_iter()
         .collect();

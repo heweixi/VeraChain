@@ -142,6 +142,20 @@ pub struct SessionView {
     pub current: bool,
 }
 
+/// 管理员视角的会话视图:只含 id、时间戳与脱敏 IP 提示,
+/// 不含 ip_hash、refresh family、token、jti、user_agent、撤销信息。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminSessionView {
+    pub id: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    /// 脱敏 IP 提示,如 `203.0.x.x`。
+    pub ip_hint: Option<String>,
+    /// 管理员视角下恒为 false。
+    pub current: bool,
+}
+
 /// IP 脱敏:IPv4 保留前两段,IPv6 保留前两组;无法解析(如占位值)返回 `None`。
 fn mask_ip(ip: &str) -> Option<String> {
     match ip.parse::<std::net::IpAddr>().ok()? {
@@ -1130,39 +1144,136 @@ impl AuthService {
     /// 随后清本进程缓存并同步内存副本、写审计。返回被撤销的会话数。
     /// 用户在 SQLite 中不存在时返回 `UserNotFound`。
     pub async fn deactivate_user(&self, user_id: &str) -> Result<u64> {
+        self.deactivate_user_by(None, user_id, &LoginContext::default())
+            .await
+    }
+
+    /// 带操作者的停用:`actor` 为 `Some` 且等于 `target` 时返回 `SelfDeactivation`
+    /// (不落库、不审计)。其余行为同 [`Self::deactivate_user`],审计事件带 `actor_user_id`。
+    pub async fn deactivate_user_by(
+        &self,
+        actor: Option<&str>,
+        target: &str,
+        ctx: &LoginContext,
+    ) -> Result<u64> {
+        if actor == Some(target) {
+            return Err(DataChainError::SelfDeactivation);
+        }
         let revoked = self
             .storage
             .deactivate_user_and_revoke_sessions(
-                user_id,
+                target,
                 "user deactivated",
                 self.jwt_handler.refresh_expire_secs(),
             )
             .await?
-            .ok_or_else(|| DataChainError::UserNotFound(user_id.to_string()))?;
-        if let Some(user) = self.users.write().get_mut(user_id) {
+            .ok_or_else(|| DataChainError::UserNotFound(target.to_string()))?;
+        if let Some(user) = self.users.write().get_mut(target) {
             user.deactivate();
         }
-        self.audit(
-            AuditEvent::new("user_deactivated", "success")
-                .user(user_id)
-                .reason(&format!("revoked {} sessions", revoked)),
-        )
-        .await;
+        let mut event = AuditEvent::new("user_deactivated", "success")
+            .user(target)
+            .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+            .reason(&format!("revoked {} sessions", revoked));
+        if let Some(actor) = actor {
+            event = event.actor(actor);
+        }
+        self.audit(event).await;
         Ok(revoked)
     }
 
     /// 激活用户:只写 SQLite(is_active=1)并清缓存,**不**恢复任何已撤销的会话。
     /// 用户在 SQLite 中不存在时返回 `UserNotFound`。
     pub async fn activate_user(&self, user_id: &str) -> Result<()> {
-        if !self.storage.set_user_active(user_id, true).await? {
-            return Err(DataChainError::UserNotFound(user_id.to_string()));
+        self.activate_user_by(None, user_id, &LoginContext::default())
+            .await
+    }
+
+    /// 带操作者的激活,审计事件带 `actor_user_id`。
+    pub async fn activate_user_by(
+        &self,
+        actor: Option<&str>,
+        target: &str,
+        ctx: &LoginContext,
+    ) -> Result<()> {
+        if !self.storage.set_user_active(target, true).await? {
+            return Err(DataChainError::UserNotFound(target.to_string()));
         }
-        if let Some(user) = self.users.write().get_mut(user_id) {
+        if let Some(user) = self.users.write().get_mut(target) {
             user.activate();
         }
-        self.audit(AuditEvent::new("user_activated", "success").user(user_id))
-            .await;
+        let mut event = AuditEvent::new("user_activated", "success")
+            .user(target)
+            .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref());
+        if let Some(actor) = actor {
+            event = event.actor(actor);
+        }
+        self.audit(event).await;
         Ok(())
+    }
+
+    /// 管理员列出目标用户未撤销、未过期的会话(`current` 恒为 false)。
+    /// 目标不存在返回 `UserNotFound`;成功后写审计 `admin_sessions_listed`。
+    pub async fn admin_list_sessions(
+        &self,
+        actor: &str,
+        target: &str,
+        ctx: &LoginContext,
+    ) -> Result<Vec<AdminSessionView>> {
+        if !self.storage.user_exists(target).await? {
+            return Err(DataChainError::UserNotFound(target.to_string()));
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.purge_expired_sessions_lazily(target, now).await;
+        let sessions = self.storage.list_active_sessions(target, now).await?;
+        self.audit(
+            AuditEvent::new("admin_sessions_listed", "success")
+                .user(target)
+                .actor(actor)
+                .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref()),
+        )
+        .await;
+        Ok(sessions
+            .into_iter()
+            .map(|s| AdminSessionView {
+                id: s.id,
+                created_at: s.created_at,
+                last_seen_at: s.last_seen_at,
+                expires_at: s.expires_at,
+                ip_hint: s.ip_hint,
+                current: false,
+            })
+            .collect())
+    }
+
+    /// 管理员撤销目标用户全部会话(幂等),返回本次撤销数。
+    /// 目标不存在返回 `UserNotFound`;成功后写审计 `admin_sessions_revoked`。
+    pub async fn admin_revoke_sessions(
+        &self,
+        actor: &str,
+        target: &str,
+        ctx: &LoginContext,
+    ) -> Result<u64> {
+        if !self.storage.user_exists(target).await? {
+            return Err(DataChainError::UserNotFound(target.to_string()));
+        }
+        let ids = self
+            .storage
+            .revoke_user_sessions(
+                target,
+                "sessions revoked by admin",
+                self.jwt_handler.refresh_expire_secs(),
+            )
+            .await?;
+        self.audit(
+            AuditEvent::new("admin_sessions_revoked", "success")
+                .user(target)
+                .actor(actor)
+                .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                .reason(&format!("revoked {} sessions", ids.len())),
+        )
+        .await;
+        Ok(ids.len() as u64)
     }
 }
 

@@ -278,6 +278,151 @@ pub async fn delete_session(
     }
 }
 
+// ==================== 管理员处理器 ====================
+
+/// 管理员接口二次断言:中间件已按路径校验过权限,handler 内再确认一次(纵深防御)。
+/// 无权限时返回 403 响应,有权限返回 `None`。
+fn admin_denied(
+    claims: &Claims,
+    permission: crate::auth::Permission,
+) -> Option<axum::response::Response> {
+    let allowed = claims
+        .role
+        .parse::<crate::auth::Role>()
+        .map(|role| crate::auth::check_permission(role, permission))
+        .unwrap_or(false);
+    if allowed {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(ApiResponse::error("permission denied")),
+            )
+                .into_response(),
+        )
+    }
+}
+
+/// 管理员接口的错误映射:未知用户 404、自停用 409、其余 500(不泄露细节)。
+fn admin_error(context: &str, e: crate::error::DataChainError) -> axum::response::Response {
+    use crate::error::DataChainError;
+    match e {
+        DataChainError::UserNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("user not found")),
+        )
+            .into_response(),
+        DataChainError::SelfDeactivation => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("cannot deactivate yourself")),
+        )
+            .into_response(),
+        e => internal_error(context, e),
+    }
+}
+
+/// `GET /api/v1/admin/users/:user_id/sessions`:管理员列出目标用户的有效会话。
+pub async fn admin_list_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = admin_denied(&claims, crate::auth::Permission::UserSessionAdmin) {
+        return resp;
+    }
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .admin_list_sessions(&claims.sub, &user_id, &ctx)
+        .await
+    {
+        Ok(sessions) => Json(ApiResponse::success(sessions)).into_response(),
+        Err(e) => admin_error("管理员查询会话失败", e),
+    }
+}
+
+/// `DELETE /api/v1/admin/users/:user_id/sessions`:管理员撤销目标用户全部会话(幂等)。
+pub async fn admin_revoke_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = admin_denied(&claims, crate::auth::Permission::UserSessionAdmin) {
+        return resp;
+    }
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .admin_revoke_sessions(&claims.sub, &user_id, &ctx)
+        .await
+    {
+        Ok(revoked) => Json(ApiResponse::success(
+            serde_json::json!({ "revoked": revoked }),
+        ))
+        .into_response(),
+        Err(e) => admin_error("管理员撤销会话失败", e),
+    }
+}
+
+/// `POST /api/v1/admin/users/:user_id/deactivate`:停用用户并撤销其全部会话(幂等)。
+/// 目标为操作者本人返回 409。
+pub async fn admin_deactivate_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = admin_denied(&claims, crate::auth::Permission::UserStatusAdmin) {
+        return resp;
+    }
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .deactivate_user_by(Some(&claims.sub), &user_id, &ctx)
+        .await
+    {
+        Ok(revoked) => Json(ApiResponse::success(serde_json::json!({
+            "user_id": user_id,
+            "is_active": false,
+            "revoked_sessions": revoked,
+        })))
+        .into_response(),
+        Err(e) => admin_error("管理员停用用户失败", e),
+    }
+}
+
+/// `POST /api/v1/admin/users/:user_id/activate`:启用用户(幂等,不恢复旧会话)。
+pub async fn admin_activate_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = admin_denied(&claims, crate::auth::Permission::UserStatusAdmin) {
+        return resp;
+    }
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .activate_user_by(Some(&claims.sub), &user_id, &ctx)
+        .await
+    {
+        Ok(()) => Json(ApiResponse::success(serde_json::json!({
+            "user_id": user_id,
+            "is_active": true,
+        })))
+        .into_response(),
+        Err(e) => admin_error("管理员启用用户失败", e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RefreshTokenRequest {
     pub refresh_token: String,
