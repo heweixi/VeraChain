@@ -61,6 +61,9 @@ async fn fixture_with(settings: Option<AuthSettings>) -> Fixture {
     let dsn = dir.path().join("pw.db").to_str().unwrap().to_string();
     let (mut state, storage) = build_state(&dsn).await;
     if let Some(s) = settings {
+        // 限速是 epoch 对齐的固定窗口:固定时钟,避免用例耗时跨越窗口边界导致计数被重置而偶发失败。
+        // 1_800_000_000 是 900 的整数倍,+10 秒落在窗口内。
+        storage.set_clock(Arc::new(|| 1_800_000_010));
         state.auth_service = Arc::new(AuthService::with_settings(
             JWT_SECRET.to_string(),
             storage.clone(),
