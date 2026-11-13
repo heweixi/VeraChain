@@ -9,6 +9,9 @@ use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedCh
 use crate::error::{corruption_from_json, CorruptionCategory, DataChainError, Result};
 use crate::versioning::Version;
 
+/// anchor_outbox 行:(anchor_id, signed, status, attempts, last_error, receipt)。
+type AnchorOutboxRow = (String, String, String, i64, Option<String>, Option<String>);
+
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
@@ -692,7 +695,7 @@ impl Storage {
 
     /// 列出待投递锚定（pending），按创建时间升序，限制批量大小。
     pub async fn list_pending_anchors(&self, limit: i64) -> Result<Vec<AnchorOutboxEntry>> {
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<String>)> =
+        let rows: Vec<AnchorOutboxRow> =
             sqlx::query_as(
                 r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
@@ -720,7 +723,7 @@ impl Storage {
     /// 启动期只读全表扫描 anchor_outbox(不按 status 过滤),逐行严格校验
     /// status / signed / receipt。返回已校验行数;首个损坏行返回 `DataCorruption`。
     pub async fn scan_anchor_outbox(&self) -> Result<usize> {
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<String>)> =
+        let rows: Vec<AnchorOutboxRow> =
             sqlx::query_as(
                 r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
@@ -785,7 +788,7 @@ impl Storage {
 
     /// 查询单个锚定条目（供 API 查询状态）。
     pub async fn get_anchor(&self, anchor_id: &str) -> Result<Option<AnchorOutboxEntry>> {
-        let row: Option<(String, String, String, i64, Option<String>, Option<String>)> =
+        let row: Option<AnchorOutboxRow> =
             sqlx::query_as(
                 r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
