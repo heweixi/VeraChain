@@ -182,6 +182,8 @@ pub struct Storage {
     active_cache_ttl_ms: AtomicU64,
     /// 每次 is_active 写入后自增,用于丢弃"读发生在写之前"的陈旧回填。
     active_generation: AtomicU64,
+    /// 登录限速使用的时间源(Unix 秒);默认系统时间,测试可经 [`Storage::set_clock`] 注入。
+    clock: parking_lot::RwLock<Arc<dyn Fn() -> i64 + Send + Sync>>,
 }
 
 /// `identity_transactions` 查询使用的 SQLx 行元组。
@@ -237,6 +239,7 @@ impl Storage {
             active_cache: parking_lot::Mutex::new(HashMap::new()),
             active_cache_ttl_ms: AtomicU64::new(DEFAULT_ACTIVE_CACHE_TTL.as_millis() as u64),
             active_generation: AtomicU64::new(0),
+            clock: parking_lot::RwLock::new(Arc::new(|| chrono::Utc::now().timestamp())),
         };
         storage.init_tables().await?;
 
@@ -1624,6 +1627,16 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    /// 替换登录限速使用的时间源(默认系统时间)。主要供测试固定时间、复现窗口边界。
+    pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        *self.clock.write() = clock;
+    }
+
+    /// 当前时间(Unix 秒),来自可注入的时间源。
+    pub fn now_secs(&self) -> i64 {
+        (self.clock.read())()
     }
 
     /// 设置 is_active 缓存 TTL(默认 5 秒;`Duration::ZERO` 表示禁用缓存)。

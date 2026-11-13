@@ -39,9 +39,16 @@ async fn try_login(
     (status, retry_after, body_json(resp).await)
 }
 
+/// 固定在某个窗口起点之后 10 秒,使一个测试内的所有尝试必落在同一固定窗口。
+fn pin_clock(storage: &datachain::storage::Storage) {
+    let now: i64 = 1_800_000_000 - (1_800_000_000 % 900) + 10;
+    storage.set_clock(Arc::new(move || now));
+}
+
 async fn router_with_alice(dir: &tempfile::TempDir) -> (axum::Router, Arc<AuthService>) {
     let dsn = dir.path().join("dc.db");
-    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    let (state, storage) = build_state(dsn.to_str().unwrap()).await;
+    pin_clock(&storage);
     seed_user(&state, "alice", "alicepass123", Role::User).await;
     seed_user(&state, "bob", "bobpass123456", Role::User).await;
     let auth = state.auth_service.clone();
@@ -121,7 +128,8 @@ async fn successful_login_does_not_clear_accumulated_failures() {
 async fn case_variant_account_success_cannot_reset_victim_counter() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("dc.db");
-    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    let (state, storage) = build_state(dsn.to_str().unwrap()).await;
+    pin_clock(&storage);
     seed_user(&state, "carol", "carolpass123", Role::User).await;
     // 攻击者注册大小写变体:限速 key 归一化后与受害者相同。
     seed_user(&state, "CAROL", "attackerpass1", Role::User).await;
@@ -171,6 +179,7 @@ async fn service_with_limits(
 ) -> (AuthService, Arc<datachain::storage::Storage>) {
     let path = dir.path().join("svc.db");
     let storage = create_storage(path.to_str().unwrap()).await.unwrap();
+    pin_clock(&storage);
     let service = AuthService::new("svc-test-secret".to_string(), 24, storage.clone())
         .with_login_limits(limits);
     for name in ["u1", "u2", "u3", "u4", "u5"] {
@@ -315,4 +324,74 @@ async fn unknown_user_login_costs_comparable_time_to_wrong_password() {
         unknown,
         wrong
     );
+}
+
+/// 可控时钟:返回共享原子值,测试按需拨动。
+fn fixed_clock(now: Arc<std::sync::atomic::AtomicI64>) -> Arc<dyn Fn() -> i64 + Send + Sync> {
+    Arc::new(move || now.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// 窗口跨越(固定窗口按 epoch 对齐):窗口末尾失败 5 次后,进入新窗口计数从 0 重新开始;
+/// 同一窗口内第 6 次必须 429。时间完全由注入时钟控制,不依赖墙钟。
+#[tokio::test]
+async fn failed_attempts_reset_when_clock_crosses_window_boundary() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (service, storage) = service_with_limits(&dir, LoginLimits::default()).await;
+    // 任意 epoch 对齐的窗口起点(900 的整数倍)。
+    let window_start: i64 = 1_800_000_000 - (1_800_000_000 % 900);
+    let now = Arc::new(AtomicI64::new(window_start + 895));
+    storage.set_clock(fixed_clock(now.clone()));
+
+    // 窗口末尾(距边界 5 秒)连续失败 5 次,均为 401。
+    for attempt in 1..=5 {
+        let err = service
+            .login(&login_req("u1", "bad-password"), &ctx("198.51.100.30"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DataChainError::InvalidCredentials),
+            "第 {} 次应为 InvalidCredentials: {:?}",
+            attempt,
+            err
+        );
+    }
+    // 同一窗口内第 6 次被限速,Retry-After 恰为到窗口末尾的剩余秒数。
+    match service
+        .login(&login_req("u1", "bad-password"), &ctx("198.51.100.30"))
+        .await
+        .unwrap_err()
+    {
+        DataChainError::TooManyAttempts { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 5)
+        }
+        other => panic!("期望 TooManyAttempts,实际 {:?}", other),
+    }
+
+    // 时钟越过边界进入新窗口:计数从 0 开始,同一用户可再次尝试 5 次且为 401。
+    now.store(window_start + 901, Ordering::SeqCst);
+    for attempt in 1..=5 {
+        let err = service
+            .login(&login_req("u1", "bad-password"), &ctx("198.51.100.30"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DataChainError::InvalidCredentials),
+            "新窗口第 {} 次应为 InvalidCredentials: {:?}",
+            attempt,
+            err
+        );
+    }
+    // 新窗口内第 6 次再次被限速,剩余秒数 = 900 - 1。
+    match service
+        .login(&login_req("u1", "bad-password"), &ctx("198.51.100.30"))
+        .await
+        .unwrap_err()
+    {
+        DataChainError::TooManyAttempts { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 899)
+        }
+        other => panic!("期望 TooManyAttempts,实际 {:?}", other),
+    }
 }

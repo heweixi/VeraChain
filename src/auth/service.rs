@@ -228,7 +228,7 @@ impl AuthService {
     pub async fn login(&self, req: &LoginRequest, ctx: &LoginContext) -> Result<LoginResponse> {
         // 限速:先在事务外对 IP 与用户名两个维度原子递增(不先读后写),超限直接 429。
         // 失败/成功都先计数,成功后再归还名额,避免并发请求绕过阈值。
-        let now = chrono::Utc::now().timestamp();
+        let now = self.storage.now_secs();
         let limits = self.login_limits;
         let ip_key = format!(
             "ip:{}",
