@@ -36,7 +36,11 @@ async fn created_session_can_be_read_back_and_listed() {
         .await
         .unwrap();
 
-    let got = storage.get_session("s1").await.unwrap().expect("会话应存在");
+    let got = storage
+        .get_session("s1")
+        .await
+        .unwrap()
+        .expect("会话应存在");
     assert_eq!(got.user_id, "u1");
     assert_eq!(got.refresh_family, "fam1");
     assert_eq!(got.expires_at, FAR_FUTURE);
@@ -104,7 +108,10 @@ async fn revoking_session_marks_it_and_revokes_refresh_family() {
     // 幂等:再次撤销返回 false,不报错。
     assert!(!storage.revoke_session("s1", "logout", 3600).await.unwrap());
     // 不存在的会话返回 false。
-    assert!(!storage.revoke_session("nope", "logout", 3600).await.unwrap());
+    assert!(!storage
+        .revoke_session("nope", "logout", 3600)
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
