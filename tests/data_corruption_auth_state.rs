@@ -68,7 +68,9 @@ impl Env {
         pool.close().await;
     }
 
-    async fn scan(&self) -> datachain::error::Result<datachain::cli::server::StartupRecoveryResult> {
+    async fn scan(
+        &self,
+    ) -> datachain::error::Result<datachain::cli::server::StartupRecoveryResult> {
         scan_authoritative_sources_and_ensure_projections(&self.chain, &self.storage).await
     }
 }
