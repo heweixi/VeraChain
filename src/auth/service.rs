@@ -55,7 +55,11 @@ fn normalize_username_key(username: &str) -> String {
 /// 不存在用户时用于抹平耗时的 bcrypt 哈希,cost 与真实密码一致(同为 `hash_password`)。
 fn dummy_password_hash() -> &'static str {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DUMMY.get_or_init(|| hash_password("datachain-dummy-password-for-timing").unwrap_or_default())
+    // hash 失败不能退化为空串(会让时序保护无声失效),直接 panic 暴露问题。
+    DUMMY.get_or_init(|| {
+        hash_password("datachain-dummy-password-for-timing")
+            .expect("生成 dummy bcrypt 哈希失败,无法保证登录时序保护")
+    })
 }
 
 /// user_agent 入库长度上限(字符数)。
@@ -293,8 +297,13 @@ impl AuthService {
             }
         };
 
-        // 成功:重置用户名维度计数,归还 IP 维度的本次名额。
-        self.storage.reset_login_counter(&user_key).await?;
+        // 成功:对两个维度都只归还本次自己占用的名额(净效果为 0),
+        // 绝不清零用户名计数——否则能登录大小写变体账户("BOB" 与 "bob" 归一化后同 key)
+        // 的攻击者可抵消对受害者累积的失败计数,绕过限速。
+        // 归还不会低于 0,也不会让他人累积的失败减少:本次名额是本请求刚递增的那一份。
+        self.storage
+            .decr_login_counter(&user_key, now, limits.window_secs)
+            .await?;
         self.storage
             .decr_login_counter(&ip_key, now, limits.window_secs)
             .await?;
@@ -360,7 +369,8 @@ impl AuthService {
     /// 统一的 access token 鉴权:供 HTTP 鉴权中间件、可选鉴权中间件与 WS 握手共用。
     ///
     /// 依次校验:JWT 签名/过期 → (有 `sid` 时)会话存在、属于该用户、未撤销、未过期
-    /// → 用户 is_active(SQLite 权威,带短 TTL 缓存)→ 内存用户存在、启用且角色与 claims 一致。
+    /// → 用户 is_active(SQLite 权威,带短 TTL 缓存;启用状态只信 SQLite)
+    /// → 内存用户存在且角色与 claims 一致。
     /// 无 `sid` 的旧 token 跳过会话检查,只查 is_active。
     /// 任一步失败(含查库失败)都返回 `Err`,调用方一律按 401 处理(fail-closed)。
     pub async fn authenticate_access_token(&self, token: &str) -> Result<super::Claims> {
@@ -506,17 +516,19 @@ impl AuthService {
                     .touch_session(&session.id, now, now + ttl_secs)
                     .await?
                 {
-                    // 会话在检查后被并发撤销:登出/停用 => 拒绝签发;
-                    // 若是并发双花触发的整族撤销,沿用既有语义(胜出方拿到的令牌随整族失效)。
+                    // 会话在检查后被并发撤销:登出/停用 => 拒绝签发(InvalidToken);
+                    // 并发双花/复用触发的整族撤销 => 同样不签发,返回 TokenReuseDetected。
                     let by_reuse = self
                         .storage
                         .get_session(&session.id)
                         .await?
                         .and_then(|s| s.revoke_reason)
                         .is_some_and(|r| r.starts_with("refresh token"));
-                    if !by_reuse {
-                        return Err(DataChainError::InvalidToken);
-                    }
+                    return Err(if by_reuse {
+                        DataChainError::TokenReuseDetected
+                    } else {
+                        DataChainError::InvalidToken
+                    });
                 }
                 (session.id, family_id)
             }

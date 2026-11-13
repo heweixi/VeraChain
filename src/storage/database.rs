@@ -1311,7 +1311,9 @@ impl Storage {
         Ok(row.map(|(active,)| active).unwrap_or(false))
     }
 
-    /// 写入用户启用状态。返回 `true` 表示用户存在并已更新。
+    /// 写入用户启用状态。**仅启用路径使用**;停用必须用
+    /// `deactivate_user_and_revoke_sessions`(本函数不撤销会话与 refresh family)。
+    /// 返回 `true` 表示用户存在并已更新。
     pub async fn set_user_active(&self, user_id: &str, active: bool) -> Result<bool> {
         let result = sqlx::query("UPDATE users SET is_active = ? WHERE user_id = ?")
             .bind(active)
