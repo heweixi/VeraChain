@@ -2,10 +2,11 @@
 
 DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：既可作为可嵌入的 Rust 模块使用，也可独立运行 Axum HTTP + WebSocket 服务。
 
-> **最后核实：2026-11-10**
+> **最后核实：2026-11-13**
 >
-> - ✅ 链完整性校验：`validate_chain` 与 `validate_loaded_blocks` 共用同一显式门禁；恢复遇到损坏区块会失败关闭，不加载、修复或写回该库。本次提交 + 247 docker `rust:latest` `cargo test`（107 passed）。
-> - ⚠️ **未验证声明(分支 `feat/data-corruption-policy`，2026-11-11)**：数据损坏处置策略（见下文"数据损坏处置"）的代码**未编译、未测试**（本机无 Rust 工具链，247 根分区已满无法运行 docker）。上面的 107 passed 仅适用于基线 `96d08e8`，**不覆盖本分支改动**；仅有 reviewer 两轮读代码审查，待 247 恢复后补跑 `cargo test`/`fmt`/`clippy`。
+> - ✅ 链完整性校验：`validate_chain` 与 `validate_loaded_blocks` 共用同一显式门禁；恢复遇到损坏区块会失败关闭，不加载、修复或写回该库。基线提交 `96d08e8` + 247 docker `rust:latest` `cargo test`（107 passed，**旧基线计数**，已被下条本分支计数取代）。
+> - ✅ **数据损坏处置策略已验证(分支 `feat/data-corruption-policy`，HEAD `d3614f6`，2026-11-13)**：本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest` 真实运行：`cargo fmt --check` rc=0；`cargo test --no-fail-fast` 共 **139 passed、0 failed**（lib 93、api_integration 11、chain_validation_cli 1、data_corruption_authoritative 4、data_corruption_cli 4、data_corruption_outbox 9、data_corruption_projection 3、data_corruption_startup 5、websocket_integration 9、bin 0、doctest 0）；`cargo clippy --all-targets`（未加 `-D warnings`）无 error，lib 22 条 warning（既有基线约 23 条，本分支新增的 `anchor_outbox` type_complexity 已消除），`tests/common/corrupt.rs` 有 3 条 `dead_code`（共享测试 helper，未处理）。首次真实运行发现并已修复 2 个 `/chain/validate` HTTP 测试漏带 Bearer token（返回 401，属测试缺陷，路由鉴权未改）及 rustfmt 差异（修复提交 `e63c66a`、`1a8b4b6`、`d3614f6`）。reviewer 两轮读代码审查最终无 Important。已知限制仍保留，见下文。
+> - 验证环境：主验证机已从 247 迁到 `deploy@192.168.3.7`（局域网）；247 磁盘长期 100% 满，降为备用。
 > - 实现状态与未完成需求见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。该文档是本独立仓库的状态入口。
 
 ## 适用场景
@@ -36,7 +37,9 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 
 完整限制、证据和后续项以 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) 为准。
 
-## 数据损坏处置（`feat/data-corruption-policy`，⚠️ 未编译未测试）
+## 数据损坏处置（`feat/data-corruption-policy`，✅ 已验证：本次提交 + 192.168.3.7 docker `rust:latest` `cargo test`（139 passed））
+
+> 下列行为由 `tests/data_corruption_*.rs`、`tests/chain_validation_cli.rs`、lib 单测覆盖。未被测试覆盖者单独标 ⚠️：`login`/`refresh` 遇数据损坏返回 500 目前无集成测试，仅读代码审查。
 
 - 新增 `DataChainError::DataCorruption{category,table,key,reason}`；`reason` 为固定词表，不回显行内容、`password_hash` 或 JSON 片段。
 - 权威源 fail-closed：blocks、users、versions、pending metadata、pending catalog、anchor_outbox（全表扫描，未知 status 报错，不再当 pending）、aggregations（由调度器写入，非纯区块导出，不重建）。
@@ -45,7 +48,7 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 - CLI 退出码：`0` 成功 / `1` 其他错误 / `2` 链无效 / `3` 数据损坏。`chain`/`metadata`/`aggregate`/`status` 统一走完整链校验。
   - 🔺 **破坏性变更**：`chain validate` 在链无效时原退出码为 `0`，现为 `2`；数据损坏为 `3`。依赖旧行为的脚本需调整。
   - `chain mine` 改用 `commit_block`，同事务写投影。
-- HTTP：`POST /api/v1/chain/validate` 保留 `valid`/`block_count`，新增可选 `corruption`、`invalid_block`（仅异常时出现），状态码仍为 200；`login`/`refresh` 遇数据损坏返回 `500`（原 `login` 会返回 401）。
+- HTTP：`POST /api/v1/chain/validate` 保留 `valid`/`block_count`，新增可选 `corruption`、`invalid_block`（仅异常时出现），状态码仍为 200；`login`/`refresh` 遇数据损坏返回 `500`（原 `login` 会返回 401）——⚠️ 该 500 行为暂无集成测试，仅读代码审查。
 - 已知限制：投影检测不发现"合法但被篡改"的内容；p2p `import_blocks` 仍用 `save_block` 不写投影（依赖下次启动重建兜底）；其他业务端点的 500 body 含 table/key（无行内容），未按设计收窄；未提供 `storage check`/`rebuild-projections` 命令；旧用户/版本表兼容迁移未做。
 
 详情与状态标记见 [IMPLEMENTATION_STATUS.md §2.6](IMPLEMENTATION_STATUS.md) 与 `docs/superpowers/specs/2026-11-11-data-corruption-policy-design.md`。
@@ -78,7 +81,9 @@ Docker Compose 路径、请求示例和端口说明见新手指南。
 - 启动方式：`cargo run -- serve --port 8080`，或 `docker compose up --build`。
 - 健康检查：`GET /health`。
 - Rust 测试：`cargo test`。
-- ✅ 链完整性验证：本次提交 + 247 docker `rust:latest` `cargo test`（86 单测 + 21 集成测试：API 11、CLI 1、WebSocket 9，107 passed）；`cargo fmt --check` 通过，`cargo clippy --all-targets` 无本次警告，现有基线 warning 保留。
+- ✅ 本分支验证（`d3614f6`）：本次提交 + 192.168.3.7 docker `rust:latest` `cargo test --no-fail-fast`，**139 passed**（lib 93 + api_integration 11 + chain_validation_cli 1 + data_corruption_* 25 + websocket_integration 9）；`cargo fmt --check` 通过；`cargo clippy --all-targets` 无 error（lib 22 条既有 warning，tests/common/corrupt.rs 3 条 dead_code）。
+- ✅ 旧基线（`96d08e8`）：247 docker `rust:latest` `cargo test`，86 单测 + 21 集成测试，107 passed；仅作历史参考。
+- 验证机：主验证机为 `deploy@192.168.3.7`，247 因磁盘满降为备用。
 
 ## 文档导航
 
