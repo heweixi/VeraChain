@@ -695,19 +695,18 @@ impl Storage {
 
     /// 列出待投递锚定（pending），按创建时间升序，限制批量大小。
     pub async fn list_pending_anchors(&self, limit: i64) -> Result<Vec<AnchorOutboxEntry>> {
-        let rows: Vec<AnchorOutboxRow> =
-            sqlx::query_as(
-                r#"
+        let rows: Vec<AnchorOutboxRow> = sqlx::query_as(
+            r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox
             WHERE status = 'pending'
             ORDER BY created_at ASC
             LIMIT ?
             "#,
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         rows.into_iter()
             .map(
@@ -723,16 +722,15 @@ impl Storage {
     /// 启动期只读全表扫描 anchor_outbox(不按 status 过滤),逐行严格校验
     /// status / signed / receipt。返回已校验行数;首个损坏行返回 `DataCorruption`。
     pub async fn scan_anchor_outbox(&self) -> Result<usize> {
-        let rows: Vec<AnchorOutboxRow> =
-            sqlx::query_as(
-                r#"
+        let rows: Vec<AnchorOutboxRow> = sqlx::query_as(
+            r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox
             ORDER BY created_at ASC, anchor_id ASC
             "#,
-            )
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut count = 0usize;
         for (anchor_id, signed, status, attempts, last_error, receipt) in rows {
             Self::parse_anchor_row(&anchor_id, &signed, &status, attempts, last_error, receipt)?;
@@ -788,16 +786,15 @@ impl Storage {
 
     /// 查询单个锚定条目（供 API 查询状态）。
     pub async fn get_anchor(&self, anchor_id: &str) -> Result<Option<AnchorOutboxEntry>> {
-        let row: Option<AnchorOutboxRow> =
-            sqlx::query_as(
-                r#"
+        let row: Option<AnchorOutboxRow> = sqlx::query_as(
+            r#"
             SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox WHERE anchor_id = ?
             "#,
-            )
-            .bind(anchor_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        )
+        .bind(anchor_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         match row {
             None => Ok(None),
