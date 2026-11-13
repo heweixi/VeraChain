@@ -60,7 +60,7 @@ async fn initialize_or_load_chain(
 
 /// 启动时序第 4-7 步的核心逻辑,抽成独立可测函数:
 /// 4) 权威源只读扫描(users/versions/pending metadata/pending catalog/identity_transactions/anchor_outbox/
-///    aggregations/sessions/login_rate_counters;auth_audit_log 损坏只告警,
+///    aggregations/sessions/login_rate_counters/login_lockouts;auth_audit_log 损坏只告警,
 ///    任一损坏即 fail-closed,此时尚无任何写操作)
 /// 5) (无写)
 /// 6) pending 去重(复用调用方已加载的区块判断)
@@ -106,6 +106,7 @@ pub async fn scan_authoritative_sources_and_ensure_projections(
     // (同样在任何写操作之前)。auth_audit_log 只是证据,损坏仅告警,不阻塞启动。
     storage.scan_sessions().await?;
     storage.scan_login_rate_counters().await?;
+    storage.scan_login_lockouts().await?;
     if let Err(e) = storage.scan_auth_audit_log().await {
         tracing::error!("认证审计日志扫描失败(不阻塞启动): {}", e);
     }
@@ -258,6 +259,16 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!("清理过期会话失败: {}", e),
     }
+    // 清理锁定结束已超过 `lockout_reset_secs` 的陈旧锁定行(级别本就会惰性归零)。
+    match storage
+        .purge_login_lockouts_before(now_ts - auth_settings.lockout.reset_secs)
+        .await
+    {
+        Ok(n) if n > 0 => info!("已清理 {} 条陈旧登录锁定记录", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("清理陈旧登录锁定记录失败: {}", e),
+    }
+
     let audit_retention_secs = config.auth.audit_retention_days as i64 * 86400;
     match storage
         .purge_audit_before(now_ts - audit_retention_secs)

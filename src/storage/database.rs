@@ -294,6 +294,7 @@ impl Storage {
                 11,
                 include_str!("../../migrations/011_identity_transaction_recovery_state.sql"),
             ),
+            (12, include_str!("../../migrations/012_login_lockouts.sql")),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -1923,6 +1924,131 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    // ==================== 用户名维度指数退避锁定(login_lockouts) ====================
+
+    /// 查询 key 当前是否处于锁定期:`now < locked_until` 时返回 `Some(locked_until)`。
+    pub async fn get_login_lock(&self, key: &str, now: i64) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT locked_until FROM login_lockouts WHERE key = ? AND locked_until > ?",
+        )
+        .bind(key)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(locked_until,)| locked_until))
+    }
+
+    /// 落锁并返回生效的 `locked_until`。
+    ///
+    /// 单条 `INSERT .. ON CONFLICT DO UPDATE .. RETURNING`,不先读后写:
+    /// - 无记录:插入 `level=1`、`locked_until = now + min(base, max)`;
+    /// - 仍在锁定期(`locked_until > now`):保持原值,并发请求不会重复升级;
+    /// - 距上次锁定结束已满 `reset`(`now - locked_until >= reset`):级别回到 1;
+    /// - 否则 `level = min(level + 1, 20)`,`locked_until = now + min(min(base,max) << level_before, max)`
+    ///   (`level_before` 取旧级别并限制在 20 以内,避免移位溢出)。
+    ///
+    /// 随后在同一事务内删除该 key 的窗口计数(锁到期后拥有完整配额),并清理陈旧锁定行。
+    /// SQL 一律用顺序 `?` 占位符并按出现顺序重复 bind,不依赖 `?N` 编号复用。
+    pub async fn lock_login_key(
+        &self,
+        key: &str,
+        now: i64,
+        base_secs: i64,
+        max_secs: i64,
+        reset_secs: i64,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let (locked_until,): (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO login_lockouts (key, level, locked_until)
+            VALUES (?, 1, ? + MIN(?, ?))
+            ON CONFLICT(key) DO UPDATE SET
+                level = CASE
+                    WHEN login_lockouts.locked_until > ? THEN login_lockouts.level
+                    WHEN ? - login_lockouts.locked_until >= ? THEN 1
+                    ELSE MIN(login_lockouts.level + 1, 20)
+                END,
+                locked_until = CASE
+                    WHEN login_lockouts.locked_until > ? THEN login_lockouts.locked_until
+                    WHEN ? - login_lockouts.locked_until >= ? THEN ? + MIN(?, ?)
+                    ELSE ? + MIN(MIN(?, ?) << MIN(login_lockouts.level, 20), ?)
+                END
+            RETURNING locked_until
+            "#,
+        )
+        // VALUES
+        .bind(key)
+        .bind(now)
+        .bind(base_secs)
+        .bind(max_secs)
+        // level CASE
+        .bind(now)
+        .bind(now)
+        .bind(reset_secs)
+        // locked_until CASE
+        .bind(now)
+        .bind(now)
+        .bind(reset_secs)
+        .bind(now)
+        .bind(base_secs)
+        .bind(max_secs)
+        .bind(now)
+        .bind(base_secs)
+        .bind(max_secs)
+        .bind(max_secs)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM login_rate_counters WHERE key = ?")
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM login_lockouts WHERE locked_until < ?")
+            .bind(now - reset_secs)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(locked_until)
+    }
+
+    /// 严格扫描 `login_lockouts` 全表(锁定状态是访问决策依据,损坏必须 fail-closed)。
+    ///
+    /// 流式逐行校验(`fetch` + `try_next`),错误 key 固定为 `rowid=<n>`,不回显 `key` 列
+    /// (其值含攻击者可控的用户名);reason 为 `invalid_column:<列>`。
+    pub async fn scan_login_lockouts(&self) -> Result<usize> {
+        use futures_util::TryStreamExt;
+        use sqlx::Row;
+        let mut scanned: usize = 0;
+        let mut rows = sqlx::query(
+            "SELECT rowid, key, level, locked_until FROM login_lockouts ORDER BY rowid ASC",
+        )
+        .fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
+            scanned += 1;
+            let key = Self::scan_rowid_key(&row);
+            let invalid = |column: &str| DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "login_lockouts",
+                key: key.clone(),
+                reason: format!("invalid_column:{}", column),
+            };
+            row.try_get::<String, _>("key")
+                .map_err(|_| invalid("key"))?;
+            for column in ["level", "locked_until"] {
+                row.try_get::<i64, _>(column).map_err(|_| invalid(column))?;
+            }
+        }
+        Ok(scanned)
+    }
+
+    /// 删除 `locked_until < cutoff` 的陈旧锁定行(启动时清理),返回删除行数。
+    pub async fn purge_login_lockouts_before(&self, cutoff: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM login_lockouts WHERE locked_until < ?")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     // ==================== metadata 查询投影(backlog #5) ====================

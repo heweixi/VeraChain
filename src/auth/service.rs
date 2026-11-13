@@ -252,6 +252,17 @@ impl AuthService {
         }
     }
 
+    /// 记录一次被锁定/限速拒绝的登录尝试(`login_locked`,result `denied`)。
+    async fn audit_login_locked(&self, req: &LoginRequest, ctx: &LoginContext, reason: &str) {
+        self.audit(
+            AuditEvent::new("login_locked", "denied")
+                .username(&req.username)
+                .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                .reason(reason),
+        )
+        .await;
+    }
+
     /// 请求上下文里的客户端 IP 摘要(无对端地址时为 `None`)。
     fn ctx_ip_hash(&self, ctx: &LoginContext) -> Option<String> {
         ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip))
@@ -312,6 +323,16 @@ impl AuthService {
             self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
         );
         let user_key = format!("user:{}", normalize_username_key(&req.username));
+
+        // 用户名维度已处于指数退避锁定期:直接拒绝,不计数、不验密(不跑 bcrypt),
+        // 对不存在的用户名同样生效,保持同形。
+        if let Some(locked_until) = self.storage.get_login_lock(&user_key, now).await? {
+            self.audit_login_locked(req, ctx, "account locked").await;
+            return Err(DataChainError::TooManyAttempts {
+                retry_after_secs: (locked_until - now).max(1) as u64,
+            });
+        }
+
         let (ip_count, window_start) = self
             .storage
             .incr_login_counter(&ip_key, now, limits.window_secs)
@@ -320,16 +341,36 @@ impl AuthService {
             .storage
             .incr_login_counter(&user_key, now, limits.window_secs)
             .await?;
-        if ip_count > limits.ip_max_attempts || user_count > limits.user_max_attempts {
-            let retry_after_secs = (window_start + limits.window_secs - now).max(1) as u64;
-            self.audit(
-                AuditEvent::new("login_locked", "denied")
-                    .username(&req.username)
-                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
-                    .reason("rate limit exceeded"),
-            )
-            .await;
-            return Err(DataChainError::TooManyAttempts { retry_after_secs });
+        let ip_exceeded = ip_count > limits.ip_max_attempts;
+        let user_exceeded = user_count > limits.user_max_attempts;
+        if ip_exceeded || user_exceeded {
+            // 同时超限取较大的 Retry-After;用户名维度落指数退避锁,IP 维度仍是固定窗口。
+            let mut retry_after = 0i64;
+            if user_exceeded {
+                let locked_until = self
+                    .storage
+                    .lock_login_key(
+                        &user_key,
+                        now,
+                        self.lockout.base_secs,
+                        self.lockout.max_secs,
+                        self.lockout.reset_secs,
+                    )
+                    .await?;
+                retry_after = retry_after.max(locked_until - now);
+            }
+            if ip_exceeded {
+                retry_after = retry_after.max(window_start + limits.window_secs - now);
+            }
+            let reason = if user_exceeded {
+                "account locked"
+            } else {
+                "rate limit exceeded"
+            };
+            self.audit_login_locked(req, ctx, reason).await;
+            return Err(DataChainError::TooManyAttempts {
+                retry_after_secs: retry_after.max(1) as u64,
+            });
         }
 
         // 取用户;不存在时也对固定 dummy hash 做一次同 cost 的 bcrypt,抹平耗时差异。
