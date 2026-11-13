@@ -636,7 +636,8 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mining_keeps_an_aligned_mapping_for_mixed_key_transactions_and_rolls_back_together() {
+    fn sidecar_mining_keeps_an_aligned_mapping_for_mixed_key_transactions_and_rolls_back_together()
+    {
         let chain = Chain::new(1, 100);
         chain.init();
         let entry = pending_identity_entry();
@@ -647,7 +648,10 @@ mod tests {
         chain.add_key_transaction(legacy_entry.clone());
         assert!(chain.add_pending_key_transaction("tx-a".to_string(), entry.clone()));
         let mined = chain.mine_block_with_identity_transaction_ids().unwrap();
-        assert_eq!(mined.identity_transaction_ids, vec![None, Some("tx-a".to_string())]);
+        assert_eq!(
+            mined.identity_transaction_ids,
+            vec![None, Some("tx-a".to_string())]
+        );
         assert_eq!(mined.block.key_transactions, vec![legacy_entry, entry]);
 
         assert!(chain.rollback_mined_block_with_identity_transaction_ids(&mined));
@@ -663,7 +667,8 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_rollback_rejects_misaligned_sidecars_without_changing_chain_or_pending_transactions() {
+    fn sidecar_rollback_rejects_misaligned_sidecars_without_changing_chain_or_pending_transactions()
+    {
         let chain = Chain::new(1, 100);
         chain.init();
         let entry = pending_identity_entry();

@@ -374,7 +374,10 @@ mod tests {
         let storage = create_storage(dsn).await.unwrap();
         chain.load_blocks(vec![genesis, committed_block]);
         let result = recover_pending_identity_transactions(&chain, &storage).await;
-        assert!(result.is_err(), "无法验证的旧 pending 必须在启动时 fail-closed");
+        assert!(
+            result.is_err(),
+            "无法验证的旧 pending 必须在启动时 fail-closed"
+        );
         assert_eq!(chain.get_pending_key_tx_count(), 0);
     }
 

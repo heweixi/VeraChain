@@ -100,7 +100,7 @@ pub struct SignedAttestation {
 }
 
 /// 密钥管理交易 (Requirement 9.1)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyTransactionEntry {
     #[serde(rename = "type")]
     pub tx_type: String,
