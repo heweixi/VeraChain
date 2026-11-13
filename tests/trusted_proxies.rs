@@ -5,9 +5,9 @@ mod common;
 
 use std::net::{IpAddr, SocketAddr};
 
+use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
-use axum::body::Body;
 use common::*;
 use datachain::api::{self, AppState, RateLimiter};
 use datachain::auth::Role;
@@ -62,13 +62,20 @@ fn walks_right_to_left_and_stops_at_first_untrusted() {
         Some(ip("10.0.0.1")),
         &xff(&["1.1.1.1, 203.0.113.5, 10.0.0.2"]),
     );
-    assert_eq!(got, Some(ip("203.0.113.5")), "左侧 1.1.1.1 是可伪造部分,不应被取用");
+    assert_eq!(
+        got,
+        Some(ip("203.0.113.5")),
+        "左侧 1.1.1.1 是可伪造部分,不应被取用"
+    );
 }
 
 #[test]
 fn all_trusted_returns_leftmost() {
     let tp = proxies(&["10.0.0.0/8"]);
-    let got = tp.resolve_client_ip(Some(ip("10.0.0.1")), &xff(&["10.0.0.7, 10.0.0.3, 10.0.0.2"]));
+    let got = tp.resolve_client_ip(
+        Some(ip("10.0.0.1")),
+        &xff(&["10.0.0.7, 10.0.0.3, 10.0.0.2"]),
+    );
     assert_eq!(got, Some(ip("10.0.0.7")));
 }
 
@@ -163,7 +170,10 @@ fn trusted_peer_without_xff_returns_peer() {
 fn missing_peer_returns_none() {
     let tp = proxies(&["10.0.0.0/8"]);
     assert_eq!(tp.resolve_client_ip(None, &xff(&["203.0.113.5"])), None);
-    assert_eq!(proxies(&[]).resolve_client_ip(None, &HeaderMap::new()), None);
+    assert_eq!(
+        proxies(&[]).resolve_client_ip(None, &HeaderMap::new()),
+        None
+    );
 }
 
 #[test]
@@ -189,9 +199,8 @@ async fn fixture_with_trusted(items: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("dc.db");
     let (mut state, _) = build_state(dsn.to_str().unwrap()).await;
-    state.rate_limiter = std::sync::Arc::new(
-        RateLimiter::default().with_trusted_proxies(proxies(items)),
-    );
+    state.rate_limiter =
+        std::sync::Arc::new(RateLimiter::default().with_trusted_proxies(proxies(items)));
     seed_user(&state, "alice", "alicepass123", Role::User).await;
     let router = api::create_router(state.clone());
     Fixture {
@@ -211,11 +220,7 @@ fn with_peer_and_xff(mut req: Request<Body>, peer: &str, xff_value: Option<&str>
     req
 }
 
-async fn refresh_status(
-    router: &axum::Router,
-    peer: &str,
-    xff_value: Option<&str>,
-) -> StatusCode {
+async fn refresh_status(router: &axum::Router, peer: &str, xff_value: Option<&str>) -> StatusCode {
     let req = with_peer_and_xff(
         post(
             "/api/v1/auth/refresh",
@@ -294,7 +299,12 @@ async fn clients_behind_same_trusted_proxy_get_independent_buckets() {
     let f = fixture_with_trusted(&["10.0.0.0/8"]).await;
     for i in 0..20 {
         let status = refresh_status(&f.router, TRUSTED_PROXY_PEER, Some("203.0.113.5")).await;
-        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "A 第 {} 次不应限流", i + 1);
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "A 第 {} 次不应限流",
+            i + 1
+        );
     }
     // 同一客户端第 21 次被限流。
     let status = refresh_status(&f.router, TRUSTED_PROXY_PEER, Some("203.0.113.5")).await;
@@ -311,8 +321,17 @@ async fn untrusted_peer_cannot_bypass_rate_limit_by_forging_xff() {
     for i in 0..20 {
         let forged = format!("203.0.113.{}", i);
         let status = refresh_status(&f.router, peer, Some(&forged)).await;
-        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "第 {} 次不应限流", i + 1);
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "第 {} 次不应限流",
+            i + 1
+        );
     }
     let status = refresh_status(&f.router, peer, Some("203.0.113.200")).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "换 XFF 仍应落入同一对端桶");
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "换 XFF 仍应落入同一对端桶"
+    );
 }
