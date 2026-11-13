@@ -1200,7 +1200,10 @@ impl Storage {
     }
 
     /// 严格扫描 `login_rate_counters` 全表(限速计数器同为安全状态,损坏必须 fail-closed)。
-    /// key 为计数器 `key` 列(无法解码时退化为 `rowid=<n>`);reason 同 [`Storage::scan_sessions`]。
+    /// 错误 key 固定为 `rowid=<n>`(rowid 不可得时退化为 `corruption_key(None)`)。
+    /// 不使用 `key` 列:其值为 `user:<规范化用户名>`/`ip:<hash>`,用户名由攻击者可控,
+    /// 且主键为 `(key, window_start)`、key 不唯一,回显会泄露用户名并污染日志。
+    /// reason 同 [`Storage::scan_sessions`]。
     pub async fn scan_login_rate_counters(&self) -> Result<usize> {
         use sqlx::Row;
         let rows = sqlx::query(
@@ -1210,7 +1213,7 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         for row in &rows {
-            let key = Self::scan_row_key(row, "key");
+            let key = Self::scan_rowid_key(row);
             let invalid = |column: &str| DataChainError::DataCorruption {
                 category: CorruptionCategory::Authoritative,
                 table: "login_rate_counters",
@@ -1275,10 +1278,16 @@ impl Storage {
         use sqlx::Row;
         match row.try_get::<String, _>(key_column) {
             Ok(key) => key,
-            Err(_) => match row.try_get::<i64, _>("rowid") {
-                Ok(rowid) => format!("rowid={}", rowid),
-                Err(_) => corruption_key(None),
-            },
+            Err(_) => Self::scan_rowid_key(row),
+        }
+    }
+
+    /// 仅用 `rowid=<n>` 作为扫描报错 key(用于主键含用户可控内容的表);rowid 不可得时退化为 `corruption_key(None)`。
+    fn scan_rowid_key(row: &sqlx::sqlite::SqliteRow) -> String {
+        use sqlx::Row;
+        match row.try_get::<i64, _>("rowid") {
+            Ok(rowid) => format!("rowid={}", rowid),
+            Err(_) => corruption_key(None),
         }
     }
 
@@ -1755,7 +1764,11 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
-    /// 替换登录限速使用的时间源(默认系统时间)。主要供测试固定时间、复现窗口边界。
+    /// 替换登录限速使用的时间源(默认系统时间)。
+    ///
+    /// 仅供测试注入时钟;目前只影响登录限速计数(`now_secs`),
+    /// 会话过期等其他路径仍使用系统时间。
+    #[doc(hidden)]
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         *self.clock.write() = clock;
     }

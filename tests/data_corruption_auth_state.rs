@@ -132,10 +132,11 @@ async fn corrupt_login_rate_counter_row_fails_startup_scan_closed() {
         .expect_err("login_rate_counters 损坏必须 fail-closed");
     let key = expect_corruption(err, "login_rate_counters");
     assert!(
-        key.starts_with("ip:") || key.starts_with("user:"),
-        "key 应为计数器主键 key 列,实际 {}",
+        key.starts_with("rowid="),
+        "key 应为 rowid=<n>,实际 {}",
         key
     );
+    assert!(!key.contains("scanuser"), "key 不得包含用户名,实际 {}", key);
     assert!(!key.contains("TAMPERED-VALUE"));
 }
 

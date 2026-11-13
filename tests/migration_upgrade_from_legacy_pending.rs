@@ -162,6 +162,8 @@ async fn legacy_pending_db_upgrade_fails_cleanly_and_manual_repair_drill_is_docu
     let pool = connect(dsn).await;
     assert_eq!(count(&pool, "blocks").await, 1);
     assert_eq!(count(&pool, "identity_transactions").await, 1);
+    // 注意:该值依赖迁移 011 因 `duplicate column name` 失败而回滚;
+    // 若将来把 011 改为幂等(如先检查列是否存在),此断言需随之更新。
     assert_eq!(max_version(&pool).await, 10);
     pool.close().await;
 }
