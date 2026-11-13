@@ -47,3 +47,8 @@ pub async fn corrupt_version_timestamp(pool: &Pool<Sqlite>, version_id: &str) {
         .await
         .unwrap();
 }
+
+/// 在独立连接上执行任意破坏性 SQL(DROP TABLE / 写入类型不符的值等)。
+pub async fn execute_sql(pool: &Pool<Sqlite>, sql: &str) {
+    sqlx::query(sql).execute(pool).await.unwrap();
+}
