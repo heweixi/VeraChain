@@ -1,7 +1,7 @@
 use axum::{
     http::{header, HeaderValue, Method},
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -23,7 +23,7 @@ pub fn create_router(state: AppState) -> Router {
         .collect();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     // 公开路由（无需认证）
@@ -49,6 +49,13 @@ pub fn create_router(state: AppState) -> Router {
     let protected_routes = Router::new()
         // 用户
         .route("/api/v1/auth/profile", get(handlers::get_profile))
+        .route("/api/v1/auth/logout", post(handlers::logout))
+        .route("/api/v1/auth/logout-all", post(handlers::logout_all))
+        .route("/api/v1/auth/sessions", get(handlers::list_sessions))
+        .route(
+            "/api/v1/auth/sessions/:id",
+            delete(handlers::delete_session),
+        )
         // 元数据
         .route("/api/v1/metadata", post(handlers::create_metadata))
         .route("/api/v1/metadata", get(handlers::query_metadata))

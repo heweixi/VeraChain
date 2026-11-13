@@ -19,7 +19,6 @@ struct Fixture {
     token: String,
     sid: String,
     user_id: String,
-    refresh_token: String,
     _dir: tempfile::TempDir,
 }
 
@@ -42,7 +41,6 @@ async fn fixture() -> Fixture {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     let token = body["data"]["token"].as_str().unwrap().to_string();
-    let refresh_token = body["data"]["refresh_token"].as_str().unwrap().to_string();
     let sid = state
         .auth_service
         .validate_token(&token)
@@ -55,7 +53,6 @@ async fn fixture() -> Fixture {
         token,
         sid,
         user_id,
-        refresh_token,
         _dir: dir,
     }
 }
@@ -124,6 +121,7 @@ async fn token_for_expired_session_is_rejected() {
             revoked_at: None,
             revoke_reason: None,
             ip_hash: None,
+            ip_hint: None,
             user_agent: None,
         })
         .await
@@ -150,6 +148,7 @@ async fn token_whose_sid_belongs_to_another_user_is_rejected() {
             revoked_at: None,
             revoke_reason: None,
             ip_hash: None,
+            ip_hint: None,
             user_agent: None,
         })
         .await
@@ -186,22 +185,8 @@ async fn disabling_user_in_sqlite_takes_effect_immediately_and_reenable_restores
 #[tokio::test]
 async fn legacy_token_without_sid_only_checks_user_active() {
     let f = fixture().await;
-    // refresh 签发的 access 暂不带 sid,属于"无 sid 旧 token"。
-    let resp = f
-        .router
-        .clone()
-        .oneshot(post(
-            "/api/v1/auth/refresh",
-            None,
-            serde_json::json!({"refresh_token": f.refresh_token}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let legacy = body_json(resp).await["data"]["token"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // 无 sid 的存量 access token(refresh 自 S6 起会带 sid,故手工签发)。
+    let legacy = f.mint(Role::User, None);
     assert!(f
         .state
         .auth_service
@@ -209,7 +194,6 @@ async fn legacy_token_without_sid_only_checks_user_active() {
         .unwrap()
         .sid
         .is_none());
-
     assert_eq!(f.profile_status(&legacy).await, StatusCode::OK);
     f.state
         .storage

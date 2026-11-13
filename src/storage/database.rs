@@ -25,11 +25,13 @@ pub struct SessionRecord {
     pub revoke_reason: Option<String>,
     /// 客户端 IP 的 HMAC 摘要(十六进制),不存明文 IP。
     pub ip_hash: Option<String>,
+    /// 脱敏 IP 提示(如 `203.0.x.x`),仅用于会话列表展示。
+    pub ip_hint: Option<String>,
     pub user_agent: Option<String>,
 }
 
 const SESSION_COLUMNS: &str = "id, user_id, refresh_family, created_at, last_seen_at, \
-     expires_at, revoked_at, revoke_reason, ip_hash, user_agent";
+     expires_at, revoked_at, revoke_reason, ip_hash, ip_hint, user_agent";
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
@@ -42,6 +44,7 @@ struct SessionRow {
     revoked_at: Option<i64>,
     revoke_reason: Option<String>,
     ip_hash: Option<String>,
+    ip_hint: Option<String>,
     user_agent: Option<String>,
 }
 
@@ -57,6 +60,7 @@ impl From<SessionRow> for SessionRecord {
             revoked_at: r.revoked_at,
             revoke_reason: r.revoke_reason,
             ip_hash: r.ip_hash,
+            ip_hint: r.ip_hint,
             user_agent: r.user_agent,
         }
     }
@@ -137,6 +141,7 @@ impl Storage {
                 8,
                 include_str!("../../migrations/008_login_rate_counters_and_audit.sql"),
             ),
+            (9, include_str!("../../migrations/009_session_ip_hint.sql")),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -879,8 +884,8 @@ impl Storage {
             r#"
             INSERT INTO sessions
                 (id, user_id, refresh_family, created_at, last_seen_at, expires_at,
-                 revoked_at, revoke_reason, ip_hash, user_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 revoked_at, revoke_reason, ip_hash, ip_hint, user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&session.id)
@@ -892,6 +897,7 @@ impl Storage {
         .bind(session.revoked_at)
         .bind(&session.revoke_reason)
         .bind(&session.ip_hash)
+        .bind(&session.ip_hint)
         .bind(&session.user_agent)
         .execute(&self.pool)
         .await?;
@@ -979,6 +985,111 @@ impl Storage {
         .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// 按 refresh family 读取会话(含已撤销/已过期)。family 与会话一一对应。
+    pub async fn get_session_by_family(&self, family_id: &str) -> Result<Option<SessionRecord>> {
+        let row = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions WHERE refresh_family = ?",
+            SESSION_COLUMNS
+        ))
+        .bind(family_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SessionRecord::from))
+    }
+
+    /// refresh 成功后更新会话的 `last_seen_at` 并顺延 `expires_at`。
+    ///
+    /// 仅作用于未撤销的会话;返回 `false` 表示会话已被撤销或不存在(与并发登出收口)。
+    pub async fn touch_session(&self, id: &str, now: i64, new_expires_at: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sessions SET last_seen_at = ?, expires_at = MAX(expires_at, ?) \
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(new_expires_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 撤销某用户全部未撤销会话,并在同一事务内写入各 family 的哨兵行。
+    /// 返回本次被撤销的会话 id(幂等:已撤销的不重复返回)。
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Vec<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let ids = Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    /// 事务内撤销用户全部会话。首条语句即为写操作(`UPDATE .. RETURNING`),
+    /// 避免"先读后写"在多连接下的读锁升级冲突。
+    async fn revoke_user_sessions_in_tx(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+        now: i64,
+    ) -> Result<Vec<String>> {
+        let revoked: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE sessions SET revoked_at = ?, revoke_reason = ? \
+             WHERE user_id = ? AND revoked_at IS NULL \
+             RETURNING id, refresh_family",
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (_, family_id) in &revoked {
+            sqlx::query(
+                r#"
+                INSERT INTO revoked_refresh_tokens
+                    (jti, user_id, family_id, reason, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(jti) DO UPDATE SET
+                    expires_at = excluded.expires_at,
+                    reason = excluded.reason,
+                    revoked_at = excluded.revoked_at
+                "#,
+            )
+            .bind(Self::family_sentinel_jti(family_id))
+            .bind(user_id)
+            .bind(family_id)
+            .bind(reason)
+            .bind(now + ttl_secs + 24 * 3600)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(revoked.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// 惰性清理:删除某用户已过期的会话行(走 `idx_sessions_user`),返回删除行数。
+    pub async fn purge_expired_sessions_for_user(&self, user_id: &str, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM sessions WHERE user_id = ? AND expires_at < ?")
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 清理全部已过期的会话行(服务启动时调用),返回删除行数。
+    pub async fn purge_expired_sessions(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// 设置 is_active 缓存 TTL(默认 5 秒;`Duration::ZERO` 表示禁用缓存)。

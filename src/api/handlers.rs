@@ -156,6 +156,75 @@ pub async fn get_profile(
     }
 }
 
+/// 内部错误统一响应:不向客户端泄露存储细节。
+fn internal_error(context: &str, e: crate::error::DataChainError) -> axum::response::Response {
+    tracing::error!("{}: {}", context, e);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiResponse::error("internal error")),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/auth/logout`:撤销当前会话(幂等),204。
+pub async fn logout(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> axum::response::Response {
+    match state.auth_service.logout(&claims).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error("登出失败", e),
+    }
+}
+
+/// `POST /api/v1/auth/logout-all`:撤销该用户全部会话(幂等),204。
+pub async fn logout_all(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> axum::response::Response {
+    match state.auth_service.logout_all(&claims.sub).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error("全部登出失败", e),
+    }
+}
+
+/// `GET /api/v1/auth/sessions`:列出当前用户的有效会话。
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> axum::response::Response {
+    match state
+        .auth_service
+        .list_sessions(&claims.sub, claims.sid.as_deref())
+        .await
+    {
+        Ok(sessions) => Json(ApiResponse::success(sessions)).into_response(),
+        Err(e) => internal_error("查询会话失败", e),
+    }
+}
+
+/// `DELETE /api/v1/auth/sessions/:id`:撤销本人名下的指定会话。
+/// 非本人、不存在或已失效统一 404,避免枚举他人会话。
+pub async fn delete_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    match state
+        .auth_service
+        .revoke_user_session(&claims.sub, &session_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("session not found")),
+        )
+            .into_response(),
+        Err(e) => internal_error("撤销会话失败", e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RefreshTokenRequest {
     pub refresh_token: String,

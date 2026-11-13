@@ -22,6 +22,7 @@ fn session(id: &str, user_id: &str, family: &str, expires_at: i64) -> SessionRec
         revoked_at: None,
         revoke_reason: None,
         ip_hash: Some("abcd".to_string()),
+        ip_hint: None,
         user_agent: Some("test-agent".to_string()),
     }
 }
