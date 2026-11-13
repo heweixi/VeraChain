@@ -15,6 +15,9 @@ pub struct Claims {
     pub iat: i64,    // 签发时间
     pub iss: String, // 签发者
     pub aud: String, // 受众
+    /// 会话标识(sessions.id)。#[serde(default)] 软兼容无该字段的存量 access token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 impl Claims {
@@ -70,12 +73,13 @@ impl JwtHandler {
         validation
     }
 
-    /// 生成访问令牌
+    /// 生成访问令牌。`sid` 为会话标识,旧调用方(无会话)传 `None`。
     pub fn generate_access_token(
         &self,
         user_id: &str,
         username: &str,
         role: Role,
+        sid: Option<&str>,
     ) -> Result<String> {
         let now = Utc::now();
         let exp = now + Duration::hours(self.access_expire_hours as i64);
@@ -88,6 +92,7 @@ impl JwtHandler {
             iat: now.timestamp(),
             iss: "datachain".to_string(),
             aud: "datachain-api".to_string(),
+            sid: sid.map(str::to_string),
         };
 
         encode(
@@ -157,15 +162,16 @@ impl JwtHandler {
         Ok(token_data.claims)
     }
 
-    /// 生成令牌对。family_id 由调用方指定（登录新建 / 轮换沿用）。
+    /// 生成令牌对。family_id 由调用方指定（登录新建 / 轮换沿用）；sid 为会话标识。
     pub fn generate_token_pair(
         &self,
         user_id: &str,
         username: &str,
         role: Role,
         family_id: &str,
+        sid: Option<&str>,
     ) -> Result<TokenPair> {
-        let access_token = self.generate_access_token(user_id, username, role)?;
+        let access_token = self.generate_access_token(user_id, username, role, sid)?;
         let refresh_token = self.generate_refresh_token(user_id, family_id)?;
         let expires_at = Utc::now() + Duration::hours(self.access_expire_hours as i64);
 
@@ -196,12 +202,23 @@ mod tests {
         let handler = JwtHandler::new("test-secret".to_string(), 24);
 
         let token = handler
-            .generate_access_token("user-123", "testuser", Role::User)
+            .generate_access_token("user-123", "testuser", Role::User, None)
             .unwrap();
         assert!(!token.is_empty());
 
         let claims = handler.verify_access_token(&token).unwrap();
         assert_eq!(claims.sub, "user-123");
         assert_eq!(claims.username, "testuser");
+        assert!(claims.sid.is_none());
+    }
+
+    #[test]
+    fn test_access_token_carries_sid() {
+        let handler = JwtHandler::new("test-secret".to_string(), 24);
+        let token = handler
+            .generate_access_token("user-123", "testuser", Role::User, Some("sid-1"))
+            .unwrap();
+        let claims = handler.verify_access_token(&token).unwrap();
+        assert_eq!(claims.sid.as_deref(), Some("sid-1"));
     }
 }

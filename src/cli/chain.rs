@@ -1,8 +1,10 @@
 use clap::Subcommand;
 
+use crate::cli::common::load_verified_chain;
 use crate::cli::server::recover_pending_identity_transactions;
 use crate::config::AppConfig;
 use crate::core::create_chain;
+use crate::error::DataChainError;
 use crate::storage::create_storage;
 
 #[derive(Subcommand)]
@@ -29,18 +31,44 @@ pub enum ChainAction {
     },
 }
 
-/// 运行链命令
+/// 运行链命令。`chain validate` 之外的命令若遇数据损坏,`load_verified_chain`
+/// 直接返回 Err(DataCorruption),经 main.rs 的 exit_code_for 映射为退出码 3。
 pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Result<()> {
     let storage = create_storage(&config.database.dsn).await?;
     let chain = create_chain(config.blockchain.difficulty, config.blockchain.block_size);
 
-    // 加载区块
-    let blocks = storage.get_all_blocks().await?;
-    if !blocks.is_empty() {
-        if matches!(&action, ChainAction::Mine) {
-            chain.validate_loaded_blocks(&blocks)?;
+    // ChainAction::Validate 是本命令唯一允许在"链本身无效"时仍打印结果并以退出码 2
+    // 结束的分支(用户可见、非数据损坏);其余分支复用严格的 load_verified_chain,
+    // 链无效或数据损坏都直接 fail-closed。
+    if let ChainAction::Validate = action {
+        let blocks = storage.get_all_blocks().await?;
+        let valid = chain.validate_loaded_blocks(&blocks).is_ok() && !blocks.is_empty();
+        if valid {
+            println!("✓ 链验证通过");
+            return Ok(());
+        } else {
+            println!("✗ 链验证失败");
+            // 退出码 2:链无效,不是数据损坏(get_all_blocks 已成功读取,只是规则不通过)。
+            return Err(DataChainError::InvalidChain.into());
         }
-        chain.load_blocks(blocks);
+    }
+
+    load_verified_chain(&storage, &chain).await?;
+
+    // Mine 需要内存链里有待打包元数据才能出块;CLI 各命令各自独立进程/连接,
+    // 这里按与 server 启动一致的"去重"语义加载一次(已打包的不会重复加入)。
+    if let ChainAction::Mine = action {
+        let committed_data_ids: std::collections::HashSet<String> = chain
+            .get_all_blocks()
+            .iter()
+            .flat_map(|b| b.metadata_list.iter().map(|e| e.data_id.clone()))
+            .collect();
+        let pending = storage.get_pending_metadata().await?;
+        let pending_to_load: Vec<_> = pending
+            .into_iter()
+            .filter(|e| !committed_data_ids.contains(&e.data_id))
+            .collect();
+        chain.load_pending(pending_to_load);
     }
     if matches!(&action, ChainAction::Mine) {
         recover_pending_identity_transactions(&chain, &storage).await?;
@@ -64,16 +92,12 @@ pub async fn run_chain(config: &AppConfig, action: ChainAction) -> anyhow::Resul
                 println!("  时间: {}", latest.timestamp);
             }
         }
-        ChainAction::Validate => {
-            let valid = chain.validate_chain();
-            if valid {
-                println!("✓ 链验证通过");
-            } else {
-                println!("✗ 链验证失败");
-            }
-        }
+        ChainAction::Validate => unreachable!("handled above"),
         ChainAction::Mine => match chain.mine_block_with_identity_transaction_ids() {
             Ok(mined) => {
+                // Mine 与挖矿后的 CLI 导入统一走 commit_block,同事务补投影
+                // (metadata/catalog_*)并把身份交易账本行转为 committed;
+                // 提交失败时把区块与 sidecar 一并回滚回待打包队列。
                 if let Err(error) = storage
                     .commit_block(&mined.block, &mined.identity_transaction_ids)
                     .await

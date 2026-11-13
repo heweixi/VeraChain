@@ -105,12 +105,23 @@ impl Default for ChainIdentityConfig {
 ///
 /// 默认 trusted_issuers 为空：原始 Claim 历史可查询，但不会被 resolver 视为可信有效结论。
 /// 生产部署必须显式列出可信认证者，避免任意已登记公钥的风险/质量声明自动获得信任。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimPolicyConfig {
     #[serde(default = "default_min_claim_weight")]
     pub min_weight: u32,
     #[serde(default)]
     pub trusted_issuers: Vec<TrustedIssuerConfig>,
+}
+impl Default for ClaimPolicyConfig {
+    fn default() -> Self {
+        Self {
+            // 与 serde 的 `default_min_claim_weight` 保持一致：derive(Default) 会把
+            // u32 字段填成 0，绕过 serde 的字段默认值，导致无配置文件部署时
+            // `AppConfig::validate` 必然因 min_weight == 0 报错。
+            min_weight: default_min_claim_weight(),
+            trusted_issuers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

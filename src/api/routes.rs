@@ -1,7 +1,7 @@
 use axum::{
     http::{header, HeaderName, HeaderValue, Method},
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -23,7 +23,7 @@ pub fn create_router(state: AppState) -> Router {
         .collect();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -53,6 +53,13 @@ pub fn create_router(state: AppState) -> Router {
     let protected_routes = Router::new()
         // 用户
         .route("/api/v1/auth/profile", get(handlers::get_profile))
+        .route("/api/v1/auth/logout", post(handlers::logout))
+        .route("/api/v1/auth/logout-all", post(handlers::logout_all))
+        .route("/api/v1/auth/sessions", get(handlers::list_sessions))
+        .route(
+            "/api/v1/auth/sessions/:id",
+            delete(handlers::delete_session),
+        )
         // 元数据
         .route("/api/v1/metadata", post(handlers::create_metadata))
         .route("/api/v1/metadata", get(handlers::query_metadata))
@@ -167,6 +174,14 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 把 Router 转成携带对端地址(ConnectInfo)的 make-service。
+/// TLS 与非 TLS 两条 serve 路径都必须经此转换,否则 handler/限流拿不到真实对端 IP。
+pub fn make_service(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 /// 运行服务器
 pub async fn run_server(
     state: AppState,
@@ -181,12 +196,12 @@ pub async fn run_server(
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
         tracing::info!("服务器启动于 HTTPS://{}", addr);
         axum_server::bind_rustls(socket_addr, tls_config)
-            .serve(app.into_make_service())
+            .serve(make_service(app))
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(socket_addr).await?;
         tracing::info!("服务器启动于 HTTP://{}", addr);
-        axum::serve(listener, app).await?;
+        axum::serve(listener, make_service(app)).await?;
     }
 
     Ok(())

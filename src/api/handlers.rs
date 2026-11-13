@@ -1,16 +1,17 @@
 use axum::{
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
 
 use super::{AppState, Event, EventType};
 use crate::aggregation::StrategyType;
-use crate::auth::{Claims, LoginRequest, RegisterRequest};
+use crate::auth::{Claims, LoginContext, LoginRequest, RegisterRequest};
 use crate::core::{metadata_leaf_hash, MerkleTree};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
 use crate::p2p::{PeerRegistration, SyncBlocksRequest, SyncBlocksResponse, SyncQuery};
@@ -104,16 +105,49 @@ pub async fn register(
     }
 }
 
+/// 提取请求的客户端上下文(会话与审计用)。仅使用对端地址;不信任 X-Forwarded-For。
+fn client_context(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> LoginContext {
+    LoginContext {
+        client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
+    }
+}
+
 pub async fn login(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.auth_service.login(&req) {
-        Ok(resp) => Ok((StatusCode::OK, Json(ApiResponse::success(resp)))),
-        Err(e) => Err((
+) -> axum::response::Response {
+    let ctx = client_context(connect_info, &headers);
+    match state.auth_service.login(&req, &ctx).await {
+        Ok(resp) => (StatusCode::OK, Json(ApiResponse::success(resp))).into_response(),
+        Err(crate::error::DataChainError::TooManyAttempts { retry_after_secs }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(ApiResponse::error("too many attempts")),
+        )
+            .into_response(),
+        Err(crate::error::DataChainError::InvalidCredentials) => (
             StatusCode::UNAUTHORIZED,
-            Json(ApiResponse::error(e.to_string())),
-        )),
+            Json(ApiResponse::error("invalid credentials")),
+        )
+            .into_response(),
+        Err(e) => {
+            // 数据损坏(DataCorruption)与存储等内部故障一律 500,
+            // 不伪装成凭证错误,也不向客户端泄露细节(详情仅写日志)。
+            tracing::error!("登录失败(内部错误): {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("internal error")),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -127,6 +161,84 @@ pub async fn get_profile(
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error(e.to_string())),
         )),
+    }
+}
+
+/// 内部错误统一响应:不向客户端泄露存储细节。
+fn internal_error(context: &str, e: crate::error::DataChainError) -> axum::response::Response {
+    tracing::error!("{}: {}", context, e);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiResponse::error("internal error")),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/auth/logout`:撤销当前会话(幂等),204。
+pub async fn logout(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let ctx = client_context(connect_info, &headers);
+    match state.auth_service.logout(&claims, &ctx).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error("登出失败", e),
+    }
+}
+
+/// `POST /api/v1/auth/logout-all`:撤销该用户全部会话(幂等),204。
+pub async fn logout_all(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let ctx = client_context(connect_info, &headers);
+    match state.auth_service.logout_all(&claims.sub, &ctx).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal_error("全部登出失败", e),
+    }
+}
+
+/// `GET /api/v1/auth/sessions`:列出当前用户的有效会话。
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> axum::response::Response {
+    match state
+        .auth_service
+        .list_sessions(&claims.sub, claims.sid.as_deref())
+        .await
+    {
+        Ok(sessions) => Json(ApiResponse::success(sessions)).into_response(),
+        Err(e) => internal_error("查询会话失败", e),
+    }
+}
+
+/// `DELETE /api/v1/auth/sessions/:id`:撤销本人名下的指定会话。
+/// 非本人、不存在或已失效统一 404,避免枚举他人会话。
+pub async fn delete_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id): Path<String>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let ctx = client_context(connect_info, &headers);
+    match state
+        .auth_service
+        .revoke_user_session(&claims.sub, &session_id, &ctx)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("session not found")),
+        )
+            .into_response(),
+        Err(e) => internal_error("撤销会话失败", e),
     }
 }
 
@@ -144,14 +256,22 @@ pub async fn refresh_token(
         Err(e) => {
             // 区分 HTTP 语义：令牌无效/过期/复用等客户端凭证问题 => 401；
             // 底层数据库/存储故障 => 500，避免把服务端故障伪装成鉴权失败而掩盖问题。
-            let status = match e {
+            // 数据损坏(DataCorruption)同属服务端故障 => 500,且不向客户端泄露细节(仅写日志)。
+            match e {
                 crate::error::DataChainError::DatabaseError(_)
-                | crate::error::DataChainError::StorageError(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
+                | crate::error::DataChainError::StorageError(_)
+                | crate::error::DataChainError::DataCorruption { .. } => {
+                    tracing::error!("刷新令牌失败(内部错误): {}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::error("internal error")),
+                    ))
                 }
-                _ => StatusCode::UNAUTHORIZED,
-            };
-            Err((status, Json(ApiResponse::error(e.to_string()))))
+                _ => Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiResponse::error(e.to_string())),
+                )),
+            }
         }
     }
 }
@@ -340,14 +460,59 @@ pub async fn mine_block(
 }
 
 #[derive(Serialize)]
+pub struct CorruptionInfo {
+    pub category: &'static str,
+    pub table: &'static str,
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
 pub struct ValidateResponse {
     pub valid: bool,
     pub block_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corruption: Option<CorruptionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_block: Option<i64>,
 }
 
+/// `{valid,block_count}` 字段语义不变(来自内存 Chain);新增只读扫描存储权威源,
+/// 检测是否存在数据损坏,仅在非空时附加 corruption/invalid_block。
+/// 状态码始终 200,不因损坏或链无效而改变(与此前行为兼容)。
 pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<ValidateResponse>> {
     let valid = state.chain.validate_chain();
     let block_count = state.chain.get_block_count();
+
+    let mut corruption = None;
+    let mut invalid_block = None;
+
+    match state.storage.get_all_blocks().await {
+        Err(crate::error::DataChainError::DataCorruption {
+            category,
+            table,
+            key,
+            reason,
+        }) => {
+            corruption = Some(CorruptionInfo {
+                category: match category {
+                    crate::error::CorruptionCategory::Authoritative => "authoritative",
+                    crate::error::CorruptionCategory::Rebuildable => "rebuildable",
+                },
+                table,
+                key,
+                reason,
+            });
+        }
+        Err(_) => {}
+        Ok(_) => {
+            if !valid {
+                invalid_block = crate::core::Chain::find_first_invalid_block_index(
+                    &state.chain.get_all_blocks(),
+                );
+            }
+        }
+    }
 
     state.event_bus.publish(Event::new(
         EventType::ChainValidated,
@@ -356,6 +521,8 @@ pub async fn validate_chain(State(state): State<AppState>) -> Json<ApiResponse<V
     Json(ApiResponse::success(ValidateResponse {
         valid,
         block_count,
+        corruption,
+        invalid_block,
     }))
 }
 

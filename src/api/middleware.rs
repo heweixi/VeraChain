@@ -84,7 +84,7 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
     None
 }
 
-/// 认证中间件:校验 JWT、账户状态、token 角色新鲜度和路由权限。
+/// 认证中间件:校验 JWT、会话、账户状态、token 角色新鲜度和路由权限。
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -100,19 +100,15 @@ pub async fn auth_middleware(
         _ => return Err(StatusCode::UNAUTHORIZED),
     };
 
+    // 统一校验:JWT → 会话 → 用户状态 → 角色一致;任一步失败(含查库失败)均 401。
     let claims = state
         .auth_service
-        .validate_token(token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    // token 必须对应当前存在且启用的用户,并且角色不能已被修改。
-    let user = state
-        .auth_service
-        .get_user_by_id(&claims.sub)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    if !user.is_active || user.role.to_string() != claims.role {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+        .authenticate_access_token(token)
+        .await
+        .map_err(|e| {
+            tracing::debug!("access token rejected: {}", e);
+            StatusCode::UNAUTHORIZED
+        })?;
 
     if let Some(permission) = required_permission(request.method(), request.uri().path()) {
         let role = claims
@@ -147,7 +143,8 @@ pub async fn optional_auth_middleware(
     {
         if auth_header.starts_with("Bearer ") {
             let token = &auth_header[7..];
-            if let Ok(claims) = state.auth_service.validate_token(token) {
+            // 与强制认证共用同一校验;失败(含已撤销会话)视为匿名,不返回 401。
+            if let Ok(claims) = state.auth_service.authenticate_access_token(token).await {
                 request.extensions_mut().insert(claims);
             }
         }

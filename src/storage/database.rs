@@ -1,17 +1,187 @@
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::aggregation::AggregationSummary;
 use crate::auth::User;
 use crate::catalog::{CatalogPayload, CatalogRecord};
 use crate::core::{Block, KeyTransactionEntry, MetadataEntry};
 use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedChainAnchor};
-use crate::error::{DataChainError, Result};
+use crate::error::{corruption_from_json, CorruptionCategory, DataChainError, Result};
 use crate::versioning::Version;
+
+/// 登录会话记录(sessions 表一行)。时间戳均为 Unix 秒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub user_id: String,
+    pub refresh_family: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub revoke_reason: Option<String>,
+    /// 客户端 IP 的 HMAC 摘要(十六进制),不存明文 IP。
+    pub ip_hash: Option<String>,
+    /// 脱敏 IP 提示(如 `203.0.x.x`),仅用于会话列表展示。
+    pub ip_hint: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+const SESSION_COLUMNS: &str = "id, user_id, refresh_family, created_at, last_seen_at, \
+     expires_at, revoked_at, revoke_reason, ip_hash, ip_hint, user_agent";
+
+#[derive(sqlx::FromRow)]
+struct SessionRow {
+    id: String,
+    user_id: String,
+    refresh_family: String,
+    created_at: i64,
+    last_seen_at: i64,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+    revoke_reason: Option<String>,
+    ip_hash: Option<String>,
+    ip_hint: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl From<SessionRow> for SessionRecord {
+    fn from(r: SessionRow) -> Self {
+        Self {
+            id: r.id,
+            user_id: r.user_id,
+            refresh_family: r.refresh_family,
+            created_at: r.created_at,
+            last_seen_at: r.last_seen_at,
+            expires_at: r.expires_at,
+            revoked_at: r.revoked_at,
+            revoke_reason: r.revoke_reason,
+            ip_hash: r.ip_hash,
+            ip_hint: r.ip_hint,
+            user_agent: r.user_agent,
+        }
+    }
+}
+
+/// 审计日志保留期(秒):90 天。启动时清理更早的行。
+pub const AUDIT_RETENTION_SECS: i64 = 90 * 24 * 3600;
+
+/// 审计字段入库前的长度上限(字符数)。
+const AUDIT_USERNAME_MAX_CHARS: usize = 128;
+const AUDIT_USER_AGENT_MAX_CHARS: usize = 200;
+const AUDIT_REASON_MAX_CHARS: usize = 200;
+
+/// 认证审计事件(auth_audit_log 一行)。
+///
+/// 只记录事件元数据:**不得**放入密码、token、jti 或明文 IP;`ip_hash` 为 HMAC 摘要。
+/// 文本字段在 [`Storage::append_audit_event`] 入库时统一截断并转义控制字符。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditEvent {
+    /// 自增主键;写入时忽略,读取时填充。
+    pub id: i64,
+    /// Unix 秒。
+    pub ts: i64,
+    pub event_type: String,
+    pub user_id: Option<String>,
+    pub username_attempted: Option<String>,
+    pub session_id: Option<String>,
+    pub ip_hash: Option<String>,
+    pub user_agent: Option<String>,
+    /// `success` / `failure` / `denied`。
+    pub result: String,
+    pub reason: Option<String>,
+}
+
+impl AuditEvent {
+    /// 以当前时间创建一个事件。
+    pub fn new(event_type: &str, result: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().timestamp(),
+            event_type: event_type.to_string(),
+            result: result.to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn user(mut self, user_id: &str) -> Self {
+        self.user_id = Some(user_id.to_string());
+        self
+    }
+
+    pub fn username(mut self, username: &str) -> Self {
+        self.username_attempted = Some(username.to_string());
+        self
+    }
+
+    pub fn session(mut self, session_id: &str) -> Self {
+        self.session_id = Some(session_id.to_string());
+        self
+    }
+
+    pub fn client(mut self, ip_hash: Option<&str>, user_agent: Option<&str>) -> Self {
+        self.ip_hash = ip_hash.map(str::to_string);
+        self.user_agent = user_agent.map(str::to_string);
+        self
+    }
+
+    pub fn reason(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.to_string());
+        self
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    id: i64,
+    ts: i64,
+    event_type: String,
+    user_id: Option<String>,
+    username_attempted: Option<String>,
+    session_id: Option<String>,
+    ip_hash: Option<String>,
+    user_agent: Option<String>,
+    result: String,
+    reason: Option<String>,
+}
+
+/// 截断到 `max_chars` 个字符,并把控制字符(换行、ESC/ANSI 序列等)转义为可见文本,
+/// 防止日志注入与终端转义序列污染。
+fn sanitize_audit_text(raw: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for c in raw.chars().take(max_chars) {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let code = c as u32;
+                if code <= 0xff {
+                    out.push_str(&format!("\\x{:02x}", code));
+                } else {
+                    out.push_str(&format!("\\u{{{:x}}}", code));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// anchor_outbox 行:(anchor_id, signed, status, attempts, last_error, receipt)。
+type AnchorOutboxRow = (String, String, String, i64, Option<String>, Option<String>);
 
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
+    /// 用户 is_active 的进程内短 TTL 缓存:user_id -> (是否启用, 写入时刻)。
+    active_cache: parking_lot::Mutex<HashMap<String, (bool, Instant)>>,
+    /// 缓存 TTL(毫秒);0 表示禁用缓存。
+    active_cache_ttl_ms: AtomicU64,
+    /// 每次 is_active 写入后自增,用于丢弃"读发生在写之前"的陈旧回填。
+    active_generation: AtomicU64,
 }
 
 /// `identity_transactions` 查询使用的 SQLx 行元组。
@@ -46,6 +216,9 @@ pub struct CreateIdentityTransactionResult {
     pub created: bool,
 }
 
+/// is_active 缓存默认 TTL。
+const DEFAULT_ACTIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
 impl Storage {
     /// 创建存储实例
     pub async fn new(dsn: &str) -> Result<Self> {
@@ -59,7 +232,12 @@ impl Storage {
             .connect(&format!("sqlite:{}?mode=rwc", dsn))
             .await?;
 
-        let storage = Self { pool };
+        let storage = Self {
+            pool,
+            active_cache: parking_lot::Mutex::new(HashMap::new()),
+            active_cache_ttl_ms: AtomicU64::new(DEFAULT_ACTIVE_CACHE_TTL.as_millis() as u64),
+            active_generation: AtomicU64::new(0),
+        };
         storage.init_tables().await?;
 
         Ok(storage)
@@ -97,13 +275,19 @@ impl Storage {
                 6,
                 include_str!("../../migrations/006_catalog_semantic_records.sql"),
             ),
-            (
-                7,
-                include_str!("../../migrations/007_identity_transactions.sql"),
-            ),
+            (7, include_str!("../../migrations/007_sessions.sql")),
             (
                 8,
-                include_str!("../../migrations/008_identity_transaction_recovery_state.sql"),
+                include_str!("../../migrations/008_login_rate_counters_and_audit.sql"),
+            ),
+            (9, include_str!("../../migrations/009_session_ip_hint.sql")),
+            (
+                10,
+                include_str!("../../migrations/010_identity_transactions.sql"),
+            ),
+            (
+                11,
+                include_str!("../../migrations/011_identity_transaction_recovery_state.sql"),
             ),
         ];
         for (version, sql) in migrations {
@@ -164,6 +348,140 @@ impl Storage {
         .bind(&data)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// 把单个区块的派生投影(metadata 查询表 + catalog_* 查询表)写入同一事务,
+    /// 并删除其已打包的 pending 条目。由 `commit_block`(追加单块)与
+    /// `rebuild_projections`(全量重放)共用,保证两条路径投影语义完全一致。
+    ///
+    /// 不写 blocks 表本身——区块落库仍由调用方(commit_block)负责,
+    /// 重建路径在调用前已清空投影表,只需按区块顺序重放。
+    async fn project_block_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, block: &Block) -> Result<()> {
+        for entry in &block.metadata_list {
+            sqlx::query("DELETE FROM pending_metadata WHERE data_id = ?")
+                .bind(&entry.data_id)
+                .execute(&mut **tx)
+                .await?;
+
+            // 同事务写入 metadata 查询投影(只读副本,权威源仍是区块 metadata_list)。
+            // data_id upsert 保证幂等:重放/回填同一条目不会重复。
+            let entry_json = serde_json::to_string(entry)?;
+            let tags_json = serde_json::to_string(&entry.tags)?;
+            sqlx::query(
+                r#"
+                INSERT INTO metadata (data_id, owner, data_size, created_at, block_index, tags, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(data_id) DO UPDATE SET
+                    owner = excluded.owner,
+                    data_size = excluded.data_size,
+                    created_at = excluded.created_at,
+                    block_index = excluded.block_index,
+                    tags = excluded.tags,
+                    data = excluded.data
+                "#,
+            )
+            .bind(&entry.data_id)
+            .bind(&entry.owner)
+            .bind(entry.data_size)
+            .bind(entry.created_at.timestamp())
+            .bind(block.index)
+            .bind(&tags_json)
+            .bind(&entry_json)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        // 同事务持久化语义目录记录并更新查询投影。记录本身已在 block.catalog_records
+        // 并进入 merkle_root，是权威事实；catalog_* 表仅加速查询。
+        for record in &block.catalog_records {
+            let record_json = serde_json::to_string(record)?;
+            sqlx::query("DELETE FROM pending_catalog_records WHERE record_id = ?")
+                .bind(&record.record_id)
+                .execute(&mut **tx)
+                .await?;
+
+            match &record.payload {
+                CatalogPayload::Subject(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_subjects (subject_id, subject_type, display_name, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(subject_id) DO NOTHING",
+                    )
+                    .bind(&v.subject_id)
+                    .bind(&v.subject_type)
+                    .bind(&v.display_name)
+                    .bind(&v.source_ref)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                CatalogPayload::Revision(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_revisions (revision_id, subject_id, content_hash, parent_revision_id, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(revision_id) DO NOTHING",
+                    )
+                    .bind(&v.revision_id)
+                    .bind(&v.subject_id)
+                    .bind(&v.content_hash)
+                    .bind(&v.parent_revision_id)
+                    .bind(&v.source_ref)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                CatalogPayload::Artifact(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_artifacts (artifact_id, revision_id, artifact_hash, configuration_hash, platform, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING",
+                    )
+                    .bind(&v.artifact_id)
+                    .bind(&v.revision_id)
+                    .bind(&v.artifact_hash)
+                    .bind(&v.configuration_hash)
+                    .bind(&v.platform)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                CatalogPayload::Claim(v) => {
+                    sqlx::query(
+                        "INSERT INTO catalog_claims (claim_id, subject_id, revision_id, artifact_id, category, status, evidence_ref, observed_at, effective_from, effective_to, supersedes_claim_id, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(claim_id) DO NOTHING",
+                    )
+                    .bind(&v.claim_id)
+                    .bind(&v.subject_id)
+                    .bind(&v.revision_id)
+                    .bind(&v.artifact_id)
+                    .bind(&v.category)
+                    .bind(&v.status)
+                    .bind(&v.evidence_ref)
+                    .bind(v.observed_at)
+                    .bind(v.effective_from)
+                    .bind(v.effective_to)
+                    .bind(&v.supersedes_claim_id)
+                    .bind(&record.issuer_identity)
+                    .bind(&record.issuer_key)
+                    .bind(&record.record_id)
+                    .bind(record.recorded_at)
+                    .bind(block.index)
+                    .bind(&record_json)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -230,129 +548,7 @@ impl Storage {
             }
         }
 
-        for entry in &block.metadata_list {
-            sqlx::query("DELETE FROM pending_metadata WHERE data_id = ?")
-                .bind(&entry.data_id)
-                .execute(&mut *tx)
-                .await?;
-
-            // 同事务写入 metadata 查询投影(只读副本,权威源仍是区块 metadata_list)。
-            // data_id upsert 保证幂等:重放/回填同一条目不会重复。
-            let entry_json = serde_json::to_string(entry)?;
-            let tags_json = serde_json::to_string(&entry.tags)?;
-            sqlx::query(
-                r#"
-                INSERT INTO metadata (data_id, owner, data_size, created_at, block_index, tags, data)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(data_id) DO UPDATE SET
-                    owner = excluded.owner,
-                    data_size = excluded.data_size,
-                    created_at = excluded.created_at,
-                    block_index = excluded.block_index,
-                    tags = excluded.tags,
-                    data = excluded.data
-                "#,
-            )
-            .bind(&entry.data_id)
-            .bind(&entry.owner)
-            .bind(entry.data_size)
-            .bind(entry.created_at.timestamp())
-            .bind(block.index)
-            .bind(&tags_json)
-            .bind(&entry_json)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // 同事务持久化语义目录记录并更新查询投影。记录本身已在 block.catalog_records
-        // 并进入 merkle_root，是权威事实；catalog_* 表仅加速查询。
-        for record in &block.catalog_records {
-            let record_json = serde_json::to_string(record)?;
-            sqlx::query("DELETE FROM pending_catalog_records WHERE record_id = ?")
-                .bind(&record.record_id)
-                .execute(&mut *tx)
-                .await?;
-
-            match &record.payload {
-                CatalogPayload::Subject(v) => {
-                    sqlx::query(
-                        "INSERT INTO catalog_subjects (subject_id, subject_type, display_name, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(subject_id) DO NOTHING",
-                    )
-                    .bind(&v.subject_id)
-                    .bind(&v.subject_type)
-                    .bind(&v.display_name)
-                    .bind(&v.source_ref)
-                    .bind(&record.issuer_identity)
-                    .bind(&record.issuer_key)
-                    .bind(&record.record_id)
-                    .bind(record.recorded_at)
-                    .bind(block.index)
-                    .bind(&record_json)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                CatalogPayload::Revision(v) => {
-                    sqlx::query(
-                        "INSERT INTO catalog_revisions (revision_id, subject_id, content_hash, parent_revision_id, source_ref, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(revision_id) DO NOTHING",
-                    )
-                    .bind(&v.revision_id)
-                    .bind(&v.subject_id)
-                    .bind(&v.content_hash)
-                    .bind(&v.parent_revision_id)
-                    .bind(&v.source_ref)
-                    .bind(&record.issuer_identity)
-                    .bind(&record.issuer_key)
-                    .bind(&record.record_id)
-                    .bind(record.recorded_at)
-                    .bind(block.index)
-                    .bind(&record_json)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                CatalogPayload::Artifact(v) => {
-                    sqlx::query(
-                        "INSERT INTO catalog_artifacts (artifact_id, revision_id, artifact_hash, configuration_hash, platform, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING",
-                    )
-                    .bind(&v.artifact_id)
-                    .bind(&v.revision_id)
-                    .bind(&v.artifact_hash)
-                    .bind(&v.configuration_hash)
-                    .bind(&v.platform)
-                    .bind(&record.issuer_identity)
-                    .bind(&record.issuer_key)
-                    .bind(&record.record_id)
-                    .bind(record.recorded_at)
-                    .bind(block.index)
-                    .bind(&record_json)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                CatalogPayload::Claim(v) => {
-                    sqlx::query(
-                        "INSERT INTO catalog_claims (claim_id, subject_id, revision_id, artifact_id, category, status, evidence_ref, observed_at, effective_from, effective_to, supersedes_claim_id, issuer_identity, issuer_key, record_id, recorded_at, block_index, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(claim_id) DO NOTHING",
-                    )
-                    .bind(&v.claim_id)
-                    .bind(&v.subject_id)
-                    .bind(&v.revision_id)
-                    .bind(&v.artifact_id)
-                    .bind(&v.category)
-                    .bind(&v.status)
-                    .bind(&v.evidence_ref)
-                    .bind(v.observed_at)
-                    .bind(v.effective_from)
-                    .bind(v.effective_to)
-                    .bind(&v.supersedes_claim_id)
-                    .bind(&record.issuer_identity)
-                    .bind(&record.issuer_key)
-                    .bind(&record.record_id)
-                    .bind(record.recorded_at)
-                    .bind(block.index)
-                    .bind(&record_json)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
+        Self::project_block_tx(&mut tx, block).await?;
 
         tx.commit().await?;
         Ok(())
@@ -516,7 +712,8 @@ impl Storage {
             .collect()
     }
 
-    /// 获取区块
+    /// 获取区块。blocks 是权威源:JSON 解析失败视为数据损坏(fail-closed),
+    /// key 用区块索引(与"blocks 的 key 用区块索引"的错误契约一致)。
     pub async fn get_block(&self, index: i64) -> Result<Block> {
         let row: (String,) = sqlx::query_as("SELECT data FROM blocks WHERE block_index = ?")
             .bind(index)
@@ -524,19 +721,35 @@ impl Storage {
             .await
             .map_err(|_| DataChainError::BlockNotFound(index))?;
 
-        let block: Block = serde_json::from_str(&row.0)?;
-        Ok(block)
+        serde_json::from_str(&row.0).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "blocks",
+                Some(&index.to_string()),
+                &e,
+            )
+        })
     }
 
-    /// 获取所有区块
+    /// 获取所有区块。权威源严格读取:任一行 JSON 解析失败即整体 fail-closed,
+    /// 返回 DataCorruption{table:"blocks", key:<block_index>}。
     pub async fn get_all_blocks(&self) -> Result<Vec<Block>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM blocks ORDER BY block_index ASC")
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT block_index, data FROM blocks ORDER BY block_index ASC")
                 .fetch_all(&self.pool)
                 .await?;
 
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(block_index, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "blocks",
+                        Some(&block_index.to_string()),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -600,28 +813,42 @@ impl Storage {
                     is_active,
                     metadata,
                 )| {
-                    let role = role.parse().map_err(|e| {
-                        DataChainError::StorageError(format!("invalid user role: {}", e))
+                    // users 是权威源:任一字段解析失败即 fail-closed。key 统一用 user_id
+                    // 主键(不用 email/username),reason 只走固定词表,不回显 role/日期/
+                    // 原始 JSON 内容(避免间接泄露 password_hash 等敏感字段所在行)。
+                    let role = role.parse().map_err(|_| DataChainError::DataCorruption {
+                        category: CorruptionCategory::Authoritative,
+                        table: "users",
+                        key: user_id.clone(),
+                        reason: "missing_field".to_string(),
                     })?;
                     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
-                        .map_err(|e| {
-                            DataChainError::StorageError(format!("invalid user created_at: {}", e))
+                        .map_err(|_| DataChainError::DataCorruption {
+                            category: CorruptionCategory::Authoritative,
+                            table: "users",
+                            key: user_id.clone(),
+                            reason: "missing_field".to_string(),
                         })?
                         .with_timezone(&chrono::Utc);
                     let last_login = last_login
                         .map(|t| {
                             chrono::DateTime::parse_from_rfc3339(&t)
                                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                                .map_err(|e| {
-                                    DataChainError::StorageError(format!(
-                                        "invalid user last_login: {}",
-                                        e
-                                    ))
+                                .map_err(|_| DataChainError::DataCorruption {
+                                    category: CorruptionCategory::Authoritative,
+                                    table: "users",
+                                    key: user_id.clone(),
+                                    reason: "missing_field".to_string(),
                                 })
                         })
                         .transpose()?;
                     let metadata = serde_json::from_str(&metadata).map_err(|e| {
-                        DataChainError::StorageError(format!("invalid user metadata: {}", e))
+                        corruption_from_json(
+                            CorruptionCategory::Authoritative,
+                            "users",
+                            Some(&user_id),
+                            &e,
+                        )
                     })?;
                     Ok(User {
                         id: 0,
@@ -689,12 +916,13 @@ impl Storage {
                     message,
                     parent_version,
                 )| {
+                    // versions 是权威源:timestamp 解析失败即 fail-closed,key 用 version_id。
                     let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
-                        .map_err(|e| {
-                            DataChainError::StorageError(format!(
-                                "invalid version timestamp: {}",
-                                e
-                            ))
+                        .map_err(|_| DataChainError::DataCorruption {
+                            category: CorruptionCategory::Authoritative,
+                            table: "versions",
+                            key: version_id.clone(),
+                            reason: "missing_field".to_string(),
                         })?
                         .with_timezone(&chrono::Utc);
                     Ok(Version {
@@ -726,15 +954,24 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取所有待打包元数据。
+    /// 获取所有待打包元数据。权威源严格读取:data_id 作 key。
     pub async fn get_pending_metadata(&self) -> Result<Vec<MetadataEntry>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM pending_metadata ORDER BY created_at ASC, data_id ASC",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT data_id, data FROM pending_metadata ORDER BY created_at ASC, data_id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(data_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "pending_metadata",
+                        Some(&data_id),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -761,26 +998,48 @@ impl Storage {
         Ok(())
     }
 
-    /// 获取单个聚合结果。
+    /// 获取单个聚合结果。data 列坏 JSON 返回结构化 `DataCorruption`(权威源,key=summary_id)。
     pub async fn get_aggregation(&self, summary_id: &str) -> Result<AggregationSummary> {
-        let row: (String,) = sqlx::query_as("SELECT data FROM aggregations WHERE summary_id = ?")
-            .bind(summary_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| {
-                DataChainError::AggregationFailed(format!("aggregation not found: {}", summary_id))
-            })?;
-        Ok(serde_json::from_str(&row.0)?)
+        let row: (String, String) =
+            sqlx::query_as("SELECT summary_id, data FROM aggregations WHERE summary_id = ?")
+                .bind(summary_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| {
+                    DataChainError::AggregationFailed(format!(
+                        "aggregation not found: {}",
+                        summary_id
+                    ))
+                })?;
+        serde_json::from_str(&row.1).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "aggregations",
+                Some(row.0.as_str()),
+                &e,
+            )
+        })
     }
 
-    /// 获取全部聚合结果，按创建时间恢复历史顺序。
+    /// 获取全部聚合结果，按创建时间恢复历史顺序。任一行坏 JSON 即返回
+    /// 结构化 `DataCorruption`(权威源,key=summary_id)。
     pub async fn get_all_aggregations(&self) -> Result<Vec<AggregationSummary>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data FROM aggregations ORDER BY created_at ASC, summary_id ASC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT summary_id, data FROM aggregations ORDER BY created_at ASC, summary_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(summary_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "aggregations",
+                        Some(summary_id.as_str()),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -803,11 +1062,56 @@ impl Storage {
         Ok(())
     }
 
+    /// 将 outbox 行严格解析为条目;任何字段损坏均返回带 anchor_id 的 `DataCorruption`。
+    fn parse_anchor_row(
+        anchor_id: &str,
+        signed: &str,
+        status: &str,
+        attempts: i64,
+        last_error: Option<String>,
+        receipt: Option<String>,
+    ) -> Result<AnchorOutboxEntry> {
+        let signed: SignedChainAnchor = serde_json::from_str(signed).map_err(|e| {
+            corruption_from_json(
+                CorruptionCategory::Authoritative,
+                "anchor_outbox",
+                Some(anchor_id),
+                &e,
+            )
+        })?;
+        let status =
+            AnchorStatus::parse_status(status).map_err(|_| DataChainError::DataCorruption {
+                category: CorruptionCategory::Authoritative,
+                table: "anchor_outbox",
+                key: anchor_id.to_string(),
+                reason: "unknown_status".to_string(),
+            })?;
+        let receipt = match receipt {
+            Some(r) => Some(serde_json::from_str(&r).map_err(|e| {
+                corruption_from_json(
+                    CorruptionCategory::Authoritative,
+                    "anchor_outbox",
+                    Some(anchor_id),
+                    &e,
+                )
+            })?),
+            None => None,
+        };
+        Ok(AnchorOutboxEntry {
+            signed,
+            status,
+            attempts,
+            last_error,
+            receipt,
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
     /// 列出待投递锚定（pending），按创建时间升序，限制批量大小。
     pub async fn list_pending_anchors(&self, limit: i64) -> Result<Vec<AnchorOutboxEntry>> {
-        let rows: Vec<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        let rows: Vec<AnchorOutboxRow> = sqlx::query_as(
             r#"
-            SELECT signed, status, attempts, last_error, receipt
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox
             WHERE status = 'pending'
             ORDER BY created_at ASC
@@ -819,22 +1123,34 @@ impl Storage {
         .await?;
 
         rows.into_iter()
-            .map(|(signed, status, attempts, last_error, receipt)| {
-                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
-                let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r)?),
-                    None => None,
-                };
-                Ok(AnchorOutboxEntry {
-                    signed,
-                    status: AnchorStatus::parse_status(&status),
-                    attempts,
-                    last_error,
-                    receipt,
-                    updated_at: chrono::Utc::now(),
-                })
-            })
+            .map(
+                |(anchor_id, signed, status, attempts, last_error, receipt)| {
+                    Self::parse_anchor_row(
+                        &anchor_id, &signed, &status, attempts, last_error, receipt,
+                    )
+                },
+            )
             .collect()
+    }
+
+    /// 启动期只读全表扫描 anchor_outbox(不按 status 过滤),逐行严格校验
+    /// status / signed / receipt。返回已校验行数;首个损坏行返回 `DataCorruption`。
+    pub async fn scan_anchor_outbox(&self) -> Result<usize> {
+        let rows: Vec<AnchorOutboxRow> = sqlx::query_as(
+            r#"
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
+            FROM anchor_outbox
+            ORDER BY created_at ASC, anchor_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut count = 0usize;
+        for (anchor_id, signed, status, attempts, last_error, receipt) in rows {
+            Self::parse_anchor_row(&anchor_id, &signed, &status, attempts, last_error, receipt)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// 标记锚定已确认，记录回执。
@@ -884,9 +1200,9 @@ impl Storage {
 
     /// 查询单个锚定条目（供 API 查询状态）。
     pub async fn get_anchor(&self, anchor_id: &str) -> Result<Option<AnchorOutboxEntry>> {
-        let row: Option<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        let row: Option<AnchorOutboxRow> = sqlx::query_as(
             r#"
-            SELECT signed, status, attempts, last_error, receipt
+            SELECT anchor_id, signed, status, attempts, last_error, receipt
             FROM anchor_outbox WHERE anchor_id = ?
             "#,
         )
@@ -896,21 +1212,9 @@ impl Storage {
 
         match row {
             None => Ok(None),
-            Some((signed, status, attempts, last_error, receipt)) => {
-                let signed: SignedChainAnchor = serde_json::from_str(&signed)?;
-                let receipt = match receipt {
-                    Some(r) => Some(serde_json::from_str(&r)?),
-                    None => None,
-                };
-                Ok(Some(AnchorOutboxEntry {
-                    signed,
-                    status: AnchorStatus::parse_status(&status),
-                    attempts,
-                    last_error,
-                    receipt,
-                    updated_at: chrono::Utc::now(),
-                }))
-            }
+            Some((id, signed, status, attempts, last_error, receipt)) => Ok(Some(
+                Self::parse_anchor_row(&id, &signed, &status, attempts, last_error, receipt)?,
+            )),
         }
     }
 
@@ -1030,6 +1334,440 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    // ==================== 登录会话(sessions) ====================
+
+    /// 创建会话。
+    pub async fn create_session(&self, session: &SessionRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sessions
+                (id, user_id, refresh_family, created_at, last_seen_at, expires_at,
+                 revoked_at, revoke_reason, ip_hash, ip_hint, user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&session.id)
+        .bind(&session.user_id)
+        .bind(&session.refresh_family)
+        .bind(session.created_at)
+        .bind(session.last_seen_at)
+        .bind(session.expires_at)
+        .bind(session.revoked_at)
+        .bind(&session.revoke_reason)
+        .bind(&session.ip_hash)
+        .bind(&session.ip_hint)
+        .bind(&session.user_agent)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按 id 读取会话(含已撤销/已过期)。
+    pub async fn get_session(&self, id: &str) -> Result<Option<SessionRecord>> {
+        let row = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions WHERE id = ?",
+            SESSION_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SessionRecord::from))
+    }
+
+    /// 列出某用户未撤销且 `expires_at > now` 的会话,按创建时间升序。
+    pub async fn list_active_sessions(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let rows = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions \
+             WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? \
+             ORDER BY created_at ASC, id ASC",
+            SESSION_COLUMNS
+        ))
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SessionRecord::from).collect())
+    }
+
+    /// 撤销会话,并在同一事务内写入其 refresh family 的哨兵行。
+    ///
+    /// 返回 `true` 表示本次调用使会话由未撤销变为已撤销,`false` 表示会话不存在
+    /// 或此前已撤销(幂等,不重复写入)。`ttl_secs` 用于哨兵行过期时间,语义同
+    /// [`Storage::revoke_family`]。
+    pub async fn revoke_session(&self, id: &str, reason: &str, ttl_secs: i64) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+
+        // 条件更新兼作并发收口:只有一个调用能把 revoked_at 从 NULL 置位。
+        let updated = sqlx::query(
+            "UPDATE sessions SET revoked_at = ?, revoke_reason = ? \
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let (user_id, family_id): (String, String) =
+            sqlx::query_as("SELECT user_id, refresh_family FROM sessions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens
+                (jti, user_id, family_id, reason, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(jti) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                reason = excluded.reason,
+                revoked_at = excluded.revoked_at
+            "#,
+        )
+        .bind(Self::family_sentinel_jti(&family_id))
+        .bind(&user_id)
+        .bind(&family_id)
+        .bind(reason)
+        .bind(now + ttl_secs + 24 * 3600)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// 按 refresh family 读取会话(含已撤销/已过期)。family 与会话一一对应。
+    pub async fn get_session_by_family(&self, family_id: &str) -> Result<Option<SessionRecord>> {
+        let row = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions WHERE refresh_family = ?",
+            SESSION_COLUMNS
+        ))
+        .bind(family_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SessionRecord::from))
+    }
+
+    /// refresh 成功后更新会话的 `last_seen_at` 并顺延 `expires_at`。
+    ///
+    /// 仅作用于未撤销的会话;返回 `false` 表示会话已被撤销或不存在(与并发登出收口)。
+    pub async fn touch_session(&self, id: &str, now: i64, new_expires_at: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE sessions SET last_seen_at = ?, expires_at = MAX(expires_at, ?) \
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(new_expires_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 撤销某用户全部未撤销会话,并在同一事务内写入各 family 的哨兵行。
+    /// 返回本次被撤销的会话 id(幂等:已撤销的不重复返回)。
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Vec<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let ids = Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    /// 事务内撤销用户全部会话。首条语句即为写操作(`UPDATE .. RETURNING`),
+    /// 避免"先读后写"在多连接下的读锁升级冲突。
+    async fn revoke_user_sessions_in_tx(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+        now: i64,
+    ) -> Result<Vec<String>> {
+        let revoked: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE sessions SET revoked_at = ?, revoke_reason = ? \
+             WHERE user_id = ? AND revoked_at IS NULL \
+             RETURNING id, refresh_family",
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (_, family_id) in &revoked {
+            sqlx::query(
+                r#"
+                INSERT INTO revoked_refresh_tokens
+                    (jti, user_id, family_id, reason, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(jti) DO UPDATE SET
+                    expires_at = excluded.expires_at,
+                    reason = excluded.reason,
+                    revoked_at = excluded.revoked_at
+                "#,
+            )
+            .bind(Self::family_sentinel_jti(family_id))
+            .bind(user_id)
+            .bind(family_id)
+            .bind(reason)
+            .bind(now + ttl_secs + 24 * 3600)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(revoked.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// 惰性清理:删除某用户已过期的会话行(走 `idx_sessions_user`),返回删除行数。
+    pub async fn purge_expired_sessions_for_user(&self, user_id: &str, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM sessions WHERE user_id = ? AND expires_at < ?")
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 清理全部已过期的会话行(服务启动时调用),返回删除行数。
+    pub async fn purge_expired_sessions(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    // ==================== 认证审计日志 ====================
+
+    /// 追加一条审计事件。文本字段会截断并转义控制字符;用户名同时规范化为小写。
+    pub async fn append_audit_event(&self, event: &AuditEvent) -> Result<()> {
+        let username = event
+            .username_attempted
+            .as_deref()
+            .map(|u| sanitize_audit_text(&u.trim().to_lowercase(), AUDIT_USERNAME_MAX_CHARS));
+        let user_agent = event
+            .user_agent
+            .as_deref()
+            .map(|ua| sanitize_audit_text(ua, AUDIT_USER_AGENT_MAX_CHARS));
+        let reason = event
+            .reason
+            .as_deref()
+            .map(|r| sanitize_audit_text(r, AUDIT_REASON_MAX_CHARS));
+        sqlx::query(
+            r#"
+            INSERT INTO auth_audit_log
+                (ts, event_type, user_id, username_attempted, session_id,
+                 ip_hash, user_agent, result, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.ts)
+        .bind(sanitize_audit_text(&event.event_type, 64))
+        .bind(&event.user_id)
+        .bind(username)
+        .bind(&event.session_id)
+        .bind(&event.ip_hash)
+        .bind(user_agent)
+        .bind(sanitize_audit_text(&event.result, 32))
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按写入顺序(id 升序)读取最多 `limit` 条审计事件。
+    pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEvent>> {
+        let rows = sqlx::query_as::<_, AuditRow>(
+            "SELECT id, ts, event_type, user_id, username_attempted, session_id, \
+                    ip_hash, user_agent, result, reason \
+             FROM auth_audit_log ORDER BY id ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditEvent {
+                id: r.id,
+                ts: r.ts,
+                event_type: r.event_type,
+                user_id: r.user_id,
+                username_attempted: r.username_attempted,
+                session_id: r.session_id,
+                ip_hash: r.ip_hash,
+                user_agent: r.user_agent,
+                result: r.result,
+                reason: r.reason,
+            })
+            .collect())
+    }
+
+    /// 删除 `ts < cutoff_ts` 的审计行(启动时按保留期清理),返回删除行数。
+    pub async fn purge_audit_before(&self, cutoff_ts: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM auth_audit_log WHERE ts < ?")
+            .bind(cutoff_ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 设置 is_active 缓存 TTL(默认 5 秒;`Duration::ZERO` 表示禁用缓存)。
+    pub fn set_active_cache_ttl(&self, ttl: Duration) {
+        self.active_cache_ttl_ms
+            .store(ttl.as_millis() as u64, Ordering::Relaxed);
+        self.active_cache.lock().clear();
+    }
+
+    /// 带短 TTL 缓存地读取用户启用状态(鉴权热路径使用)。
+    ///
+    /// 缓存只存成功查询的结果;查库失败直接返回 `Err`(调用方应 fail-closed)。
+    /// [`Storage::set_user_active`] 会同步清除本进程缓存,故本进程内的禁用/启用即时生效;
+    /// 其他进程直接改库的变更最多滞后一个 TTL。
+    pub async fn is_user_active_cached(&self, user_id: &str) -> Result<bool> {
+        let ttl = Duration::from_millis(self.active_cache_ttl_ms.load(Ordering::Relaxed));
+        if ttl.is_zero() {
+            return self.is_user_active(user_id).await;
+        }
+        if let Some((active, at)) = self.active_cache.lock().get(user_id).copied() {
+            if at.elapsed() < ttl {
+                return Ok(active);
+            }
+        }
+        let generation = self.active_generation.load(Ordering::SeqCst);
+        let active = self.is_user_active(user_id).await?;
+        let mut cache = self.active_cache.lock();
+        // 查询期间若发生过写入,结果可能已陈旧,不回填。
+        if self.active_generation.load(Ordering::SeqCst) == generation {
+            cache.insert(user_id.to_string(), (active, Instant::now()));
+        }
+        Ok(active)
+    }
+
+    /// 读取用户启用状态(以 SQLite 为权威)。用户不存在视为非活跃(fail-closed)。
+    pub async fn is_user_active(&self, user_id: &str) -> Result<bool> {
+        let row: Option<(bool,)> = sqlx::query_as("SELECT is_active FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(active,)| active).unwrap_or(false))
+    }
+
+    /// 写入用户启用状态。**仅启用路径使用**;停用必须用
+    /// `deactivate_user_and_revoke_sessions`(本函数不撤销会话与 refresh family)。
+    /// 返回 `true` 表示用户存在并已更新。
+    pub async fn set_user_active(&self, user_id: &str, active: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET is_active = ? WHERE user_id = ?")
+            .bind(active)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        self.invalidate_active_cache(user_id);
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 停用用户并在**同一事务**内撤销其全部会话与 refresh family。
+    ///
+    /// 返回 `None` 表示用户不存在;`Some(n)` 为本次被撤销的会话数。
+    /// 提交后同步清本进程 is_active 缓存,其他进程最迟一个 TTL 内感知。
+    pub async fn deactivate_user_and_revoke_sessions(
+        &self,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<u64>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query("UPDATE users SET is_active = 0 WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let revoked =
+            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+        tx.commit().await?;
+        self.invalidate_active_cache(user_id);
+        Ok(Some(revoked.len() as u64))
+    }
+
+    /// 清本进程 is_active 缓存,并让在途的旧读不再回填。
+    fn invalidate_active_cache(&self, user_id: &str) {
+        let mut cache = self.active_cache.lock();
+        self.active_generation.fetch_add(1, Ordering::SeqCst);
+        cache.remove(user_id);
+    }
+
+    // ==================== 登录限速计数器 ====================
+
+    /// 原子递增固定窗口计数器,返回 `(递增后的计数, 窗口起点)`。
+    ///
+    /// 单条 `INSERT .. ON CONFLICT DO UPDATE .. RETURNING`,不先读后写,并发不漏计。
+    /// 同时惰性清理该 key 已过期的旧窗口。
+    pub async fn incr_login_counter(
+        &self,
+        key: &str,
+        now: i64,
+        window_secs: i64,
+    ) -> Result<(i64, i64)> {
+        let window_start = now - now.rem_euclid(window_secs);
+        let (count,): (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO login_rate_counters (key, window_start, count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(key, window_start) DO UPDATE SET count = count + 1
+            RETURNING count
+            "#,
+        )
+        .bind(key)
+        .bind(window_start)
+        .fetch_one(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM login_rate_counters WHERE key = ? AND window_start < ?")
+            .bind(key)
+            .bind(window_start)
+            .execute(&self.pool)
+            .await?;
+        Ok((count, window_start))
+    }
+
+    /// 当前窗口计数减一(不低于 0)。用于成功登录归还 IP 维度的名额。
+    pub async fn decr_login_counter(&self, key: &str, now: i64, window_secs: i64) -> Result<()> {
+        let window_start = now - now.rem_euclid(window_secs);
+        sqlx::query(
+            "UPDATE login_rate_counters SET count = MAX(count - 1, 0) \
+             WHERE key = ? AND window_start = ?",
+        )
+        .bind(key)
+        .bind(window_start)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 清空某 key 的全部计数(成功登录后重置用户名维度)。
+    pub async fn reset_login_counter(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM login_rate_counters WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ==================== metadata 查询投影(backlog #5) ====================
@@ -1158,15 +1896,24 @@ impl Storage {
         Ok(())
     }
 
-    /// 恢复所有待打包目录记录。
+    /// 恢复所有待打包目录记录。权威源严格读取:record_id 作 key。
     pub async fn get_pending_catalog_records(&self) -> Result<Vec<CatalogRecord>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT data FROM pending_catalog_records ORDER BY created_at ASC, record_id ASC",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT record_id, data FROM pending_catalog_records ORDER BY created_at ASC, record_id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(data,)| serde_json::from_str(&data).map_err(DataChainError::from))
+            .map(|(record_id, data)| {
+                serde_json::from_str(&data).map_err(|e| {
+                    corruption_from_json(
+                        CorruptionCategory::Authoritative,
+                        "pending_catalog_records",
+                        Some(&record_id),
+                        &e,
+                    )
+                })
+            })
             .collect()
     }
 
@@ -1243,10 +1990,159 @@ impl Storage {
             .collect()
     }
 
+    // ==================== 可重建投影检测与重建(S3) ====================
+
+    /// 可重建投影清单。aggregations 前置核实后排除:AggregationSummary 携带
+    /// parent_summaries/is_merged 等递归合并历史状态,不是"当前区块集合"可确定性
+    /// 推导的纯投影,而是跨多次聚合动作累积的状态机,移出可重建投影改为
+    /// fail-closed(见 get_all_aggregations 不变,仍走裸反序列化错误 fail-closed)。
+    const REBUILDABLE_TABLES: &'static [&'static str] = &[
+        "metadata",
+        "catalog_subjects",
+        "catalog_revisions",
+        "catalog_artifacts",
+        "catalog_claims",
+    ];
+
+    /// 某张可重建投影表对已加载区块按"能否正常解析每一行"与"行数是否与推导值一致"
+    /// 做检测;任一失败都视为该表需要重建。
+    async fn projection_needs_rebuild(&self, table: &'static str, expected: i64) -> bool {
+        let count_sql = format!("SELECT COUNT(*) FROM {}", table);
+        let actual: Option<(i64,)> = sqlx::query_as(&count_sql).fetch_one(&self.pool).await.ok();
+        let actual = match actual {
+            Some((n,)) => n,
+            None => return true,
+        };
+        if actual != expected {
+            return true;
+        }
+
+        // 数量一致时再抽样校验可解析性:逐行尝试反序列化 data 列。
+        let data_sql = format!("SELECT data FROM {}", table);
+        let rows: Option<Vec<(String,)>> =
+            sqlx::query_as(&data_sql).fetch_all(&self.pool).await.ok();
+        match rows {
+            None => true,
+            Some(rows) => rows
+                .iter()
+                .any(|(data,)| serde_json::from_str::<serde_json::Value>(data).is_err()),
+        }
+    }
+
+    /// 期望的 metadata 投影行数:区块内全部 metadata_list 条目数(按 data_id 去重,
+    /// 与 upsert 语义一致)。
+    fn expected_metadata_count(blocks: &[Block]) -> i64 {
+        let mut ids = std::collections::HashSet::new();
+        for block in blocks {
+            for entry in &block.metadata_list {
+                ids.insert(entry.data_id.as_str());
+            }
+        }
+        ids.len() as i64
+    }
+
+    /// 期望的某张 catalog_* 投影行数:区块内对应 payload 类型的记录数(按主键去重,
+    /// 与 commit_block 的 `ON CONFLICT DO NOTHING` 首写者胜语义一致)。
+    fn expected_catalog_count(blocks: &[Block], table: &'static str) -> i64 {
+        let mut ids = std::collections::HashSet::new();
+        for block in blocks {
+            for record in &block.catalog_records {
+                let id = match (&record.payload, table) {
+                    (CatalogPayload::Subject(v), "catalog_subjects") => Some(v.subject_id.as_str()),
+                    (CatalogPayload::Revision(v), "catalog_revisions") => {
+                        Some(v.revision_id.as_str())
+                    }
+                    (CatalogPayload::Artifact(v), "catalog_artifacts") => {
+                        Some(v.artifact_id.as_str())
+                    }
+                    (CatalogPayload::Claim(v), "catalog_claims") => Some(v.claim_id.as_str()),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    ids.insert(id);
+                }
+            }
+        }
+        ids.len() as i64
+    }
+
+    /// 清空全部可重建投影表(事务内),调用方负责随后按区块顺序重放并提交。
+    async fn clear_projection_tables(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+        for table in Self::REBUILDABLE_TABLES {
+            let sql = format!("DELETE FROM {}", table);
+            sqlx::query(&sql).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
+
+    /// 在同一事务内清空可重建投影表、按区块高度升序重放 `project_block_tx`、提交。
+    /// 失败整体回滚(事务未提交,drop 时自动 rollback)。
+    ///
+    /// 调用方(`ensure_projections`)必须确保仅在区块校验通过后调用;本函数不重复
+    /// 校验区块合法性。
+    pub async fn rebuild_projections(&self, blocks: &[Block]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::clear_projection_tables(&mut tx).await?;
+        for block in blocks {
+            Self::project_block_tx(&mut tx, block).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 启动时序第 7 步:检测可重建投影表与已加载区块是否一致,不一致则在单事务内
+    /// 整体重建(清表→重放→提交)。仅应在区块校验(validate_loaded_blocks)通过后调用。
+    ///
+    /// 返回触发重建的表名列表(用于日志 `event=projection_rebuild tables=[..]`),
+    /// 空列表表示投影已与区块一致,未发生任何写入(幂等、重复调用安全)。
+    pub async fn ensure_projections(&self, blocks: &[Block]) -> Result<ProjectionReport> {
+        let expected_metadata = Self::expected_metadata_count(blocks);
+        let mut needs_rebuild = Vec::new();
+
+        if self
+            .projection_needs_rebuild("metadata", expected_metadata)
+            .await
+        {
+            needs_rebuild.push("metadata");
+        }
+        for table in [
+            "catalog_subjects",
+            "catalog_revisions",
+            "catalog_artifacts",
+            "catalog_claims",
+        ] {
+            let expected = Self::expected_catalog_count(blocks, table);
+            if self.projection_needs_rebuild(table, expected).await {
+                needs_rebuild.push(table);
+            }
+        }
+
+        if needs_rebuild.is_empty() {
+            return Ok(ProjectionReport {
+                rebuilt_tables: Vec::new(),
+            });
+        }
+
+        // 任一表不一致即整体重建全部可重建投影表(清表→重放→提交为单事务,
+        // 避免只重建部分表导致表间关联字段不一致)。
+        self.rebuild_projections(blocks).await?;
+
+        Ok(ProjectionReport {
+            rebuilt_tables: needs_rebuild.into_iter().map(String::from).collect(),
+        })
+    }
+
     /// 关闭存储
     pub async fn close(&self) {
         self.pool.close().await;
     }
+}
+
+/// `ensure_projections` 的结果报告。
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionReport {
+    /// 本次调用触发重建的表名(日志 `tables=[..]` 字段用)。空表示无需重建。
+    pub rebuilt_tables: Vec<String>,
 }
 
 /// 创建共享的 Storage 实例
@@ -1883,7 +2779,7 @@ mod tests {
             .fetch_one(&storage.pool)
             .await
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
         let index_sql: (String,) = sqlx::query_as(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_identity_transactions_submitter_idempotency'",
         )

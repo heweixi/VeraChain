@@ -164,6 +164,46 @@ async fn protected_route_requires_auth() {
 }
 
 #[tokio::test]
+async fn chain_validation_api_reports_validity_and_requires_block_read_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "reader", "readerpass123", Role::User).await;
+    let router = api::create_router(state.clone());
+    let token = login(router.clone(), "reader", "readerpass123").await;
+
+    let response = router
+        .clone()
+        .oneshot(post("/api/v1/chain/validate", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["valid"], true);
+
+    let mut corrupt_blocks = state.chain.get_all_blocks();
+    corrupt_blocks[0].previous_hash = "tampered-genesis-parent".to_string();
+    corrupt_blocks[0].mine();
+    state.chain.load_blocks(corrupt_blocks);
+    let response = router
+        .clone()
+        .oneshot(post("/api/v1/chain/validate", Some(&token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["valid"], false);
+
+    let response = router
+        .oneshot(post("/api/v1/chain/validate", None, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn rbac_user_cannot_create_anchor_admin_can() {
     let dir = tempfile::tempdir().unwrap();
     let dsn = dir.path().join("dc.db");

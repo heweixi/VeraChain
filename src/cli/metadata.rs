@@ -1,5 +1,6 @@
 use clap::Subcommand;
 
+use crate::cli::common::load_verified_chain;
 use crate::config::AppConfig;
 use crate::core::create_chain;
 use crate::crypto::HashEngine;
@@ -66,11 +67,8 @@ pub async fn run_metadata(config: &AppConfig, action: MetadataAction) -> anyhow:
     let storage = create_storage(&config.database.dsn).await?;
     let chain = create_chain(config.blockchain.difficulty, config.blockchain.block_size);
 
-    // 加载区块
-    let blocks = storage.get_all_blocks().await?;
-    if !blocks.is_empty() {
-        chain.load_blocks(blocks);
-    }
+    // 严格加载:区块损坏或链无效时 fail-closed,不会继续执行回填/查询。
+    load_verified_chain(&storage, &chain).await?;
 
     // 回填 metadata 投影,确保读命令(list/get/query/stats)能命中历史上链元数据。
     storage
