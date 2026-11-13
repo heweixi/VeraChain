@@ -344,4 +344,4 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 
 - 本仓库不再依赖 monorepo 根的 `PROJECT_STATUS_OVERVIEW.md`；状态以本文档和 README 为准。
 - 每次需求、设计或代码行为变化，都要同步本文档对应表格、README 和任务记录，并在状态项后附 commit 与验证方式。
-- 远程仓库已配置为 `https://github.com/heweixi/datachain-rust.git`；当前 Git 历史由原 monorepo 的 `datachain-rust` subtree 提取而来，提交消息和演进路径保留，commit hash 因 subtree 拆分而重新生成。
+- 远程仓库已重命名为 `VeraChain`，地址为 `https://github.com/heweixi/VeraChain.git`（SSH：`git@github.com:heweixi/VeraChain.git`；旧地址 `heweixi/datachain-rust` 由 GitHub 重定向，各分支提交号与新地址一致）；当前 Git 历史由原 monorepo 的 `datachain-rust` subtree 提取而来，提交消息和演进路径保留，commit hash 因 subtree 拆分而重新生成。

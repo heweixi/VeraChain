@@ -20,8 +20,8 @@
 仓库当前远程地址为：
 
 ```bash
-git clone https://github.com/heweixi/datachain-rust.git
-cd datachain-rust
+git clone https://github.com/heweixi/VeraChain.git
+cd VeraChain
 ```
 
 使用 Cargo 构建：
