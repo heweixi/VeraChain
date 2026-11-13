@@ -137,6 +137,46 @@ async fn corrupt_login_rate_counter_row_fails_startup_scan_closed() {
 }
 
 #[tokio::test]
+async fn corrupt_login_lockout_row_fails_startup_scan_closed() {
+    // login_lockouts 为迁移 012 新增的表;每列各注入一次损坏,reason 为固定词表。
+    for column in ["level", "locked_until"] {
+        let env = env_with_auth_state().await;
+        env.sql(
+            "INSERT INTO login_lockouts (key, level, locked_until) \
+             VALUES ('user:scanuser', 1, 4102444800)",
+        )
+        .await;
+        env.scan().await.expect("健康的 login_lockouts 不应阻塞启动");
+
+        env.sql(&format!(
+            "UPDATE login_lockouts SET {} = 'TAMPERED-VALUE'",
+            column
+        ))
+        .await;
+        let err = env
+            .scan()
+            .await
+            .expect_err("login_lockouts 损坏必须 fail-closed");
+        match err {
+            DataChainError::DataCorruption {
+                category,
+                table,
+                key,
+                reason,
+            } => {
+                assert_eq!(category, CorruptionCategory::Authoritative);
+                assert_eq!(table, "login_lockouts");
+                assert!(key.starts_with("rowid="), "key 应为 rowid=<n>,实际 {}", key);
+                assert!(!key.contains("scanuser"), "key 不得回显 key 列,实际 {}", key);
+                assert!(!key.contains("TAMPERED-VALUE"));
+                assert_eq!(reason, format!("invalid_column:{}", column));
+            }
+            other => panic!("期望 DataCorruption,实际 {:?}", other),
+        }
+    }
+}
+
+#[tokio::test]
 async fn corrupt_audit_log_does_not_block_startup() {
     let env = env_with_auth_state().await;
     env.sql("UPDATE auth_audit_log SET ts = 'TAMPERED-VALUE'")

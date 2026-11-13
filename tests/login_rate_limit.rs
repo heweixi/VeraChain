@@ -334,14 +334,23 @@ fn fixed_clock(now: Arc<std::sync::atomic::AtomicI64>) -> Arc<dyn Fn() -> i64 + 
     Arc::new(move || now.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// 窗口跨越(固定窗口按 epoch 对齐):窗口末尾失败 5 次后,进入新窗口计数从 0 重新开始;
-/// 同一窗口内第 6 次必须 429。时间完全由注入时钟控制,不依赖墙钟。
+/// 窗口跨越(IP 维度固定窗口按 epoch 对齐):窗口末尾同一 IP 失败 5 次后,进入新窗口
+/// 计数从 0 重新开始;同一窗口内第 6 次必须 429。用户名阈值设得很大,保证只有 IP 维度
+/// 触发(用户名维度会走指数退避锁定,不再随窗口重置)。时间由注入时钟控制,不依赖墙钟。
 #[tokio::test]
 async fn failed_attempts_reset_when_clock_crosses_window_boundary() {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     let dir = tempfile::tempdir().unwrap();
-    let (service, storage) = service_with_limits(&dir, LoginLimits::default()).await;
+    let (service, storage) = service_with_limits(
+        &dir,
+        LoginLimits {
+            user_max_attempts: 100,
+            ip_max_attempts: 5,
+            window_secs: 900,
+        },
+    )
+    .await;
     // 任意 epoch 对齐的窗口起点(900 的整数倍)。
     let window_start: i64 = ALIGNED_T0;
     let now = Arc::new(AtomicI64::new(window_start + 895));
