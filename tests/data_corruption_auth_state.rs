@@ -146,7 +146,9 @@ async fn corrupt_login_lockout_row_fails_startup_scan_closed() {
              VALUES ('user:scanuser', 1, 4102444800)",
         )
         .await;
-        env.scan().await.expect("健康的 login_lockouts 不应阻塞启动");
+        env.scan()
+            .await
+            .expect("健康的 login_lockouts 不应阻塞启动");
 
         env.sql(&format!(
             "UPDATE login_lockouts SET {} = 'TAMPERED-VALUE'",
@@ -167,7 +169,11 @@ async fn corrupt_login_lockout_row_fails_startup_scan_closed() {
                 assert_eq!(category, CorruptionCategory::Authoritative);
                 assert_eq!(table, "login_lockouts");
                 assert!(key.starts_with("rowid="), "key 应为 rowid=<n>,实际 {}", key);
-                assert!(!key.contains("scanuser"), "key 不得回显 key 列,实际 {}", key);
+                assert!(
+                    !key.contains("scanuser"),
+                    "key 不得回显 key 列,实际 {}",
+                    key
+                );
                 assert!(!key.contains("TAMPERED-VALUE"));
                 assert_eq!(reason, format!("invalid_column:{}", column));
             }

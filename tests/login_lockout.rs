@@ -304,7 +304,8 @@ async fn lock_survives_restart_with_same_dsn() {
     // 同一 dsn 全新建 Storage + AuthService(模拟进程重启),用户从库中重新加载。
     let storage2 = create_storage(&f.dsn).await.unwrap();
     let _clock2 = attach_clock(&storage2, T0 + 100);
-    let service2 = AuthService::with_settings(SECRET.to_string(), storage2.clone(), settings(2, 1000));
+    let service2 =
+        AuthService::with_settings(SECRET.to_string(), storage2.clone(), settings(2, 1000));
     for user in storage2.get_all_users().await.unwrap() {
         service2.load_user(user);
     }
@@ -314,7 +315,10 @@ async fn lock_survives_restart_with_same_dsn() {
         .expect_err("重启后仍应锁定")
     {
         DataChainError::TooManyAttempts { retry_after_secs } => {
-            assert_eq!(retry_after_secs, 810, "剩余 locked_until(T0+910) - now(T0+100)")
+            assert_eq!(
+                retry_after_secs, 810,
+                "剩余 locked_until(T0+910) - now(T0+100)"
+            )
         }
         other => panic!("期望 TooManyAttempts,实际 {:?}", other),
     }
