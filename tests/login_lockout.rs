@@ -118,10 +118,6 @@ impl Fixture {
         self.clock.store(t, Ordering::SeqCst);
     }
 
-    fn now(&self) -> i64 {
-        self.clock.load(Ordering::SeqCst)
-    }
-
     async fn attempt(&self, user: &str, pw: &str) -> DataChainError {
         self.service
             .login(&req(user, pw), &ctx(IP))
