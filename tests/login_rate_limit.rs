@@ -99,7 +99,7 @@ async fn locked_user_cannot_login_even_with_correct_password_but_others_can() {
 }
 
 #[tokio::test]
-async fn successful_login_resets_the_username_counter() {
+async fn successful_login_does_not_clear_accumulated_failures() {
     let dir = tempfile::tempdir().unwrap();
     let (router, _) = router_with_alice(&dir).await;
 
@@ -109,11 +109,40 @@ async fn successful_login_resets_the_username_counter() {
     }
     let (status, _, _) = try_login(&router, "alice", "alicepass123").await;
     assert_eq!(status, StatusCode::OK);
-    // 成功后计数清零:再失败 4 次仍是 401 而不是 429。
+    // 成功登录只归还自己的名额,不清零已累积的 4 次失败:
+    // 第 5 次失败仍是 401,第 6 次尝试起被限速。
+    let (status, _, _) = try_login(&router, "alice", "wrong-password").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = try_login(&router, "alice", "wrong-password").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn case_variant_account_success_cannot_reset_victim_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dc.db");
+    let (state, _) = build_state(dsn.to_str().unwrap()).await;
+    seed_user(&state, "carol", "carolpass123", Role::User).await;
+    // 攻击者注册大小写变体:限速 key 归一化后与受害者相同。
+    seed_user(&state, "CAROL", "attackerpass1", Role::User).await;
+    let router = api::create_router(state);
+
     for _ in 0..4 {
-        let (status, _, _) = try_login(&router, "alice", "wrong-password").await;
+        let (status, _, _) = try_login(&router, "carol", "wrong-password").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
+    let (status, _, _) = try_login(&router, "CAROL", "attackerpass1").await;
+    assert_eq!(status, StatusCode::OK);
+    // 攻击者的成功登录不得抵消对受害者累积的 4 次失败:
+    // 第 5 次失败仍 401,之后必须被限速。
+    let (status, _, _) = try_login(&router, "carol", "wrong-password").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = try_login(&router, "carol", "wrong-password").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "大小写变体账户的成功登录不应重置受害者用户名计数"
+    );
 }
 
 #[tokio::test]
