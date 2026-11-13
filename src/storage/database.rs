@@ -9,6 +9,56 @@ use crate::crosschain::{AnchorOutboxEntry, AnchorReceipt, AnchorStatus, SignedCh
 use crate::error::{DataChainError, Result};
 use crate::versioning::Version;
 
+/// 登录会话记录(sessions 表一行)。时间戳均为 Unix 秒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: String,
+    pub user_id: String,
+    pub refresh_family: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub revoke_reason: Option<String>,
+    /// 客户端 IP 的 HMAC 摘要(十六进制),不存明文 IP。
+    pub ip_hash: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+const SESSION_COLUMNS: &str = "id, user_id, refresh_family, created_at, last_seen_at, \
+     expires_at, revoked_at, revoke_reason, ip_hash, user_agent";
+
+#[derive(sqlx::FromRow)]
+struct SessionRow {
+    id: String,
+    user_id: String,
+    refresh_family: String,
+    created_at: i64,
+    last_seen_at: i64,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+    revoke_reason: Option<String>,
+    ip_hash: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl From<SessionRow> for SessionRecord {
+    fn from(r: SessionRow) -> Self {
+        Self {
+            id: r.id,
+            user_id: r.user_id,
+            refresh_family: r.refresh_family,
+            created_at: r.created_at,
+            last_seen_at: r.last_seen_at,
+            expires_at: r.expires_at,
+            revoked_at: r.revoked_at,
+            revoke_reason: r.revoke_reason,
+            ip_hash: r.ip_hash,
+            user_agent: r.user_agent,
+        }
+    }
+}
+
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
@@ -65,6 +115,7 @@ impl Storage {
                 6,
                 include_str!("../../migrations/006_catalog_semantic_records.sql"),
             ),
+            (7, include_str!("../../migrations/007_sessions.sql")),
         ];
         for (version, sql) in migrations {
             if *version <= current {
@@ -797,6 +848,135 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    // ==================== 登录会话(sessions) ====================
+
+    /// 创建会话。
+    pub async fn create_session(&self, session: &SessionRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO sessions
+                (id, user_id, refresh_family, created_at, last_seen_at, expires_at,
+                 revoked_at, revoke_reason, ip_hash, user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&session.id)
+        .bind(&session.user_id)
+        .bind(&session.refresh_family)
+        .bind(session.created_at)
+        .bind(session.last_seen_at)
+        .bind(session.expires_at)
+        .bind(session.revoked_at)
+        .bind(&session.revoke_reason)
+        .bind(&session.ip_hash)
+        .bind(&session.user_agent)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按 id 读取会话(含已撤销/已过期)。
+    pub async fn get_session(&self, id: &str) -> Result<Option<SessionRecord>> {
+        let row = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions WHERE id = ?",
+            SESSION_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SessionRecord::from))
+    }
+
+    /// 列出某用户未撤销且 `expires_at > now` 的会话,按创建时间升序。
+    pub async fn list_active_sessions(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let rows = sqlx::query_as::<_, SessionRow>(&format!(
+            "SELECT {} FROM sessions \
+             WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? \
+             ORDER BY created_at ASC, id ASC",
+            SESSION_COLUMNS
+        ))
+        .bind(user_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SessionRecord::from).collect())
+    }
+
+    /// 撤销会话,并在同一事务内写入其 refresh family 的哨兵行。
+    ///
+    /// 返回 `true` 表示本次调用使会话由未撤销变为已撤销,`false` 表示会话不存在
+    /// 或此前已撤销(幂等,不重复写入)。`ttl_secs` 用于哨兵行过期时间,语义同
+    /// [`Storage::revoke_family`]。
+    pub async fn revoke_session(&self, id: &str, reason: &str, ttl_secs: i64) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+
+        // 条件更新兼作并发收口:只有一个调用能把 revoked_at 从 NULL 置位。
+        let updated = sqlx::query(
+            "UPDATE sessions SET revoked_at = ?, revoke_reason = ? \
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(reason)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let (user_id, family_id): (String, String) =
+            sqlx::query_as("SELECT user_id, refresh_family FROM sessions WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO revoked_refresh_tokens
+                (jti, user_id, family_id, reason, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(jti) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                reason = excluded.reason,
+                revoked_at = excluded.revoked_at
+            "#,
+        )
+        .bind(Self::family_sentinel_jti(&family_id))
+        .bind(&user_id)
+        .bind(&family_id)
+        .bind(reason)
+        .bind(now + ttl_secs + 24 * 3600)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// 读取用户启用状态(以 SQLite 为权威)。用户不存在视为非活跃(fail-closed)。
+    pub async fn is_user_active(&self, user_id: &str) -> Result<bool> {
+        let row: Option<(bool,)> = sqlx::query_as("SELECT is_active FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(active,)| active).unwrap_or(false))
+    }
+
+    /// 写入用户启用状态。返回 `true` 表示用户存在并已更新。
+    pub async fn set_user_active(&self, user_id: &str, active: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE users SET is_active = ? WHERE user_id = ?")
+            .bind(active)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ==================== metadata 查询投影(backlog #5) ====================
