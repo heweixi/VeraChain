@@ -273,7 +273,10 @@ impl Default for AppConfig {
 /// 解析数值型环境变量;失败时错误只含变量名与期望格式,不回显原始取值(避免误填的敏感内容进入日志)。
 fn parse_env_number<T: std::str::FromStr>(name: &str, raw: &str) -> anyhow::Result<T> {
     raw.trim().parse::<T>().map_err(|_| {
-        anyhow::anyhow!("environment variable {} must be a non-negative integer", name)
+        anyhow::anyhow!(
+            "environment variable {} must be a non-negative integer",
+            name
+        )
     })
 }
 
