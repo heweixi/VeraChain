@@ -350,7 +350,10 @@ async fn refresh_failure_audit_never_contains_secrets() {
         .parse_refresh_claims(&t.refresh)
         .unwrap();
     let dump = format!("{:?}", f.events().await);
-    assert!(dump.contains("refresh_failure"), "应有失败审计行,避免空表假阳性");
+    assert!(
+        dump.contains("refresh_failure"),
+        "应有失败审计行,避免空表假阳性"
+    );
     let needles = [
         garbage.to_string(),
         expired,
