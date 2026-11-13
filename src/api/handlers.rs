@@ -214,13 +214,15 @@ pub async fn change_password(
 ) -> axum::response::Response {
     use crate::error::DataChainError;
     let ctx = client_context(client_ip, &headers);
-    match state.auth_service.change_password(&claims, &req, &ctx).await {
+    match state
+        .auth_service
+        .change_password(&claims, &req, &ctx)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(DataChainError::PasswordRejected(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error(msg)),
-        )
-            .into_response(),
+        Err(DataChainError::PasswordRejected(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg))).into_response()
+        }
         Err(DataChainError::InvalidCredentials) => (
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::error("invalid credentials")),

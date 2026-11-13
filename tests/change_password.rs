@@ -336,11 +336,15 @@ async fn repeated_bad_old_password_locks_change_with_429_and_login_is_unaffected
     let a = f.login("alice", OLD).await;
 
     assert_eq!(
-        f.change(Some(&a.access), "bad-old-pass-1", NEW).await.status,
+        f.change(Some(&a.access), "bad-old-pass-1", NEW)
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        f.change(Some(&a.access), "bad-old-pass-2", NEW).await.status,
+        f.change(Some(&a.access), "bad-old-pass-2", NEW)
+            .await
+            .status,
         StatusCode::UNAUTHORIZED
     );
     let locked = f.change(Some(&a.access), "bad-old-pass-3", NEW).await;
@@ -363,7 +367,10 @@ async fn repeated_bad_old_password_locks_change_with_429_and_login_is_unaffected
     // 该用户正常登录不受改密锁影响(旧密码仍有效),也不是 429。
     let login = f.login_raw("alice", OLD).await;
     assert_eq!(login.status, StatusCode::OK, "改密锁不得影响登录");
-    assert_eq!(f.login_raw("alice", NEW).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        f.login_raw("alice", NEW).await.status,
+        StatusCode::UNAUTHORIZED
+    );
 
     // 审计:两次失败 + 至少两次 locked(触发锁的那次与锁内那次)。
     assert_eq!(f.events_of("password_change_failure").await.len(), 2);
@@ -378,7 +385,10 @@ async fn new_equal_to_old_is_400() {
     let a = f.login("alice", OLD).await;
     let r = f.change(Some(&a.access), OLD, OLD).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert_eq!(r.body["error"], "new password must differ from old password");
+    assert_eq!(
+        r.body["error"],
+        "new password must differ from old password"
+    );
     // 密码未变。
     assert_eq!(f.login_raw("alice", OLD).await.status, StatusCode::OK);
 }
