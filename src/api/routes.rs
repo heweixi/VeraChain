@@ -163,6 +163,14 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 把 Router 转成携带对端地址(ConnectInfo)的 make-service。
+/// TLS 与非 TLS 两条 serve 路径都必须经此转换,否则 handler/限流拿不到真实对端 IP。
+pub fn make_service(
+    router: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 /// 运行服务器
 pub async fn run_server(
     state: AppState,
@@ -177,12 +185,12 @@ pub async fn run_server(
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
         tracing::info!("服务器启动于 HTTPS://{}", addr);
         axum_server::bind_rustls(socket_addr, tls_config)
-            .serve(app.into_make_service())
+            .serve(make_service(app))
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(socket_addr).await?;
         tracing::info!("服务器启动于 HTTP://{}", addr);
-        axum::serve(listener, app).await?;
+        axum::serve(listener, make_service(app)).await?;
     }
 
     Ok(())
