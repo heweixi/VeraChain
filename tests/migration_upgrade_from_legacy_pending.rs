@@ -126,13 +126,15 @@ async fn legacy_pending_db_upgrade_fails_cleanly_and_manual_repair_drill_is_docu
     assert_eq!(count(&pool, "blocks").await, 1);
     assert_eq!(count(&pool, "identity_transactions").await, 1);
     assert_eq!(max_version(&pool).await, 8);
-    let sessions_table: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-    assert!(sessions_table.is_none(), "失败的升级不得留下半成品 sessions 表");
+    let sessions_table: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sessions'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert!(
+        sessions_table.is_none(),
+        "失败的升级不得留下半成品 sessions 表"
+    );
     let (recovery_state,): (String,) = sqlx::query_as(
         "SELECT recovery_state FROM identity_transactions WHERE transaction_id = 'legacy-tx'",
     )

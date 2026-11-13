@@ -147,7 +147,10 @@ async fn reusing_a_rotated_refresh_token_is_reported_as_reuse_and_revokes_the_fa
     // 此前合法的新 refresh 与新 access 都随整族撤销失效。
     let (status, body) = f.refresh(&new_refresh).await;
     assert_reuse_rejection(status, &body);
-    assert_eq!(f.profile_status(&new_access).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        f.profile_status(&new_access).await,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]

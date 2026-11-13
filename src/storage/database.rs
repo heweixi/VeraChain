@@ -1217,7 +1217,8 @@ impl Storage {
                 key: key.clone(),
                 reason: format!("invalid_column:{}", column),
             };
-            row.try_get::<String, _>("key").map_err(|_| invalid("key"))?;
+            row.try_get::<String, _>("key")
+                .map_err(|_| invalid("key"))?;
             for column in ["window_start", "count"] {
                 row.try_get::<i64, _>(column).map_err(|_| invalid(column))?;
             }
