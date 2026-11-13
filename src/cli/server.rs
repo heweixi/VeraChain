@@ -307,7 +307,9 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
     scheduler.start();
 
     let p2p = crate::p2p::P2PService::with_node_id(config.chain_identity.node_id.clone());
-    let rate_limiter = Arc::new(api::RateLimiter::default());
+    let trusted_proxies = crate::net::TrustedProxies::parse(&config.auth.trusted_proxies)
+        .map_err(|e| anyhow::anyhow!("auth.trusted_proxies is invalid: {}", e))?;
+    let rate_limiter = Arc::new(api::RateLimiter::default().with_trusted_proxies(trusted_proxies));
 
     // 注册种子 peer(可选):环境变量 DATACHAIN_P2P_SEED_PEERS,逗号分隔,
     // 每项格式 peer_id|base_url[|auth_token]。用于 P2P 广播/发现的初始连接点。

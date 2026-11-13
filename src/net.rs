@@ -1,8 +1,10 @@
 //! 网络辅助:可信代理列表(CIDR/单 IP)解析与匹配。
 //!
-//! 本模块只提供 `trusted_proxies` 配置的解析与成员判断;`X-Forwarded-For` 取址
-//! (`resolve_client_ip`)由后续切片接入。手写 CIDR,不引入额外依赖。
-use std::net::IpAddr;
+//! 提供 `trusted_proxies` 配置的解析、成员判断,以及基于 `X-Forwarded-For` 的
+//! 真实客户端 IP 解析(`resolve_client_ip`)。手写 CIDR,不引入额外依赖。
+use std::net::{IpAddr, SocketAddr};
+
+use axum::http::HeaderMap;
 
 /// `X-Forwarded-For` 最多处理的条目数(供 XFF 解析切片使用,超出视为不可信输入)。
 pub const MAX_XFF_ENTRIES: usize = 32;
@@ -97,12 +99,87 @@ impl TrustedProxies {
         self.nets.is_empty()
     }
 
+    /// 解析真实客户端 IP。
+    ///
+    /// - 列表为空、`peer` 为 `None` 或对端不可信:原样返回 `peer`(忽略 XFF)。
+    /// - 否则读取全部 `X-Forwarded-For` 行(按顺序以 `,` 拼接),按 `,` 切分后从右向左走:
+    ///   条目 > 32 或总字节 > 2048 返回对端;解析失败(含空项、非 UTF-8)返回当前跳;
+    ///   遇到不可信地址返回该地址;全部可信返回最左一项。
+    /// - 不读取 `X-Real-IP` / `Forwarded`。
+    pub fn resolve_client_ip(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> Option<IpAddr> {
+        let peer = peer?;
+        if self.is_empty() {
+            return Some(peer);
+        }
+        let peer = normalize_ip(peer);
+        if !self.contains(peer) {
+            return Some(peer);
+        }
+
+        // 拼接多行 XFF;字节数按原始头字节累加(含空白与行间分隔符)。
+        let mut joined = String::new();
+        let mut total_bytes = 0usize;
+        let mut seen_line = false;
+        for value in headers.get_all("x-forwarded-for") {
+            if seen_line {
+                total_bytes += 1;
+                joined.push(',');
+            }
+            seen_line = true;
+            total_bytes += value.as_bytes().len();
+            if total_bytes > MAX_XFF_BYTES {
+                return Some(peer);
+            }
+            // 非 UTF-8 字节变成 U+FFFD,使所在条目解析失败。
+            joined.push_str(&String::from_utf8_lossy(value.as_bytes()));
+        }
+        if !seen_line {
+            return Some(peer);
+        }
+        let entries: Vec<&str> = joined.split(',').collect();
+        if entries.len() > MAX_XFF_ENTRIES {
+            return Some(peer);
+        }
+
+        let mut current = peer;
+        for entry in entries.iter().rev() {
+            let ip = match parse_xff_entry(entry.trim()) {
+                Some(ip) => normalize_ip(ip),
+                None => return Some(current),
+            };
+            if !self.contains(ip) {
+                return Some(ip);
+            }
+            current = ip;
+        }
+        Some(current)
+    }
+
     /// `ip` 是否落在任一可信网段内。IPv4 映射的 IPv6 地址(`::ffff:a.b.c.d`)按 IPv4 判断。
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = normalize_ip(ip);
         self.nets.iter().any(|net| net.contains(ip))
     }
 }
+
+/// 解析 XFF 单项:`IpAddr`、`SocketAddr`(`1.2.3.4:80`、`[v6]:port`)或 `[v6]`。
+fn parse_xff_entry(text: &str) -> Option<IpAddr> {
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = text.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+    let inner = text.strip_prefix('[')?.strip_suffix(']')?;
+    inner.parse::<IpAddr>().ok()
+}
+
+/// 全局限流中间件解析出的客户端 IP,作为 request extension 传给 handler。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIp(pub Option<IpAddr>);
 
 /// 把 `::ffff:a.b.c.d` 规范化为 IPv4,其余原样返回。
 fn normalize_ip(ip: IpAddr) -> IpAddr {

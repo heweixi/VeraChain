@@ -1,15 +1,16 @@
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use super::AppState;
+use crate::net::{ClientIp, TrustedProxies};
 
 struct Window {
     started: Instant,
@@ -24,6 +25,8 @@ pub struct RateLimiter {
     window: Duration,
     normal_limit: u32,
     auth_limit: u32,
+    /// 可信代理列表;默认为空(不信任任何代理,只用对端地址)。
+    trusted_proxies: TrustedProxies,
 }
 
 impl RateLimiter {
@@ -34,7 +37,19 @@ impl RateLimiter {
             window,
             normal_limit,
             auth_limit,
+            trusted_proxies: TrustedProxies::default(),
         }
+    }
+
+    /// 设置可信代理列表(builder)。
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = trusted_proxies;
+        self
+    }
+
+    /// 按可信代理配置解析真实客户端 IP。
+    pub fn client_ip(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> Option<IpAddr> {
+        self.trusted_proxies.resolve_client_ip(peer, headers)
     }
 
     /// 当前被跟踪的限流 key 数量(用于观察过期淘汰)。
@@ -90,20 +105,25 @@ impl Default for RateLimiter {
 
 pub async fn rate_limit_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path();
-    if path == "/health" {
+    if request.uri().path() == "/health" {
         return next.run(request).await;
     }
-    // 仅信任对端地址;X-Forwarded-For / X-Real-IP 可被客户端任意伪造,不参与限流 key。
-    // 无 ConnectInfo(如进程内 oneshot 测试)时回退占位 key。
-    let key = request
+    // 取对端地址后经可信代理配置解析一次真实客户端 IP:仅当对端属于可信代理时才读取
+    // X-Forwarded-For(默认空列表即不读取,与此前行为一致)。无 ConnectInfo(如进程内
+    // oneshot 测试)时回退占位 key。解析结果写入 ClientIp extension 供 handler 复用。
+    let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .map(|ConnectInfo(addr)| addr.ip());
+    let client_ip = state.rate_limiter.client_ip(peer, request.headers());
+    request.extensions_mut().insert(ClientIp(client_ip));
+    let key = client_ip
+        .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let path = request.uri().path();
     let is_auth = path.starts_with("/api/v1/auth/");
     if !state
         .rate_limiter

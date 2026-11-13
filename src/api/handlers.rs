@@ -1,12 +1,11 @@
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
 
 use super::{AppState, Event, EventType};
@@ -14,6 +13,7 @@ use crate::aggregation::StrategyType;
 use crate::auth::{Claims, LoginContext, LoginRequest, RegisterRequest};
 use crate::core::{metadata_leaf_hash, MerkleTree};
 use crate::metadata::{CreateMetadataRequest, QueryMetadataRequest};
+use crate::net::ClientIp;
 use crate::p2p::{PeerRegistration, SyncBlocksRequest, SyncBlocksResponse, SyncQuery};
 
 // ==================== 响应结构 ====================
@@ -105,13 +105,13 @@ pub async fn register(
     }
 }
 
-/// 提取请求的客户端上下文(会话与审计用)。仅使用对端地址;不信任 X-Forwarded-For。
-fn client_context(
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    headers: &HeaderMap,
-) -> LoginContext {
+/// 提取请求的客户端上下文(会话与审计用)。IP 取自限流中间件解析出的 `ClientIp`
+/// (默认只用对端地址;仅对端属于可信代理时才采用 X-Forwarded-For)。
+fn client_context(client_ip: Option<Extension<ClientIp>>, headers: &HeaderMap) -> LoginContext {
     LoginContext {
-        client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
+        client_ip: client_ip
+            .and_then(|Extension(ClientIp(ip))| ip)
+            .map(|ip| ip.to_string()),
         user_agent: headers
             .get(header::USER_AGENT)
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
@@ -120,11 +120,11 @@ fn client_context(
 
 pub async fn login(
     State(state): State<AppState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> axum::response::Response {
-    let ctx = client_context(connect_info, &headers);
+    let ctx = client_context(client_ip, &headers);
     match state.auth_service.login(&req, &ctx).await {
         Ok(resp) => (StatusCode::OK, Json(ApiResponse::success(resp))).into_response(),
         Err(crate::error::DataChainError::TooManyAttempts { retry_after_secs }) => (
@@ -178,10 +178,10 @@ fn internal_error(context: &str, e: crate::error::DataChainError) -> axum::respo
 pub async fn logout(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ctx = client_context(connect_info, &headers);
+    let ctx = client_context(client_ip, &headers);
     match state.auth_service.logout(&claims, &ctx).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error("登出失败", e),
@@ -192,10 +192,10 @@ pub async fn logout(
 pub async fn logout_all(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ctx = client_context(connect_info, &headers);
+    let ctx = client_context(client_ip, &headers);
     match state.auth_service.logout_all(&claims.sub, &ctx).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error("全部登出失败", e),
@@ -223,10 +223,10 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(session_id): Path<String>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_ip: Option<Extension<ClientIp>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let ctx = client_context(connect_info, &headers);
+    let ctx = client_context(client_ip, &headers);
     match state
         .auth_service
         .revoke_user_session(&claims.sub, &session_id, &ctx)
