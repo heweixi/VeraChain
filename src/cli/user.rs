@@ -28,6 +28,16 @@ pub enum UserAction {
         /// 用户名
         username: String,
     },
+    /// 停用用户(撤销其全部会话;运行中的服务最迟一个缓存 TTL 内生效)
+    Deactivate {
+        /// 用户名
+        username: String,
+    },
+    /// 启用用户(不恢复已撤销的会话,需重新登录)
+    Activate {
+        /// 用户名
+        username: String,
+    },
     /// 用户登录
     Login {
         /// 用户名
@@ -116,6 +126,23 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 println!("✗ 用户未找到: {}", e);
             }
         },
+        UserAction::Deactivate { username } => {
+            let user = auth_service
+                .get_user(&username)
+                .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
+            let revoked = auth_service.deactivate_user(&user.user_id).await?;
+            println!("✓ 用户已停用");
+            println!("  用户名: {}", user.username);
+            println!("  已撤销会话数: {}", revoked);
+        }
+        UserAction::Activate { username } => {
+            let user = auth_service
+                .get_user(&username)
+                .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
+            auth_service.activate_user(&user.user_id).await?;
+            println!("✓ 用户已启用(旧会话不会恢复,需重新登录)");
+            println!("  用户名: {}", user.username);
+        }
         UserAction::Login { username, password } => {
             let req = LoginRequest { username, password };
 

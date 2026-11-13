@@ -115,6 +115,22 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
         Err(e) => tracing::warn!("清理过期刷新令牌撤销记录失败: {}", e),
     }
 
+    // 清理已过期的登录会话,以及超出保留期(90 天)的认证审计日志。
+    let now_ts = chrono::Utc::now().timestamp();
+    match storage.purge_expired_sessions(now_ts).await {
+        Ok(n) if n > 0 => info!("已清理 {} 条过期会话", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("清理过期会话失败: {}", e),
+    }
+    match storage
+        .purge_audit_before(now_ts - crate::storage::AUDIT_RETENTION_SECS)
+        .await
+    {
+        Ok(n) if n > 0 => info!("已清理 {} 条过期认证审计记录", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("清理过期认证审计记录失败: {}", e),
+    }
+
     // 加载版本
     let versions = storage.get_all_versions().await?;
     for version in versions {

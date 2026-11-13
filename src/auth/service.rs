@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{JwtHandler, LoginRequest, LoginResponse, RegisterRequest, Role, User};
 use crate::crypto::{hash_password, verify_password};
 use crate::error::{DataChainError, Result};
-use crate::storage::{SessionRecord, Storage};
+use crate::storage::{AuditEvent, SessionRecord, Storage};
 
 /// 登录请求的客户端上下文,用于会话审计字段。
 #[derive(Debug, Clone, Default)]
@@ -164,6 +164,18 @@ impl AuthService {
         hex::encode(&hmac_sha256(&self.ip_hash_key, ip.as_bytes())[..16])
     }
 
+    /// 写入认证审计日志。失败只记 error 日志,绝不阻塞或改变认证结果。
+    async fn audit(&self, event: AuditEvent) {
+        if let Err(e) = self.storage.append_audit_event(&event).await {
+            tracing::error!("写入认证审计日志失败: {}", e);
+        }
+    }
+
+    /// 请求上下文里的客户端 IP 摘要(无对端地址时为 `None`)。
+    fn ctx_ip_hash(&self, ctx: &LoginContext) -> Option<String> {
+        ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip))
+    }
+
     /// 公开注册:始终创建普通用户,不接受客户端指定高权限角色。
     pub fn register(&self, req: &RegisterRequest) -> Result<User> {
         self.register_with_role(req, Role::User)
@@ -229,6 +241,13 @@ impl AuthService {
             .await?;
         if ip_count > limits.ip_max_attempts || user_count > limits.user_max_attempts {
             let retry_after_secs = (window_start + limits.window_secs - now).max(1) as u64;
+            self.audit(
+                AuditEvent::new("login_locked", "denied")
+                    .username(&req.username)
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                    .reason("rate limit exceeded"),
+            )
+            .await;
             return Err(DataChainError::TooManyAttempts { retry_after_secs });
         }
 
@@ -246,9 +265,32 @@ impl AuthService {
             }
         };
         // 用户不存在 / 密码错误 / 账户已禁用 统一返回同一错误(禁用账户也先验证密码)。
-        let mut user = match found {
-            Some(user) if password_ok && user.is_active => user,
-            _ => return Err(DataChainError::InvalidCredentials),
+        // 启用状态以 SQLite 为权威(CLI 可能在别的进程里停用/启用,内存副本会陈旧)。
+        // 失败原因只写入审计日志,对外始终是同一个 InvalidCredentials。
+        let verdict: std::result::Result<User, (Option<String>, &'static str)> = match found {
+            None => Err((None, "unknown user")),
+            Some(user) if !password_ok => Err((Some(user.user_id), "bad password")),
+            Some(user) => {
+                if self.storage.is_user_active(&user.user_id).await? {
+                    Ok(user)
+                } else {
+                    Err((Some(user.user_id), "account inactive"))
+                }
+            }
+        };
+        let mut user = match verdict {
+            Ok(user) => user,
+            Err((user_id, reason)) => {
+                let mut event = AuditEvent::new("login_failure", "failure")
+                    .username(&req.username)
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                    .reason(reason);
+                if let Some(user_id) = user_id {
+                    event = event.user(&user_id);
+                }
+                self.audit(event).await;
+                return Err(DataChainError::InvalidCredentials);
+            }
         };
 
         // 成功:重置用户名维度计数,归还 IP 维度的本次名额。
@@ -292,6 +334,15 @@ impl AuthService {
             Some(session.id.as_str()),
         )?;
 
+        self.audit(
+            AuditEvent::new("login_success", "success")
+                .user(&user.user_id)
+                .username(&req.username)
+                .session(&session.id)
+                .client(session.ip_hash.as_deref(), ctx.user_agent.as_deref()),
+        )
+        .await;
+
         Ok(LoginResponse {
             token: token_pair.access_token,
             refresh_token: token_pair.refresh_token,
@@ -328,11 +379,12 @@ impl AuthService {
             return Err(DataChainError::InvalidToken);
         }
 
-        // 角色必须与当前用户一致(角色被修改后旧 token 失效);内存侧禁用同样拒绝。
+        // 角色必须与当前用户一致(角色被修改后旧 token 失效)。
+        // 启用状态只信 SQLite(上面已查):内存副本在 CLI 启用后会陈旧,不能再用它拒绝。
         let user = self
             .get_user_by_id(&claims.sub)
             .map_err(|_| DataChainError::InvalidToken)?;
-        if !user.is_active || user.role.to_string() != claims.role {
+        if user.role.to_string() != claims.role {
             return Err(DataChainError::InvalidToken);
         }
         Ok(claims)
@@ -390,8 +442,11 @@ impl AuthService {
                     }
                 }
             }
-            self.revoke_family_and_session(&user_id, &family_id, REUSE_REASON, ttl_secs)
+            let sid = self
+                .revoke_family_and_session(&user_id, &family_id, REUSE_REASON, ttl_secs)
                 .await?;
+            self.audit_reuse(&user_id, sid.as_deref(), REUSE_REASON)
+                .await;
             return Err(DataChainError::TokenReuseDetected);
         }
 
@@ -434,8 +489,11 @@ impl AuthService {
         if !claimed {
             // 抢占失败：旧 token 已被消费。整族撤销并判定复用。
             // 存量 token（family_id 为空）无族可撤，退化为单 jti 失效（上面已落库）。
-            self.revoke_family_and_session(&user_id, &family_id, DOUBLE_SPEND_REASON, ttl_secs)
+            let sid = self
+                .revoke_family_and_session(&user_id, &family_id, DOUBLE_SPEND_REASON, ttl_secs)
                 .await?;
+            self.audit_reuse(&user_id, sid.as_deref(), DOUBLE_SPEND_REASON)
+                .await;
             return Err(DataChainError::TokenReuseDetected);
         }
 
@@ -491,6 +549,13 @@ impl AuthService {
             Some(sid.as_str()),
         )?;
 
+        self.audit(
+            AuditEvent::new("refresh_success", "success")
+                .user(&user.user_id)
+                .session(&sid),
+        )
+        .await;
+
         Ok(LoginResponse {
             token: token_pair.access_token,
             refresh_token: token_pair.refresh_token,
@@ -500,26 +565,38 @@ impl AuthService {
         })
     }
 
-    /// 撤销整个 refresh family,并同步撤销其对应会话(若有)。
+    /// 撤销整个 refresh family,并同步撤销其对应会话(若有),返回该会话 id。
     async fn revoke_family_and_session(
         &self,
         user_id: &str,
         family_id: &str,
         reason: &str,
         ttl_secs: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if family_id.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         self.storage
             .revoke_family(user_id, family_id, Some(reason), ttl_secs)
             .await?;
-        if let Some(session) = self.storage.get_session_by_family(family_id).await? {
-            self.storage
-                .revoke_session(&session.id, reason, ttl_secs)
-                .await?;
+        let Some(session) = self.storage.get_session_by_family(family_id).await? else {
+            return Ok(None);
+        };
+        self.storage
+            .revoke_session(&session.id, reason, ttl_secs)
+            .await?;
+        Ok(Some(session.id))
+    }
+
+    /// 记录 refresh 复用/双花事件。
+    async fn audit_reuse(&self, user_id: &str, session_id: Option<&str>, reason: &str) {
+        let mut event = AuditEvent::new("refresh_reuse_detected", "denied")
+            .user(user_id)
+            .reason(reason);
+        if let Some(sid) = session_id {
+            event = event.session(sid);
         }
-        Ok(())
+        self.audit(event).await;
     }
 
     /// 惰性清理该用户已过期的会话;失败只记日志,不影响登录/刷新。
@@ -535,17 +612,24 @@ impl AuthService {
 
     /// 登出当前会话(幂等):撤销 `claims.sid` 对应会话并联动 refresh family。
     /// 无 `sid` 的存量 access token 没有可撤销的会话,视为成功。
-    pub async fn logout(&self, claims: &super::Claims) -> Result<()> {
+    pub async fn logout(&self, claims: &super::Claims, ctx: &LoginContext) -> Result<()> {
         if let Some(sid) = claims.sid.as_deref() {
             self.storage
                 .revoke_session(sid, "logout", self.jwt_handler.refresh_expire_secs())
                 .await?;
         }
+        let mut event = AuditEvent::new("logout", "success")
+            .user(&claims.sub)
+            .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref());
+        if let Some(sid) = claims.sid.as_deref() {
+            event = event.session(sid);
+        }
+        self.audit(event).await;
         Ok(())
     }
 
     /// 撤销该用户的全部会话(幂等),返回本次被撤销的会话数。
-    pub async fn logout_all(&self, user_id: &str) -> Result<u64> {
+    pub async fn logout_all(&self, user_id: &str, ctx: &LoginContext) -> Result<u64> {
         let ids = self
             .storage
             .revoke_user_sessions(
@@ -554,6 +638,13 @@ impl AuthService {
                 self.jwt_handler.refresh_expire_secs(),
             )
             .await?;
+        self.audit(
+            AuditEvent::new("logout_all", "success")
+                .user(user_id)
+                .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                .reason(&format!("revoked {} sessions", ids.len())),
+        )
+        .await;
         Ok(ids.len() as u64)
     }
 
@@ -582,9 +673,14 @@ impl AuthService {
 
     /// 撤销该用户名下的指定会话。会话不存在、不属于该用户或已不再有效时返回 `false`
     /// (调用方统一按 404 处理,避免枚举他人会话 id)。
-    pub async fn revoke_user_session(&self, user_id: &str, session_id: &str) -> Result<bool> {
+    pub async fn revoke_user_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        ctx: &LoginContext,
+    ) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        match self.storage.get_session(session_id).await? {
+        let revoked = match self.storage.get_session(session_id).await? {
             Some(s) if s.user_id == user_id && s.revoked_at.is_none() && s.expires_at > now => {
                 self.storage
                     .revoke_session(
@@ -592,10 +688,20 @@ impl AuthService {
                         "session revoked by user",
                         self.jwt_handler.refresh_expire_secs(),
                     )
-                    .await
+                    .await?
             }
-            _ => Ok(false),
+            _ => false,
+        };
+        if revoked {
+            self.audit(
+                AuditEvent::new("session_revoked", "success")
+                    .user(user_id)
+                    .session(session_id)
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref()),
+            )
+            .await;
         }
+        Ok(revoked)
     }
 
     /// 获取用户
@@ -655,23 +761,42 @@ impl AuthService {
         }
     }
 
-    /// 停用用户
-    pub fn deactivate_user(&self, user_id: &str) -> Result<()> {
-        let mut users = self.users.write();
-        let user = users
-            .get_mut(user_id)
-            .ok_or(DataChainError::UserNotFound(user_id.to_string()))?;
-        user.deactivate();
-        Ok(())
+    /// 停用用户:同事务写 SQLite(is_active=0)并撤销其全部会话与 refresh family,
+    /// 随后清本进程缓存并同步内存副本、写审计。返回被撤销的会话数。
+    /// 用户在 SQLite 中不存在时返回 `UserNotFound`。
+    pub async fn deactivate_user(&self, user_id: &str) -> Result<u64> {
+        let revoked = self
+            .storage
+            .deactivate_user_and_revoke_sessions(
+                user_id,
+                "user deactivated",
+                self.jwt_handler.refresh_expire_secs(),
+            )
+            .await?
+            .ok_or_else(|| DataChainError::UserNotFound(user_id.to_string()))?;
+        if let Some(user) = self.users.write().get_mut(user_id) {
+            user.deactivate();
+        }
+        self.audit(
+            AuditEvent::new("user_deactivated", "success")
+                .user(user_id)
+                .reason(&format!("revoked {} sessions", revoked)),
+        )
+        .await;
+        Ok(revoked)
     }
 
-    /// 激活用户
-    pub fn activate_user(&self, user_id: &str) -> Result<()> {
-        let mut users = self.users.write();
-        let user = users
-            .get_mut(user_id)
-            .ok_or(DataChainError::UserNotFound(user_id.to_string()))?;
-        user.activate();
+    /// 激活用户:只写 SQLite(is_active=1)并清缓存,**不**恢复任何已撤销的会话。
+    /// 用户在 SQLite 中不存在时返回 `UserNotFound`。
+    pub async fn activate_user(&self, user_id: &str) -> Result<()> {
+        if !self.storage.set_user_active(user_id, true).await? {
+            return Err(DataChainError::UserNotFound(user_id.to_string()));
+        }
+        if let Some(user) = self.users.write().get_mut(user_id) {
+            user.activate();
+        }
+        self.audit(AuditEvent::new("user_activated", "success").user(user_id))
+            .await;
         Ok(())
     }
 }

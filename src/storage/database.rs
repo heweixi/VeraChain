@@ -66,6 +66,110 @@ impl From<SessionRow> for SessionRecord {
     }
 }
 
+/// 审计日志保留期(秒):90 天。启动时清理更早的行。
+pub const AUDIT_RETENTION_SECS: i64 = 90 * 24 * 3600;
+
+/// 审计字段入库前的长度上限(字符数)。
+const AUDIT_USERNAME_MAX_CHARS: usize = 128;
+const AUDIT_USER_AGENT_MAX_CHARS: usize = 200;
+const AUDIT_REASON_MAX_CHARS: usize = 200;
+
+/// 认证审计事件(auth_audit_log 一行)。
+///
+/// 只记录事件元数据:**不得**放入密码、token、jti 或明文 IP;`ip_hash` 为 HMAC 摘要。
+/// 文本字段在 [`Storage::append_audit_event`] 入库时统一截断并转义控制字符。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditEvent {
+    /// 自增主键;写入时忽略,读取时填充。
+    pub id: i64,
+    /// Unix 秒。
+    pub ts: i64,
+    pub event_type: String,
+    pub user_id: Option<String>,
+    pub username_attempted: Option<String>,
+    pub session_id: Option<String>,
+    pub ip_hash: Option<String>,
+    pub user_agent: Option<String>,
+    /// `success` / `failure` / `denied`。
+    pub result: String,
+    pub reason: Option<String>,
+}
+
+impl AuditEvent {
+    /// 以当前时间创建一个事件。
+    pub fn new(event_type: &str, result: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().timestamp(),
+            event_type: event_type.to_string(),
+            result: result.to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn user(mut self, user_id: &str) -> Self {
+        self.user_id = Some(user_id.to_string());
+        self
+    }
+
+    pub fn username(mut self, username: &str) -> Self {
+        self.username_attempted = Some(username.to_string());
+        self
+    }
+
+    pub fn session(mut self, session_id: &str) -> Self {
+        self.session_id = Some(session_id.to_string());
+        self
+    }
+
+    pub fn client(mut self, ip_hash: Option<&str>, user_agent: Option<&str>) -> Self {
+        self.ip_hash = ip_hash.map(str::to_string);
+        self.user_agent = user_agent.map(str::to_string);
+        self
+    }
+
+    pub fn reason(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.to_string());
+        self
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    id: i64,
+    ts: i64,
+    event_type: String,
+    user_id: Option<String>,
+    username_attempted: Option<String>,
+    session_id: Option<String>,
+    ip_hash: Option<String>,
+    user_agent: Option<String>,
+    result: String,
+    reason: Option<String>,
+}
+
+/// 截断到 `max_chars` 个字符,并把控制字符(换行、ESC/ANSI 序列等)转义为可见文本,
+/// 防止日志注入与终端转义序列污染。
+fn sanitize_audit_text(raw: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for c in raw.chars().take(max_chars) {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let code = c as u32;
+                if code <= 0xff {
+                    out.push_str(&format!("\\x{:02x}", code));
+                } else {
+                    out.push_str(&format!("\\u{{{:x}}}", code));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 数据库存储
 pub struct Storage {
     pool: Pool<Sqlite>,
@@ -1092,6 +1196,80 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
+    // ==================== 认证审计日志 ====================
+
+    /// 追加一条审计事件。文本字段会截断并转义控制字符;用户名同时规范化为小写。
+    pub async fn append_audit_event(&self, event: &AuditEvent) -> Result<()> {
+        let username = event
+            .username_attempted
+            .as_deref()
+            .map(|u| sanitize_audit_text(&u.trim().to_lowercase(), AUDIT_USERNAME_MAX_CHARS));
+        let user_agent = event
+            .user_agent
+            .as_deref()
+            .map(|ua| sanitize_audit_text(ua, AUDIT_USER_AGENT_MAX_CHARS));
+        let reason = event
+            .reason
+            .as_deref()
+            .map(|r| sanitize_audit_text(r, AUDIT_REASON_MAX_CHARS));
+        sqlx::query(
+            r#"
+            INSERT INTO auth_audit_log
+                (ts, event_type, user_id, username_attempted, session_id,
+                 ip_hash, user_agent, result, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.ts)
+        .bind(sanitize_audit_text(&event.event_type, 64))
+        .bind(&event.user_id)
+        .bind(username)
+        .bind(&event.session_id)
+        .bind(&event.ip_hash)
+        .bind(user_agent)
+        .bind(sanitize_audit_text(&event.result, 32))
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按写入顺序(id 升序)读取最多 `limit` 条审计事件。
+    pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEvent>> {
+        let rows = sqlx::query_as::<_, AuditRow>(
+            "SELECT id, ts, event_type, user_id, username_attempted, session_id, \
+                    ip_hash, user_agent, result, reason \
+             FROM auth_audit_log ORDER BY id ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditEvent {
+                id: r.id,
+                ts: r.ts,
+                event_type: r.event_type,
+                user_id: r.user_id,
+                username_attempted: r.username_attempted,
+                session_id: r.session_id,
+                ip_hash: r.ip_hash,
+                user_agent: r.user_agent,
+                result: r.result,
+                reason: r.reason,
+            })
+            .collect())
+    }
+
+    /// 删除 `ts < cutoff_ts` 的审计行(启动时按保留期清理),返回删除行数。
+    pub async fn purge_audit_before(&self, cutoff_ts: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM auth_audit_log WHERE ts < ?")
+            .bind(cutoff_ts)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 设置 is_active 缓存 TTL(默认 5 秒;`Duration::ZERO` 表示禁用缓存)。
     pub fn set_active_cache_ttl(&self, ttl: Duration) {
         self.active_cache_ttl_ms
@@ -1140,13 +1318,42 @@ impl Storage {
             .bind(user_id)
             .execute(&self.pool)
             .await?;
-        // 写入后同步清本进程缓存,并让在途的旧读不再回填。
-        {
-            let mut cache = self.active_cache.lock();
-            self.active_generation.fetch_add(1, Ordering::SeqCst);
-            cache.remove(user_id);
-        }
+        self.invalidate_active_cache(user_id);
         Ok(result.rows_affected() > 0)
+    }
+
+    /// 停用用户并在**同一事务**内撤销其全部会话与 refresh family。
+    ///
+    /// 返回 `None` 表示用户不存在;`Some(n)` 为本次被撤销的会话数。
+    /// 提交后同步清本进程 is_active 缓存,其他进程最迟一个 TTL 内感知。
+    pub async fn deactivate_user_and_revoke_sessions(
+        &self,
+        user_id: &str,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<u64>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query("UPDATE users SET is_active = 0 WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let revoked =
+            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now).await?;
+        tx.commit().await?;
+        self.invalidate_active_cache(user_id);
+        Ok(Some(revoked.len() as u64))
+    }
+
+    /// 清本进程 is_active 缓存,并让在途的旧读不再回填。
+    fn invalidate_active_cache(&self, user_id: &str) {
+        let mut cache = self.active_cache.lock();
+        self.active_generation.fetch_add(1, Ordering::SeqCst);
+        cache.remove(user_id);
     }
 
     // ==================== 登录限速计数器 ====================

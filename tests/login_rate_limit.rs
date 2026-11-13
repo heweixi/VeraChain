@@ -121,7 +121,7 @@ async fn unknown_user_wrong_password_and_disabled_account_look_identical() {
     let dir = tempfile::tempdir().unwrap();
     let (router, auth) = router_with_alice(&dir).await;
     let bob_id = auth.get_user("bob").unwrap().user_id;
-    auth.deactivate_user(&bob_id).unwrap();
+    auth.deactivate_user(&bob_id).await.unwrap();
 
     let unknown = try_login(&router, "nobody", "whatever-pass").await;
     let wrong = try_login(&router, "alice", "wrong-password").await;
@@ -145,7 +145,7 @@ async fn service_with_limits(
     let service = AuthService::new("svc-test-secret".to_string(), 24, storage.clone())
         .with_login_limits(limits);
     for name in ["u1", "u2", "u3", "u4", "u5"] {
-        service
+        let user = service
             .register(&RegisterRequest {
                 username: name.to_string(),
                 password: "password123".to_string(),
@@ -153,6 +153,8 @@ async fn service_with_limits(
                 role: None,
             })
             .unwrap();
+        // 启用状态以 SQLite 为权威,用户需落库才能登录。
+        storage.save_user(&user).await.unwrap();
     }
     (service, storage)
 }

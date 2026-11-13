@@ -105,19 +105,26 @@ pub async fn register(
     }
 }
 
+/// 提取请求的客户端上下文(会话与审计用)。仅使用对端地址;不信任 X-Forwarded-For。
+fn client_context(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> LoginContext {
+    LoginContext {
+        client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
+    }
+}
+
 pub async fn login(
     State(state): State<AppState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> axum::response::Response {
-    let ctx = LoginContext {
-        // 仅使用对端地址;不信任 X-Forwarded-For。
-        client_ip: connect_info.map(|ConnectInfo(addr)| addr.ip().to_string()),
-        user_agent: headers
-            .get(header::USER_AGENT)
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()),
-    };
+    let ctx = client_context(connect_info, &headers);
     match state.auth_service.login(&req, &ctx).await {
         Ok(resp) => (StatusCode::OK, Json(ApiResponse::success(resp))).into_response(),
         Err(crate::error::DataChainError::TooManyAttempts { retry_after_secs }) => (
@@ -170,8 +177,11 @@ fn internal_error(context: &str, e: crate::error::DataChainError) -> axum::respo
 pub async fn logout(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
-    match state.auth_service.logout(&claims).await {
+    let ctx = client_context(connect_info, &headers);
+    match state.auth_service.logout(&claims, &ctx).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error("登出失败", e),
     }
@@ -181,8 +191,11 @@ pub async fn logout(
 pub async fn logout_all(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
-    match state.auth_service.logout_all(&claims.sub).await {
+    let ctx = client_context(connect_info, &headers);
+    match state.auth_service.logout_all(&claims.sub, &ctx).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error("全部登出失败", e),
     }
@@ -209,10 +222,13 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(session_id): Path<String>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
+    let ctx = client_context(connect_info, &headers);
     match state
         .auth_service
-        .revoke_user_session(&claims.sub, &session_id)
+        .revoke_user_session(&claims.sub, &session_id, &ctx)
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
