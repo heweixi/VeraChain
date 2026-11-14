@@ -408,3 +408,243 @@ async fn unlock_unknown_user_fails_and_mentions_username() {
     );
     assert!(f.events_of("login_unlocked").await.is_empty());
 }
+
+// ================================================================ C7:HTTP 管理员解锁(TDD Red)
+//
+// 公开 seam:`POST /api/v1/admin/users/:user_id/unlock`(body `{}`)。
+// 成功响应 `{"success":true,"data":{"user_id":<目标>,"unlocked":<bool>}}`;
+// 未知用户 404 `{"error":"user not found"}`;非管理员 403;无 token 401。
+// 实现前预期 Red 原因:路由不存在,POST 返回 404/405,管理员 200 断言失败。
+// 注意:AuthSettings 小阈值(2)对所有用户生效,所以管理员及其他角色各只登录一次,且只用正确密码。
+
+const ROOT_PW: &str = "rootpass12345";
+const AUDITOR_PW: &str = "auditorpass12";
+const GUEST_PW: &str = "guestpass1234";
+
+fn unlock_uri(target: &str) -> String {
+    format!("/api/v1/admin/users/{}/unlock", target)
+}
+
+impl Fixture {
+    /// 在同一 state 里追加管理员与其他角色用户(auth_service 为共享 Arc,router 立即可见)。
+    async fn seed_roles(&self) {
+        seed_user(&self.state, "root", ROOT_PW, Role::Admin).await;
+        seed_user(&self.state, "auditor1", AUDITOR_PW, Role::Auditor).await;
+        seed_user(&self.state, "guest1", GUEST_PW, Role::Guest).await;
+    }
+
+    async fn http_unlock(&self, target: &str, token: Option<&str>) -> Resp {
+        send(&self.router, post(&unlock_uri(target), token, json!({}))).await
+    }
+
+    async fn status_of(&self, req: axum::http::Request<axum::body::Body>) -> StatusCode {
+        send(&self.router, req).await.status
+    }
+}
+
+/// 1. 管理员 200 + 响应形状;之后 alice 正确密码登录 200。
+#[tokio::test]
+async fn http_unlock_by_admin_clears_lock_and_returns_shape() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+    f.trip("alice").await;
+    assert_eq!(
+        f.login("alice", ALICE_PW).await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "锁内正确密码也应 429"
+    );
+
+    let alice_id = f.user_id("alice");
+    let r = f.http_unlock(&alice_id, Some(&admin)).await;
+
+    assert_eq!(r.status, StatusCode::OK, "管理员解锁应 200: {}", r.body);
+    assert_eq!(
+        r.body,
+        json!({"success": true, "data": {"user_id": alice_id, "unlocked": true}})
+    );
+    assert_eq!(
+        f.login("alice", ALICE_PW).await.status,
+        StatusCode::OK,
+        "解锁后正确密码应立即 200"
+    );
+}
+
+/// 2. 无锁时管理员调用 200 且 unlocked=false;重复调用仍 200。
+#[tokio::test]
+async fn http_unlock_without_lock_is_idempotent_and_unlocked_false() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+    let alice_id = f.user_id("alice");
+
+    for _ in 0..2 {
+        let r = f.http_unlock(&alice_id, Some(&admin)).await;
+        assert_eq!(r.status, StatusCode::OK, "无锁时也应 200: {}", r.body);
+        assert_eq!(
+            r.body,
+            json!({"success": true, "data": {"user_id": alice_id, "unlocked": false}})
+        );
+    }
+    assert_eq!(f.login("alice", ALICE_PW).await.status, StatusCode::OK);
+}
+
+/// 3. 审计:login_unlocked 带 actor=管理员、user=目标,reason `cleared locks=N counters=M`。
+#[tokio::test]
+async fn http_unlock_writes_audit_with_actor() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+    f.trip("alice").await;
+    assert!(f.events_of("login_unlocked").await.is_empty());
+
+    let alice_id = f.user_id("alice");
+    let r = f.http_unlock(&alice_id, Some(&admin)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    let rows = f.events_of("login_unlocked").await;
+    assert_eq!(rows.len(), 1, "应恰好一条 login_unlocked: {:?}", rows);
+    let ev = &rows[0];
+    assert_eq!(ev.user_id.as_deref(), Some(alice_id.as_str()));
+    assert_eq!(
+        ev.actor_user_id.as_deref(),
+        Some(f.user_id("root").as_str()),
+        "HTTP 解锁应记录管理员为操作者"
+    );
+    assert_eq!(ev.result, "success");
+    let reason = ev.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.starts_with("cleared locks=1 counters="),
+        "reason 应形如 `cleared locks=N counters=M` 且清除 1 条锁: {:?}",
+        reason
+    );
+    let counters = reason.trim_start_matches("cleared locks=1 counters=");
+    assert!(
+        !counters.is_empty() && counters.chars().all(|c| c.is_ascii_digit()),
+        "counters 应为数字: {:?}",
+        reason
+    );
+}
+
+/// 4. 未知用户 id → 404 `{"error":"user not found"}`,不写审计。
+#[tokio::test]
+async fn http_unlock_unknown_user_is_404_without_audit() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+
+    let r = f.http_unlock("no-such-user-id", Some(&admin)).await;
+
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.body["error"], "user not found");
+    assert!(f.events_of("login_unlocked").await.is_empty());
+}
+
+/// 5. User/Auditor/Guest → 403;无 token → 401;被拒时锁不被清除、不写审计。
+#[tokio::test]
+async fn http_unlock_denied_for_non_admin_and_anonymous_keeps_lock() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    // bob 作为 User 角色的调用者(只登录一次),alice 为被锁目标。
+    let bob = f.access_token("bob", BOB_PW).await;
+    let auditor = f.access_token("auditor1", AUDITOR_PW).await;
+    let guest = f.access_token("guest1", GUEST_PW).await;
+    f.trip("alice").await;
+    let alice_id = f.user_id("alice");
+
+    for (label, token) in [("user", &bob), ("auditor", &auditor), ("guest", &guest)] {
+        let r = f.http_unlock(&alice_id, Some(token)).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{} 应 403: {}", label, r.body);
+    }
+    let anon = f.http_unlock(&alice_id, None).await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED, "无 token 应 401");
+
+    assert_eq!(
+        f.login("alice", ALICE_PW).await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "被拒绝时 alice 的锁不应被清除"
+    );
+    assert!(f.events_of("login_unlocked").await.is_empty());
+}
+
+/// 6. 其他方法不被误授权:管理员得非 200(405/404 皆可),非管理员 403,无 token 401。
+#[tokio::test]
+async fn http_unlock_other_methods_are_not_authorized() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+    let auditor = f.access_token("auditor1", AUDITOR_PW).await;
+    f.trip("alice").await;
+    let alice_id = f.user_id("alice");
+    let uri = unlock_uri(&alice_id);
+
+    let admin_get = f.status_of(get(&uri, Some(&admin))).await;
+    assert_ne!(admin_get, StatusCode::OK, "GET 不应解锁成功");
+    assert!(
+        admin_get == StatusCode::METHOD_NOT_ALLOWED || admin_get == StatusCode::NOT_FOUND,
+        "管理员 GET 应 405/404,实际 {}",
+        admin_get
+    );
+    assert_eq!(
+        f.status_of(get(&uri, Some(&auditor))).await,
+        StatusCode::FORBIDDEN,
+        "非管理员 GET 应 403(fail-closed 前缀)"
+    );
+    assert_eq!(
+        f.status_of(get(&uri, None)).await,
+        StatusCode::UNAUTHORIZED,
+        "无 token GET 应 401"
+    );
+
+    assert_eq!(
+        f.login("alice", ALICE_PW).await.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "GET 不应清除锁"
+    );
+    assert!(f.events_of("login_unlocked").await.is_empty());
+}
+
+/// 7. 回归:未实现的 admin 子路径对非管理员仍 403。
+#[tokio::test]
+async fn http_unknown_admin_subpath_still_forbidden_for_non_admin() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let auditor = f.access_token("auditor1", AUDITOR_PW).await;
+    let guest = f.access_token("guest1", GUEST_PW).await;
+
+    for token in [&auditor, &guest] {
+        assert_eq!(
+            f.status_of(get("/api/v1/admin/users/x/unknown", Some(token)))
+                .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+}
+
+/// 8. pwchg 锁也被 HTTP unlock 清除。
+#[tokio::test]
+async fn http_unlock_clears_change_password_lock() {
+    let f = user_fixture().await;
+    f.seed_roles().await;
+    let admin = f.access_token("root", ROOT_PW).await;
+    let token = f.access_token("alice", ALICE_PW).await;
+
+    for i in 1..=2 {
+        let r = f.change(&token, &format!("bad-old-pass-{}", i), NEW_PW).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        f.change(&token, "bad-old-pass-3", NEW_PW).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let r = f.http_unlock(&f.user_id("alice"), Some(&admin)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body["data"]["unlocked"], true);
+
+    assert_eq!(
+        f.change(&token, ALICE_PW, NEW_PW).await.status,
+        StatusCode::NO_CONTENT,
+        "解锁后正确旧密码应可改密"
+    );
+}
