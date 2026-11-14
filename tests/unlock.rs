@@ -135,7 +135,12 @@ impl Fixture {
     async fn trip(&self, user: &str) -> Resp {
         for i in 0..2 {
             let r = self.login(user, "wrong-password").await;
-            assert_eq!(r.status, StatusCode::UNAUTHORIZED, "第 {} 次失败应为 401", i + 1);
+            assert_eq!(
+                r.status,
+                StatusCode::UNAUTHORIZED,
+                "第 {} 次失败应为 401",
+                i + 1
+            );
         }
         let r = self.login(user, "wrong-password").await;
         assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "第 3 次应触发锁定");
@@ -277,7 +282,9 @@ async fn unlock_clears_change_password_lock() {
     let token = f.access_token("alice", ALICE_PW).await;
 
     for i in 1..=2 {
-        let r = f.change(&token, &format!("bad-old-pass-{}", i), NEW_PW).await;
+        let r = f
+            .change(&token, &format!("bad-old-pass-{}", i), NEW_PW)
+            .await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     }
     let locked = f.change(&token, "bad-old-pass-3", NEW_PW).await;
@@ -307,7 +314,11 @@ async fn unlock_does_not_affect_other_users() {
 
     assert_eq!(f.login("alice", ALICE_PW).await.status, StatusCode::OK);
     let bob = f.login("bob", BOB_PW).await;
-    assert_eq!(bob.status, StatusCode::TOO_MANY_REQUESTS, "bob 的锁不应被清除");
+    assert_eq!(
+        bob.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "bob 的锁不应被清除"
+    );
     assert_eq!(retry_secs(&bob), 900);
 }
 
@@ -318,10 +329,19 @@ async fn unlock_does_not_clear_ip_dimension() {
     let f = fixture(settings(1000, 2)).await;
     for i in 0..2 {
         let r = f.login("alice", "wrong-password").await;
-        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "第 {} 次失败应为 401", i + 1);
+        assert_eq!(
+            r.status,
+            StatusCode::UNAUTHORIZED,
+            "第 {} 次失败应为 401",
+            i + 1
+        );
     }
     let limited = f.login("alice", ALICE_PW).await;
-    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS, "IP 超限应 429");
+    assert_eq!(
+        limited.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "IP 超限应 429"
+    );
 
     f.unlock_ok("alice").await;
 
@@ -363,11 +383,18 @@ async fn unlock_writes_login_unlocked_audit_without_actor() {
     );
 
     // 审计与 CLI 输出不含密码。
-    let dump = format!("{:?}", f.state.storage.list_audit_events(1000).await.unwrap());
+    let dump = format!(
+        "{:?}",
+        f.state.storage.list_audit_events(1000).await.unwrap()
+    );
     let cli_output = combined(&out);
     for secret in [ALICE_PW, "wrong-password"] {
         assert!(!dump.contains(secret), "审计不得含密码 {}", secret);
-        assert!(!cli_output.contains(secret), "CLI 输出不得含密码 {}", secret);
+        assert!(
+            !cli_output.contains(secret),
+            "CLI 输出不得含密码 {}",
+            secret
+        );
     }
 }
 
@@ -554,7 +581,13 @@ async fn http_unlock_denied_for_non_admin_and_anonymous_keeps_lock() {
 
     for (label, token) in [("user", &bob), ("auditor", &auditor), ("guest", &guest)] {
         let r = f.http_unlock(&alice_id, Some(token)).await;
-        assert_eq!(r.status, StatusCode::FORBIDDEN, "{} 应 403: {}", label, r.body);
+        assert_eq!(
+            r.status,
+            StatusCode::FORBIDDEN,
+            "{} 应 403: {}",
+            label,
+            r.body
+        );
     }
     let anon = f.http_unlock(&alice_id, None).await;
     assert_eq!(anon.status, StatusCode::UNAUTHORIZED, "无 token 应 401");
@@ -630,7 +663,9 @@ async fn http_unlock_clears_change_password_lock() {
     let token = f.access_token("alice", ALICE_PW).await;
 
     for i in 1..=2 {
-        let r = f.change(&token, &format!("bad-old-pass-{}", i), NEW_PW).await;
+        let r = f
+            .change(&token, &format!("bad-old-pass-{}", i), NEW_PW)
+            .await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     }
     assert_eq!(
