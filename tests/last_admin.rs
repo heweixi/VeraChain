@@ -211,7 +211,11 @@ async fn cli_cannot_deactivate_the_only_active_admin() {
 
     // 普通用户不受保护影响。
     let out = f.run_cli(&["user", "deactivate", "victim"]).await;
-    assert!(out.status.success(), "停用普通用户应成功: {}", combined(&out));
+    assert!(
+        out.status.success(),
+        "停用普通用户应成功: {}",
+        combined(&out)
+    );
     assert!(!f.is_active(&victim_id).await);
     assert!(f.is_active(&root_id).await);
 }
@@ -301,7 +305,11 @@ async fn third_admin_scenario_service_layer_protects_last_admin() {
     assert!(matches!(r, Err(DataChainError::LastAdminProtected)));
 
     assert!(f.is_active(&root3_id).await);
-    assert_eq!(f.profile(&root3).await, StatusCode::OK, "root3 会话不受影响");
+    assert_eq!(
+        f.profile(&root3).await,
+        StatusCode::OK,
+        "root3 会话不受影响"
+    );
 
     let denied = f.events_of("user_deactivate_denied").await;
     assert_eq!(denied.len(), 2);
@@ -374,7 +382,11 @@ async fn concurrent_mutual_deactivation_leaves_exactly_one_admin() {
             .filter(|r| matches!(**r, Err(DataChainError::LastAdminProtected)))
             .count();
         assert_eq!(oks, 1, "第 {} 轮恰好一个成功: {:?} / {:?}", round, r1, r2);
-        assert_eq!(protected, 1, "第 {} 轮恰好一个被保护: {:?} / {:?}", round, r1, r2);
+        assert_eq!(
+            protected, 1,
+            "第 {} 轮恰好一个被保护: {:?} / {:?}",
+            round, r1, r2
+        );
         assert_eq!(
             active_admin_count(&pool).await,
             1,
