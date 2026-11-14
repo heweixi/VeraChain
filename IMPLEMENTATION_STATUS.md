@@ -1,6 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> ✅ **认证加固第二批验证声明(以此为准)**:分支 `feat/auth-hardening-2`(基于 main `3336e83`,HEAD `95a68b8`)。最后核实:2026-11-14。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full95a68b8-20261114-052129):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 30 个测试目标共 **357 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `3336e83` 持平,无新增;迁移 001-013。基线 `3336e83` 为 251 passed、clippy lib 22、迁移到 011;较基线 +106 passed、+7 个测试目标(`admin_api`、`audit_scan_stream`、`auth_config`、`change_password`、`login_lockout`、`refresh_failure_audit`、`trusted_proxies`)。⚠️ 本文档未逐目标列出 357 的分项计数(验证汇总只给出总数,分项以 `cargo test` 原始日志为准)。本批能力、接口契约与已知限制见 §2.8;设计与决策见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch2-design.md`。下文 251 passed 的声明是上一层历史数字,其所指测试除设计文档要求改写的 `login_rate_limit` 跨窗口边界用例(与 B5 冲突,按设计改为 IP 维度;本文未逐条核对改写后的用例)外,仍包含在 357 中。
+> ✅ **认证加固第三批验证声明(以此为准)**:分支 `feat/auth-hardening-3`(基于 main `09fa049`,代码 HEAD `9837394`)。最后核实:2026-11-14。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full9837394-20261114-172325):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 36 个测试目标共 **402 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `09fa049` 持平,无新增;迁移仍为 001-013(本批无迁移)。基线 `09fa049` 为 357 passed、36 个目标中新增 6 个(`bcrypt_async` 3、`login_sqlite_hash` 3、`password_policy_registration` 9、`cli_passwd` 7、`last_admin` 6、`unlock` 17,合计 +45,与 402-357 一致)。⚠️ 本文档未逐目标列出 402 的分项计数。本批能力、契约与已知限制见 §2.9;设计与决策见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch3-design.md`。下文第二批 357 passed 的声明是上一层历史数字。
+>
+> ✅ **认证加固第二批验证声明(上一层历史)**:分支 `feat/auth-hardening-2`(基于 main `3336e83`,HEAD `95a68b8`)。最后核实:2026-11-14。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full95a68b8-20261114-052129):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 30 个测试目标共 **357 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `3336e83` 持平,无新增;迁移 001-013。基线 `3336e83` 为 251 passed、clippy lib 22、迁移到 011;较基线 +106 passed、+7 个测试目标(`admin_api`、`audit_scan_stream`、`auth_config`、`change_password`、`login_lockout`、`refresh_failure_audit`、`trusted_proxies`)。⚠️ 本文档未逐目标列出 357 的分项计数(验证汇总只给出总数,分项以 `cargo test` 原始日志为准)。本批能力、接口契约与已知限制见 §2.8;设计与决策见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch2-design.md`。下文 251 passed 的声明是上一层历史数字,其所指测试除设计文档要求改写的 `login_rate_limit` 跨窗口边界用例(与 B5 冲突,按设计改为 IP 维度;本文未逐条核对改写后的用例)外,仍包含在 357 中。
 >
 > ✅ **(上一层历史)后续加固验证声明(`b3b458b`,251 passed)**:分支 `feat/followups-hardening`(基于 main `2498be0`,HEAD `b3b458b`)。最后核实:2026-11-14。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 fullb3b458b-20261114-024913,orchestrator 亲自运行):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 23 个测试目标全部通过,共 **251 passed、0 failed**(lib 111、bin 0、api_integration 21、auth_audit 13、auth_claims 5、auth_internal_errors 7、auth_middleware_session 12、chain_validation_cli 1、cli_user_status 3、connect_info_rate_limit 5、data_corruption_auth_state 4、data_corruption_authoritative 4、data_corruption_cli 4、data_corruption_outbox 9、data_corruption_projection 3、data_corruption_startup 5、login_rate_limit 9、migration_upgrade_from_legacy_pending 1、refresh_reuse 3、sessions_api 16、storage_sessions 4、websocket_integration 11、doctest 0);`cargo clippy --all-targets`(无 `-D warnings`)无 error,lib 22 条警告与 main 基线持平,本分支无新增(`tests/common/corrupt.rs` 的 `dead_code` 告警为共享 helper,未处理)。reviewer 行为级审查:Important 0;Minor 1/3/4 已修,Minor 2 登记为后续(见 §四)。本分支把原登记的 8 项后续项更新为已完成并附证据,见 §四「后续项完成情况(`feat/followups-hardening`)」。**234 passed(`65c7c4c`,作业 pimergeo)是上一层历史数字**;210(`ecae5e0`)、168、139、120 等均为合并前/历史数字,下文凡出现"234 passed"的证据列,其所指测试均仍包含在本次 251 passed 中,除非该行另有说明。
 > ✅ **(历史)合并后验证声明(`65c7c4c`,234 passed)**:本分支 `feat/pending-identity-transactions-local`(身份交易 `Idempotency-Key` + pending 身份交易持久化,§2.3.1)已合并 `main`(`ecae5e0`:数据损坏处置 §2.6 + 认证加固 §2.7),HEAD `65c7c4c`(= `a5b6f80` 迁移改名 007/008→010/011 + `6bc1d9d` `git merge main` + `65c7c4c` 回归测试)。最后核实:2026-11-13。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 pimergeo,orchestrator 亲自复跑,避开登录限速测试的 15 分钟窗口边界):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 19 个测试目标全部 ok,共 **234 passed、0 failed**(lib 110、bin 0、api_integration 21、auth_audit 13、auth_claims 5、auth_middleware_session 12、chain_validation_cli 1、cli_user_status 3、connect_info_rate_limit 5、data_corruption_authoritative 4、data_corruption_cli 4、data_corruption_outbox 9、data_corruption_projection 3、data_corruption_startup 5、login_rate_limit 8、sessions_api 16、storage_sessions 4、websocket_integration 11、doctest 0);`cargo clippy --all-targets`(无 `-D warnings`)无 error,lib 22 条警告(与 main 基线持平,无新增),`tests/common/corrupt.rs` 的 `dead_code` 告警为遗留共享 helper(未处理)。reviewer 对合并做了行为级审查,无 Important。设计文档:`docs/superpowers/specs/2026-11-13-auth-hardening-design.md`、`docs/superpowers/specs/2026-11-11-data-corruption-policy-design.md`。
@@ -333,6 +335,8 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 - 🔺 `jwt.expire_hours` 限制 1..=720;`[auth]` 未知键与新环境变量非法值使启动失败。
 - ✅ 不变:CLI 签名(`user deactivate|activate` 等)、`create_auth_service`/`AuthService::new`/`with_login_limits`/`LoginLimits` 字段、`refresh_token`、`deactivate_user`/`activate_user`、`AppState` 字段、`RateLimiter::new/default`、`AUDIT_RETENTION_SECS`(依据设计文档 §4,本文未逐项反查源码)。
 
+> ✅ **(第三批更新)** 下列"已知限制/第三批候选"中的以下项已在第三批实现,见 §2.9:解锁入口(B8)、bcrypt 阻塞 async(B9,`spawn_blocking`)、最后一名活跃管理员保护(B10)、CLI `passwd` 与 login 读 SQLite 哈希(B11)、密码策略用于注册/CLI 创建(B12)。其余候选项仍未做,清单见 §2.9「推迟项」。
+
 #### 已知限制(⚠️)与第三批候选(⏳)
 
 - ⚠️ bcrypt 哈希/验密在 async 任务中同步执行,会阻塞运行时工作线程(第三批候选:`spawn_blocking`)。
@@ -357,7 +361,41 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 | B-5 | 无"最后一名活跃管理员"保护,管理员可互停 | ⚠️ 设计决策 D4,第三批 |
 | B-6 | 登录/改密并发新会话可能存活;落锁并发漏过少量在途请求 | ⚠️ |
 
+### 2.9 认证加固(第三批 B8-B12,分支 `feat/auth-hardening-3`,代码 HEAD `9837394`)
+
+最后核实:2026-11-14。设计与决策:`docs/superpowers/specs/2026-11-14-auth-hardening-batch3-design.md`。证据统一为:本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full9837394-20261114-172325):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 36 个测试目标 **402 passed、0 failed**;`cargo clippy --all-targets` lib 22 条,与基线持平无新增;迁移仍 001-013(**本批无迁移**)。reviewer 行为级审查:阻塞 0;重要 2(I-1 `register` 把 bcrypt 内部错误按 400 回显,已修为 500 `internal error`;I-2 unlock 只认内存用户表,登记为已知限制);建议 S-1..S-5 登记。
+
+#### 能力
+
+| 编号 | 能力 | 状态 | 测试 | 要点与限制 |
+|---|---|---|---|---|
+| B8 | 解锁入口 | ✅ | `tests/unlock.rs`(17:CLI 9 + HTTP 8) | CLI `user unlock <username>`;HTTP `POST /api/v1/admin/users/:user_id/unlock`(权限复用 `user:status_admin`,不新增 Permission)。清除 `user:<规范化用户名>` 与 `pwchg:<user_id>` 两个 key 在 `login_lockouts` 与 `login_rate_counters` 的行(退避级别归零,下次锁定从 `lockout_base_secs` 起算),**不清 IP 维度**。key 由 login/change_password/unlock 共用同一构造函数,大小写变体(`ALICE`)的锁同样被清除。审计 `login_unlocked`(HTTP 带 `actor_user_id`,CLI 无 actor,reason `cleared locks=N counters=M`,无锁时也写,幂等)。HTTP:200 `{"user_id","unlocked"}`、401/403、404 `user not found`、500;其他方法与 `/api/v1/admin/*` 下未实现路径仍 fail-closed。⚠️ 对仅存在于库中而内存无的用户返回 404(重启服务后可用)。滥用面:拥有 `user:status_admin` 的账号可反复解锁目标以获得无限猜密码机会,每次均有审计,建议监控 `login_unlocked` |
+| B9 | bcrypt 改 `spawn_blocking` | ✅ | `tests/bcrypt_async.rs`(3:正确密码登录、不存在用户 dummy bcrypt、改密) | `login`、`change_password`、`register_validated`、`reset_password` 的哈希/验密走私有 `hash_password_blocking`/`verify_password_blocking`;dummy 哈希的 `OnceLock` 首次初始化也在 blocking 闭包内;错误文本固定不含密码/哈希。同步 `register`/`register_with_role` 保留(阻塞、不校验策略,仅供测试与受信调用方)。⚠️ 未加 Semaphore:`register` 无限速,匿名并发注册可占满 blocking 池;测试用 ticker 阈值 `max(3, 耗时ms/5/4)`,慢机器若偶发应改为"最大 tick 间隔小于总耗时一半" |
+| B10 | 最后一名活跃管理员保护 | ✅ | `tests/last_admin.rs`(6,含并发互停 10 轮) | `Storage::deactivate_user_and_revoke_sessions`(签名不变)首条语句改为单条条件 `UPDATE`(目标是活跃管理员且活跃管理员数 ≤ 1 时 0 行),0 行时同事务内区分"用户不存在"(`Ok(None)`)与"最后管理员"(`Err(LastAdminProtected)`);并发互停恰一成功。HTTP 409 `cannot deactivate the last active admin`,CLI 非 0;自停用 409 `cannot deactivate yourself` 仍先判定;目标已停用时幂等成功;`activate` 不受限。被拒审计 `user_deactivate_denied`(`denied`,reason `last active admin`)。无 `--force`;唯一管理员被入侵时需先 `user create --role admin` 再停用 |
+| B11 | login 读 SQLite 哈希 + CLI `user passwd` | ✅ | `tests/login_sqlite_hash.rs`(3)、`tests/cli_passwd.rs`(7) | `login` 验密哈希取自 SQLite,库里无该行按未知用户处理(恰好一次 bcrypt,审计 reason `unknown user`,不带 user_id);内存 `password_hash` 字段保留但不再参与验证。CLI `user passwd <username>`:stdin 读一行(≤1 KiB,去 `\n`/`\r\n`,保留前后空白),不验旧密码,走密码策略,单事务改哈希并撤销该用户**全部**会话(`Storage::set_user_password_and_revoke_all_sessions`),审计 `password_reset`(无 actor,reason `cli reset, revoked N sessions`);与并发 `change_password`(旧哈希 CAS)后写者胜。⚠️ 密码缓冲未 zeroize;输入在多字节字符中间被 1 KiB 截断时报 UTF-8 错误而非 too long(S-3) |
+| B12 | 密码策略用于注册与 CLI 创建 | ✅ | `tests/password_policy_registration.rs`(9) | 新增 `AuthService::register_validated`:策略校验 → blocking 哈希 → 同时持 `users`/`username_index`/`email_index` 三把写锁复检唯一性并插入(修复并发同名注册覆盖索引的竞态,顺序与 `register_with_role`/`remove_user` 一致)。HTTP `POST /api/v1/auth/register` 新增 400 词表 `password too short`/`password too long`/`password contains invalid characters`(`auth.password_min_length` 默认 8,≤72 字节,无 NUL);内部/存储错误返回 500 `internal error`;CLI `user create` 失败(策略、已存在、保存失败)退出码非 0 |
+
+#### 新增审计事件
+`login_unlocked`、`password_reset`、`user_deactivate_denied`(均不含密码、哈希、token)。
+
+#### 破坏性变更(🔺)
+- 🔺 HTTP 注册与 CLI `user create` 开始校验密码策略,短密码被拒;现有用户不受影响。
+- 🔺 CLI `user create` 失败退出码由 0 变非 0。
+- 🔺 停用最后一名活跃管理员被拒(API 409 / CLI 非 0)。
+- 🔺 `DataChainError` 新增变体 `LastAdminProtected`,对穷尽 `match` 的下游源码级不兼容。
+- 🔺 `login` 以 SQLite 哈希为准:只改内存不落库的哈希不再生效。
+- ✅ 不变:同步 `register`/`register_with_role`、`Storage::deactivate_user_and_revoke_sessions` 签名、`deactivate_user`/`activate_user`、`LoginLimits`、`AuthSettings` 字段、`AppState`、迁移 001-013。
+
+#### 已知限制(⚠️)与推迟项(⏳)
+- ⚠️ unlock 对仅存在于库中而内存无的用户返回 404(I-2);CLI 创建的用户需重启服务才能登录(沿用)。
+- ⚠️ 登录与改密/重置并发时,撤销之后才落库的新会话可能存活(B-6 沿用);无 `sid` 旧令牌不受撤销约束(沿用)。
+- ⚠️ `register` 无限速,blocking 池可被匿名并发占满(S-2);CLI `create` 的 `role.parse().unwrap_or(User)` 在拼错 `admin` 时静默建普通用户(S-4,既有);用户名区分大小写但限速 key 归一化(S-5,既有)。
+- ⏳ 推迟(理由见设计 §1):`create_session` 原子化、`scan_sessions` 流式、refresh/access 分密钥、主动断开被撤销用户的 WS、`Forwarded`/`X-Real-IP`、IPv6 /64、全局限流阈值配置化、废弃 `locked_until` 死列。
+
 ## 三、测试与验证状态
+
+- ✅ **认证加固第三批验证总览(权威,`9837394`,`feat/auth-hardening-3`)**:本次提交 + 192.168.3.7 docker `rust:latest`(作业 full9837394-20261114-172325),`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 36 个测试目标全部通过,**402 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线持平,无新增;迁移 001-013。基线 `09fa049`:357 passed。新增测试目标 6 个:`tests/bcrypt_async.rs`、`tests/login_sqlite_hash.rs`、`tests/password_policy_registration.rs`、`tests/cli_passwd.rs`、`tests/last_admin.rs`、`tests/unlock.rs`。⚠️ 402 的分项计数本文未逐项列出(验证汇总仅给总数)。
+- **以下为上一层历史数字(357 passed,第二批)**:
 
 - ✅ **认证加固第二批验证总览(权威,`95a68b8`,`feat/auth-hardening-2`)**:本次提交 + 192.168.3.7 docker `rust:latest`(作业 full95a68b8-20261114-052129),`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 30 个测试目标全部通过,**357 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线持平,无新增;迁移 001-013。基线 `3336e83`:251 passed、clippy lib 22、迁移到 011。新增测试目标 7 个:`tests/admin_api.rs`、`tests/audit_scan_stream.rs`、`tests/auth_config.rs`、`tests/change_password.rs`、`tests/login_lockout.rs`、`tests/refresh_failure_audit.rs`、`tests/trusted_proxies.rs`(另有 `src/auth/password.rs` 的 lib 单测 4 个,已在源码中核实存在)。⚠️ 357 的分项计数本文未列出(验证汇总仅给总数);reviewer 清单中的第二批限制见 §2.8。
 - **以下为上一层历史数字(251 passed)**:

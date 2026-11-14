@@ -30,6 +30,7 @@ level = "info"
 # 完整参数表见 IMPLEMENTATION_STATUS.md §2.8。
 # lockout_max_secs 须 >= lockout_base_secs,lockout_reset_secs 须 >= lockout_max_secs。
 # trusted_proxies 的部署前提:可信代理必须把真实对端地址追加到 X-Forwarded-For。
+# password_min_length(默认 8)同时作用于:公开注册、CLI `user create`、改密接口、CLI `user passwd`。
 # [auth]
 # login_user_max_attempts = 5
 # login_ip_max_attempts = 20
@@ -39,5 +40,5 @@ level = "info"
 # lockout_reset_secs = 86400
 # audit_retention_days = 90
 # active_cache_ttl_secs = 5
-# password_min_length = 8
+# password_min_length = 8   # 同时作用于注册、CLI 创建、改密与 CLI passwd 的新密码最小字符数(上限 72 字节)   # 最小字符数,同时作用于注册、CLI user create、改密、CLI user passwd(另有:UTF-8 字节 ≤ 72、无 NUL)
 # trusted_proxies = []   # IP 或 CIDR,不允许 /0
