@@ -117,6 +117,29 @@ fn dummy_password_hash() -> &'static str {
     })
 }
 
+/// 在 blocking 线程池中哈希密码,避免 bcrypt 占用 tokio 工作线程。
+/// 错误文本固定,不含密码或哈希。
+async fn hash_password_blocking(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|_| DataChainError::Internal("password hashing task failed".to_string()))?
+        .map_err(|_| DataChainError::Internal("password hashing failed".to_string()))
+}
+
+/// 在 blocking 线程池中验证密码。`hash` 为 `None` 时对 dummy 哈希验证(结果恒为 false),
+/// 用于抹平不存在用户的耗时;dummy 的 OnceLock 首次初始化也在闭包内完成。
+async fn verify_password_blocking(password: String, hash: Option<String>) -> Result<bool> {
+    tokio::task::spawn_blocking(move || match hash {
+        Some(h) => verify_password(&password, &h),
+        None => {
+            let _ = verify_password(&password, dummy_password_hash());
+            false
+        }
+    })
+    .await
+    .map_err(|_| DataChainError::Internal("password verification task failed".to_string()))
+}
+
 /// user_agent 入库长度上限(字符数)。
 const USER_AGENT_MAX_CHARS: usize = 200;
 
@@ -434,13 +457,8 @@ impl AuthService {
 
         // 3. 以 SQLite 中的哈希验证旧密码;用户行缺失也走同 cost 的 bcrypt 抹平耗时。
         let stored_hash = self.storage.get_user_password_hash(user_id).await?;
-        let old_ok = match stored_hash.as_deref() {
-            Some(hash) => verify_password(&req.old_password, hash),
-            None => {
-                let _ = verify_password(&req.old_password, dummy_password_hash());
-                false
-            }
-        };
+        let old_ok =
+            verify_password_blocking(req.old_password.clone(), stored_hash.clone()).await?;
         let old_hash = match stored_hash {
             Some(hash) if old_ok => hash,
             _ => {
@@ -463,8 +481,7 @@ impl AuthService {
         }
 
         // 5. 哈希新密码,归还两个名额。
-        let new_hash = hash_password(&req.new_password)
-            .map_err(|e| DataChainError::Internal(e.to_string()))?;
+        let new_hash = hash_password_blocking(req.new_password.clone()).await?;
         self.release_rate_gate(&user_key, &ip_key, now).await?;
 
         // 6. 单事务:乐观更新哈希(旧哈希已被并发改密替换则 0 行)+ 撤销其他会话。
@@ -578,13 +595,11 @@ impl AuthService {
             let id = self.username_index.read().get(&req.username).cloned();
             id.and_then(|id| self.users.read().get(&id).cloned())
         };
-        let password_ok = match &found {
-            Some(user) => verify_password(&req.password, &user.password_hash),
-            None => {
-                let _ = verify_password(&req.password, dummy_password_hash());
-                false
-            }
-        };
+        let password_ok = verify_password_blocking(
+            req.password.clone(),
+            found.as_ref().map(|u| u.password_hash.clone()),
+        )
+        .await?;
         // 用户不存在 / 密码错误 / 账户已禁用 统一返回同一错误(禁用账户也先验证密码)。
         // 启用状态以 SQLite 为权威(CLI 可能在别的进程里停用/启用,内存副本会陈旧)。
         // 失败原因只写入审计日志,对外始终是同一个 InvalidCredentials。
