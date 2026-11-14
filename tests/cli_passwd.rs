@@ -225,7 +225,11 @@ async fn cli_passwd_resets_password_revokes_sessions_and_audits() {
     let cli_output = combined(&out);
     for secret in [new_password, OLD_PASSWORD] {
         assert!(!dump.contains(secret), "审计不得含密码 {}", secret);
-        assert!(!cli_output.contains(secret), "CLI 输出不得含密码 {}", secret);
+        assert!(
+            !cli_output.contains(secret),
+            "CLI 输出不得含密码 {}",
+            secret
+        );
     }
 }
 
