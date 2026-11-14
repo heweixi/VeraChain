@@ -116,7 +116,12 @@ impl Fixture {
             .unwrap()
     }
 
-    async fn cli_create(&self, username: &str, password: &str, email: &str) -> std::process::Output {
+    async fn cli_create(
+        &self,
+        username: &str,
+        password: &str,
+        email: &str,
+    ) -> std::process::Output {
         self.run_cli(&[
             "user",
             "create",
@@ -240,7 +245,11 @@ async fn concurrent_register_same_username_creates_exactly_one_user() {
         others
     );
 
-    assert_eq!(f.count_users_named("racer").await, 1, "库里只应有一个同名用户");
+    assert_eq!(
+        f.count_users_named("racer").await,
+        1,
+        "库里只应有一个同名用户"
+    );
     assert_eq!(
         f.state
             .auth_service

@@ -104,10 +104,9 @@ pub async fn register(
                 Json(ApiResponse::success(user.to_public())),
             ))
         }
-        Err(crate::error::DataChainError::PasswordRejected(msg)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error(msg)),
-        )),
+        Err(crate::error::DataChainError::PasswordRejected(msg)) => {
+            Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg))))
+        }
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(e.to_string())),
