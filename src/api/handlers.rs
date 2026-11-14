@@ -439,6 +439,32 @@ pub async fn admin_activate_user(
     }
 }
 
+/// `POST /api/v1/admin/users/:user_id/unlock`:清除目标用户的登录锁定与失败计数(幂等)。
+pub async fn admin_unlock_user(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = admin_denied(&claims, crate::auth::Permission::UserStatusAdmin) {
+        return resp;
+    }
+    let ctx = client_context(client_ip, &headers);
+    match state
+        .auth_service
+        .unlock_user(Some(&claims.sub), &user_id, &ctx)
+        .await
+    {
+        Ok(outcome) => Json(ApiResponse::success(serde_json::json!({
+            "user_id": user_id,
+            "unlocked": outcome.locks_cleared > 0,
+        })))
+        .into_response(),
+        Err(e) => admin_error("管理员解锁用户失败", e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RefreshTokenRequest {
     pub refresh_token: String,

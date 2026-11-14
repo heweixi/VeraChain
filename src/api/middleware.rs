@@ -94,7 +94,7 @@ fn required_permission(method: &Method, path: &str) -> Option<Permission> {
                     (Some("sessions"), &Method::GET | &Method::DELETE) => {
                         return Some(Permission::UserSessionAdmin);
                     }
-                    (Some("deactivate" | "activate"), &Method::POST) => {
+                    (Some("deactivate" | "activate" | "unlock"), &Method::POST) => {
                         return Some(Permission::UserStatusAdmin);
                     }
                     _ => {}

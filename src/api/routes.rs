@@ -77,6 +77,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/admin/users/:user_id/activate",
             post(handlers::admin_activate_user),
         )
+        .route(
+            "/api/v1/admin/users/:user_id/unlock",
+            post(handlers::admin_unlock_user),
+        )
         // 元数据
         .route("/api/v1/metadata", post(handlers::create_metadata))
         .route("/api/v1/metadata", get(handlers::query_metadata))
