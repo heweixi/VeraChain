@@ -49,6 +49,9 @@ pub enum DataChainError {
     /// 管理员尝试停用自己(409)。
     #[error("cannot deactivate yourself")]
     SelfDeactivation,
+    /// 停用会使系统没有活跃管理员(409)。
+    #[error("cannot deactivate the last active admin")]
+    LastAdminProtected,
     #[error("无效的令牌")]
     InvalidToken,
 

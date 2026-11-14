@@ -327,6 +327,11 @@ fn admin_error(context: &str, e: crate::error::DataChainError) -> axum::response
             Json(ApiResponse::error("cannot deactivate yourself")),
         )
             .into_response(),
+        DataChainError::LastAdminProtected => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("cannot deactivate the last active admin")),
+        )
+            .into_response(),
         e => internal_error(context, e),
     }
 }

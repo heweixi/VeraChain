@@ -1245,15 +1245,29 @@ impl AuthService {
         if actor == Some(target) {
             return Err(DataChainError::SelfDeactivation);
         }
-        let revoked = self
+        let result = self
             .storage
             .deactivate_user_and_revoke_sessions(
                 target,
                 "user deactivated",
                 self.jwt_handler.refresh_expire_secs(),
             )
-            .await?
-            .ok_or_else(|| DataChainError::UserNotFound(target.to_string()))?;
+            .await;
+        let revoked = match result {
+            Ok(v) => v.ok_or_else(|| DataChainError::UserNotFound(target.to_string()))?,
+            Err(DataChainError::LastAdminProtected) => {
+                let mut event = AuditEvent::new("user_deactivate_denied", "denied")
+                    .user(target)
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                    .reason("last active admin");
+                if let Some(actor) = actor {
+                    event = event.actor(actor);
+                }
+                self.audit(event).await;
+                return Err(DataChainError::LastAdminProtected);
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(user) = self.users.write().get_mut(target) {
             user.deactivate();
         }

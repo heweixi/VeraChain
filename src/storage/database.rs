@@ -1880,13 +1880,27 @@ impl Storage {
     ) -> Result<Option<u64>> {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query("UPDATE users SET is_active = 0 WHERE user_id = ?")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        // 单条条件 UPDATE:判定与更新原子完成,拒绝停用最后一名活跃管理员。
+        // 目标已停用时条件为真,命中 1 行,保持幂等成功。
+        let updated = sqlx::query(
+            "UPDATE users SET is_active = 0 WHERE user_id = ? \
+             AND NOT (is_active = 1 AND role = 'admin' \
+                 AND (SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1) <= 1)",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         if updated.rows_affected() == 0 {
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM users WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
             tx.commit().await?;
-            return Ok(None);
+            return if exists.is_some() {
+                Err(DataChainError::LastAdminProtected)
+            } else {
+                Ok(None)
+            };
         }
         let revoked =
             Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now, None).await?;
