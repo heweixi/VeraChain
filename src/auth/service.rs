@@ -8,7 +8,7 @@ use super::{
 };
 use crate::crypto::{hash_password, verify_password};
 use crate::error::{DataChainError, Result};
-use crate::storage::{AuditEvent, SessionRecord, Storage};
+use crate::storage::{AuditEvent, SessionRecord, Storage, UnlockOutcome};
 
 /// 登录请求的客户端上下文,用于会话审计字段。
 #[derive(Debug, Clone, Default)]
@@ -99,6 +99,16 @@ fn normalize_username_key(username: &str) -> String {
         .flat_map(char::to_lowercase)
         .take(USERNAME_KEY_MAX_CHARS)
         .collect()
+}
+
+/// 登录限速的用户名维度 key;login 与 unlock 共用,保证两处一致。
+fn login_user_key(username: &str) -> String {
+    format!("user:{}", normalize_username_key(username))
+}
+
+/// 改密限速的用户维度 key;change_password 与 unlock 共用。
+fn pwchg_key(user_id: &str) -> String {
+    format!("pwchg:{}", user_id)
 }
 
 /// 限速门拒绝信息:建议的 Retry-After(秒)与审计 reason。
@@ -438,7 +448,7 @@ impl AuthService {
 
         // 2. 限速门:独立 key,锁定不影响登录。
         let now = self.storage.now_secs();
-        let user_key = format!("pwchg:{}", user_id);
+        let user_key = pwchg_key(user_id);
         let ip_key = format!(
             "ip:{}",
             self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
@@ -560,6 +570,35 @@ impl AuthService {
         Ok(revoked)
     }
 
+    /// 解锁用户:清除其登录(`user:<规范化用户名>`)与改密(`pwchg:<user_id>`)两个 key 的
+    /// 锁与窗口计数(退避级别随锁行一并归零)。不清 IP 维度。
+    ///
+    /// key 由目标用户的存储用户名经与 login 相同的函数得出。目标不在内存用户表返回
+    /// `UserNotFound`。无锁时也写审计 `login_unlocked`(不含密码内容)。
+    pub async fn unlock_user(
+        &self,
+        actor: Option<&str>,
+        target_user_id: &str,
+        ctx: &LoginContext,
+    ) -> Result<UnlockOutcome> {
+        let user = self.get_user_by_id(target_user_id)?;
+        let keys = [login_user_key(&user.username), pwchg_key(target_user_id)];
+        let outcome = self.storage.clear_login_keys(&keys).await?;
+
+        let mut event = AuditEvent::new("login_unlocked", "success")
+            .user(target_user_id)
+            .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+            .reason(&format!(
+                "cleared locks={} counters={}",
+                outcome.locks_cleared, outcome.counters_cleared
+            ));
+        if let Some(actor) = actor {
+            event = event.actor(actor);
+        }
+        self.audit(event).await;
+        Ok(outcome)
+    }
+
     /// 请求上下文里的客户端 IP 摘要(无对端地址时为 `None`)。
     fn ctx_ip_hash(&self, ctx: &LoginContext) -> Option<String> {
         ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip))
@@ -647,7 +686,7 @@ impl AuthService {
             "ip:{}",
             self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP))
         );
-        let user_key = format!("user:{}", normalize_username_key(&req.username));
+        let user_key = login_user_key(&req.username);
 
         // 限速门(锁定检查 + 计数 + 落锁),登录与改密共用。
         if let Err(denial) = self.enter_rate_gate(&user_key, &ip_key, now).await? {

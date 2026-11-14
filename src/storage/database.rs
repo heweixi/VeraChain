@@ -14,6 +14,13 @@ use crate::error::{
 };
 use crate::versioning::Version;
 
+/// 解锁结果:被删除的锁行数与窗口计数行数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockOutcome {
+    pub locks_cleared: u64,
+    pub counters_cleared: u64,
+}
+
 /// 登录会话记录(sessions 表一行)。时间戳均为 Unix 秒。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
@@ -2139,6 +2146,31 @@ impl Storage {
             .await?;
         tx.commit().await?;
         Ok(locked_until)
+    }
+
+    /// 解锁:单事务内对每个 key 依次删除 `login_lockouts` 与 `login_rate_counters` 的行,
+    /// 返回累计删除行数。首条语句即为写操作(事务以写模式开始,避免读升级写的 BUSY)。
+    pub async fn clear_login_keys(&self, keys: &[String]) -> Result<UnlockOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let mut outcome = UnlockOutcome {
+            locks_cleared: 0,
+            counters_cleared: 0,
+        };
+        for key in keys {
+            outcome.locks_cleared += sqlx::query("DELETE FROM login_lockouts WHERE key = ?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            outcome.counters_cleared +=
+                sqlx::query("DELETE FROM login_rate_counters WHERE key = ?")
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     /// 严格扫描 `login_lockouts` 全表(锁定状态是访问决策依据,损坏必须 fail-closed)。

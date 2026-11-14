@@ -41,6 +41,11 @@ pub enum UserAction {
         /// 用户名
         username: String,
     },
+    /// 解锁用户登录与改密限速锁(清除锁与窗口计数,不清 IP 维度)
+    Unlock {
+        /// 用户名
+        username: String,
+    },
     /// 重置用户密码(从 stdin 读一行新密码,不验旧密码;撤销该用户全部会话)
     Passwd {
         /// 用户名
@@ -149,6 +154,18 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
             auth_service.activate_user(&user.user_id).await?;
             println!("✓ 用户已启用(旧会话不会恢复,需重新登录)");
             println!("  用户名: {}", user.username);
+        }
+        UserAction::Unlock { username } => {
+            let user = auth_service
+                .get_user(&username)
+                .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
+            let outcome = auth_service
+                .unlock_user(None, &user.user_id, &LoginContext::default())
+                .await?;
+            println!("✓ 已解锁");
+            println!("  用户名: {}", user.username);
+            println!("  已清除锁记录: {}", outcome.locks_cleared);
+            println!("  已清除计数记录: {}", outcome.counters_cleared);
         }
         UserAction::Passwd { username } => {
             let user = auth_service
