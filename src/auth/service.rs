@@ -595,11 +595,14 @@ impl AuthService {
             let id = self.username_index.read().get(&req.username).cloned();
             id.and_then(|id| self.users.read().get(&id).cloned())
         };
-        let password_ok = verify_password_blocking(
-            req.password.clone(),
-            found.as_ref().map(|u| u.password_hash.clone()),
-        )
-        .await?;
+        // 密码哈希以 SQLite 为权威(CLI 可能在别的进程里改密/删用户,内存哈希会陈旧)。
+        // 内存无该用户或库里无该行,都按未知用户处理(对 dummy 哈希验证,恰好一次 bcrypt)。
+        let db_hash = match found.as_ref() {
+            Some(user) => self.storage.get_user_password_hash(&user.user_id).await?,
+            None => None,
+        };
+        let found = found.filter(|_| db_hash.is_some());
+        let password_ok = verify_password_blocking(req.password.clone(), db_hash).await?;
         // 用户不存在 / 密码错误 / 账户已禁用 统一返回同一错误(禁用账户也先验证密码)。
         // 启用状态以 SQLite 为权威(CLI 可能在别的进程里停用/启用,内存副本会陈旧)。
         // 失败原因只写入审计日志,对外始终是同一个 InvalidCredentials。
