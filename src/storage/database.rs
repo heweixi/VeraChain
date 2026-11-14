@@ -1949,6 +1949,35 @@ impl Storage {
         Ok(Some(ids))
     }
 
+    /// 单事务:无条件把密码哈希置为 `new_hash`,并撤销该用户全部未撤销会话(写 family 哨兵)。
+    ///
+    /// 用于运维重置(CLI `user passwd`),不校验旧哈希;与 API 改密并发时后写者胜。
+    /// 首条语句即为写操作(`UPDATE users SET password_hash = ? WHERE user_id = ?`)。
+    /// 返回 `Ok(None)` 表示用户不存在(未改动);`Ok(Some(n))` 为被撤销的会话数。
+    pub async fn set_user_password_and_revoke_all_sessions(
+        &self,
+        user_id: &str,
+        new_hash: &str,
+        reason: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<u64>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query("UPDATE users SET password_hash = ? WHERE user_id = ?")
+            .bind(new_hash)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let revoked =
+            Self::revoke_user_sessions_in_tx(&mut tx, user_id, reason, ttl_secs, now, None).await?;
+        tx.commit().await?;
+        Ok(Some(revoked.len() as u64))
+    }
+
     /// 清本进程 is_active 缓存,并让在途的旧读不再回填。
     fn invalidate_active_cache(&self, user_id: &str) {
         let mut cache = self.active_cache.lock();

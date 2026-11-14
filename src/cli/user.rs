@@ -1,4 +1,5 @@
 use clap::Subcommand;
+use std::io::{BufRead, Read};
 
 use crate::auth::{
     create_auth_service_with_settings, LoginContext, LoginRequest, RegisterRequest, Role,
@@ -37,6 +38,11 @@ pub enum UserAction {
     },
     /// 启用用户(不恢复已撤销的会话,需重新登录)
     Activate {
+        /// 用户名
+        username: String,
+    },
+    /// 重置用户密码(从 stdin 读一行新密码,不验旧密码;撤销该用户全部会话)
+    Passwd {
         /// 用户名
         username: String,
     },
@@ -142,6 +148,29 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
             auth_service.activate_user(&user.user_id).await?;
             println!("✓ 用户已启用(旧会话不会恢复,需重新登录)");
+            println!("  用户名: {}", user.username);
+        }
+        UserAction::Passwd { username } => {
+            let user = auth_service
+                .get_user(&username)
+                .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
+
+            // 只读一行,最多 1 KiB;超长无换行的输入会被截成 1 KiB,随后被策略按 too long 拒绝。
+            let mut line = String::new();
+            std::io::stdin().lock().take(1024).read_line(&mut line)?;
+            let password = line
+                .strip_suffix('\n')
+                .map(|s| s.strip_suffix('\r').unwrap_or(s))
+                .unwrap_or(&line);
+            if password.is_empty() {
+                return Err(anyhow::anyhow!("未从 stdin 读取到新密码"));
+            }
+
+            // 策略拒绝(password too short 等)直接传播;错误文本不含密码。
+            let revoked = auth_service
+                .reset_password(&user.user_id, password, &LoginContext::default())
+                .await?;
+            println!("✓ 密码已重置(已撤销 {} 个会话)", revoked);
             println!("  用户名: {}", user.username);
         }
         UserAction::Login { username, password } => {

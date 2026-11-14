@@ -521,6 +521,45 @@ impl AuthService {
         Ok(())
     }
 
+    /// 运维重置密码(CLI `user passwd`):不验旧密码、不走限速门。
+    ///
+    /// 顺序:策略校验 → blocking 池哈希 → 单事务改哈希并撤销全部会话 → 同步内存哈希
+    /// → 审计 `password_reset`(无 actor,不含任何密码内容)。返回被撤销的会话数。
+    /// 用户不存在返回 `UserNotFound`。
+    pub async fn reset_password(
+        &self,
+        target_user_id: &str,
+        new_password: &str,
+        ctx: &LoginContext,
+    ) -> Result<u64> {
+        validate_new_password(new_password, self.password_min_length)
+            .map_err(DataChainError::PasswordRejected)?;
+        let new_hash = hash_password_blocking(new_password.to_string()).await?;
+        let revoked = self
+            .storage
+            .set_user_password_and_revoke_all_sessions(
+                target_user_id,
+                &new_hash,
+                "password reset",
+                self.jwt_handler.refresh_expire_secs(),
+            )
+            .await?
+            .ok_or_else(|| DataChainError::UserNotFound(target_user_id.to_string()))?;
+
+        if let Some(user) = self.users.write().get_mut(target_user_id) {
+            user.password_hash = new_hash;
+        }
+
+        self.audit(
+            AuditEvent::new("password_reset", "success")
+                .user(target_user_id)
+                .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                .reason(&format!("cli reset, revoked {} sessions", revoked)),
+        )
+        .await;
+        Ok(revoked)
+    }
+
     /// 请求上下文里的客户端 IP 摘要(无对端地址时为 `None`)。
     fn ctx_ip_hash(&self, ctx: &LoginContext) -> Option<String> {
         ctx.client_ip.as_deref().map(|ip| self.hash_client_ip(ip))
