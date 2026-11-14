@@ -70,7 +70,7 @@ pub struct AuthSettings {
     pub refresh_expire_days: u64,
     pub login_limits: LoginLimits,
     pub lockout: LockoutPolicy,
-    /// 改密时新密码的最小字符数。
+    /// 注册、CLI 创建、改密与 CLI 重置密码时新密码的最小字符数。
     pub password_min_length: usize,
 }
 

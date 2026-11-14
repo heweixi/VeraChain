@@ -92,7 +92,7 @@ pub async fn register(
                 tracing::error!("保存用户失败: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::error(e.to_string())),
+                    Json(ApiResponse::error("internal error")),
                 ));
             }
             state.event_bus.publish(Event::new(
@@ -107,6 +107,20 @@ pub async fn register(
         Err(crate::error::DataChainError::PasswordRejected(msg)) => {
             Err((StatusCode::BAD_REQUEST, Json(ApiResponse::error(msg))))
         }
+        // 存储故障/数据损坏/内部错误:500,详情只进日志,不回显给客户端。
+        Err(
+            e @ (crate::error::DataChainError::Internal(_)
+            | crate::error::DataChainError::DatabaseError(_)
+            | crate::error::DataChainError::StorageError(_)
+            | crate::error::DataChainError::DataCorruption { .. }),
+        ) => {
+            tracing::error!("注册失败(内部错误): {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error("internal error")),
+            ))
+        }
+        // UserExists 及其余错误保持 400 + 原文案。
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(e.to_string())),
