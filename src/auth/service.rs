@@ -527,11 +527,40 @@ impl AuthService {
     }
 
     /// 公开注册:始终创建普通用户,不接受客户端指定高权限角色。
+    ///
+    /// 同步方法,bcrypt 会阻塞当前线程且不校验密码策略;请求路径请用 [`Self::register_validated`]。
     pub fn register(&self, req: &RegisterRequest) -> Result<User> {
         self.register_with_role(req, Role::User)
     }
 
+    /// 带密码策略校验的异步注册:策略校验 → blocking 池哈希 → 同时持有三把写锁
+    /// (users/username_index/email_index,顺序与 `register_with_role`、`remove_user` 一致)
+    /// 复检用户名与邮箱唯一性并插入。并发同名只有一个成功,其余返回 `UserExists`。
+    pub async fn register_validated(&self, req: &RegisterRequest, role: Role) -> Result<User> {
+        validate_new_password(&req.password, self.password_min_length)
+            .map_err(DataChainError::PasswordRejected)?;
+        let password_hash = hash_password_blocking(req.password.clone()).await?;
+        let user = User::new(req.username.clone(), password_hash, req.email.clone(), role);
+
+        // 持锁区内无 await。
+        let mut users = self.users.write();
+        let mut username_index = self.username_index.write();
+        let mut email_index = self.email_index.write();
+        if username_index.contains_key(&req.username) {
+            return Err(DataChainError::UserExists(req.username.clone()));
+        }
+        if email_index.contains_key(&req.email) {
+            return Err(DataChainError::UserExists(req.email.clone()));
+        }
+        username_index.insert(user.username.clone(), user.user_id.clone());
+        email_index.insert(user.email.clone(), user.user_id.clone());
+        users.insert(user.user_id.clone(), user.clone());
+        Ok(user)
+    }
+
     /// 管理/CLI 注册:由受信调用方显式指定角色。
+    ///
+    /// 同步方法,会阻塞(bcrypt)且不校验密码策略,请求路径请用 [`Self::register_validated`]。
     pub fn register_with_role(&self, req: &RegisterRequest, role: Role) -> Result<User> {
         // 检查用户名唯一性
         {

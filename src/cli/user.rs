@@ -82,18 +82,17 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 role: Some(role),
             };
 
-            match auth_service.register_with_role(&req, role) {
-                Ok(user) => {
-                    storage.save_user(&user).await?;
-                    println!("✓ 用户已创建");
-                    println!("  用户 ID: {}", user.user_id);
-                    println!("  用户名: {}", user.username);
-                    println!("  角色: {}", user.role);
-                }
-                Err(e) => {
-                    println!("✗ 创建用户失败: {}", e);
-                }
+            // 策略拒绝 / 用户已存在 / 保存失败都返回 Err(退出码非 0);错误文本不含密码。
+            // 直接用 `?` 传播,保留 DataChainError 类型供 exit_code_for downcast(其他错误为 1)。
+            let user = auth_service.register_validated(&req, role).await?;
+            if let Err(e) = storage.save_user(&user).await {
+                auth_service.remove_user(&user.user_id);
+                return Err(e.into());
             }
+            println!("✓ 用户已创建");
+            println!("  用户 ID: {}", user.user_id);
+            println!("  用户名: {}", user.username);
+            println!("  角色: {}", user.role);
         }
         UserAction::List => {
             let users = auth_service.get_all_users();

@@ -78,8 +78,14 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.auth_service.register(&req) {
+    match state
+        .auth_service
+        .register_validated(&req, crate::auth::Role::User)
+        .await
+    {
         Ok(user) => {
+            // register_validated 在三把写锁内复检唯一性,成功即本请求独占该 user_id,
+            // 因此下面失败回滚只会移除本请求插入的用户。
             // 保存到存储；内存状态不能在持久化失败时对外宣称成功。
             if let Err(e) = state.storage.save_user(&user).await {
                 state.auth_service.remove_user(&user.user_id);
@@ -98,6 +104,10 @@ pub async fn register(
                 Json(ApiResponse::success(user.to_public())),
             ))
         }
+        Err(crate::error::DataChainError::PasswordRejected(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(msg)),
+        )),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error(e.to_string())),
