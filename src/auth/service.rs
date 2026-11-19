@@ -573,7 +573,8 @@ impl AuthService {
     /// 解锁用户:清除其登录(`user:<规范化用户名>`)与改密(`pwchg:<user_id>`)两个 key 的
     /// 锁与窗口计数(退避级别随锁行一并归零)。不清 IP 维度。
     ///
-    /// key 由目标用户的存储用户名经与 login 相同的函数得出。目标不在内存用户表返回
+    /// key 由目标用户的存储用户名经与 login 相同的函数得出。用户名先取内存用户表,
+    /// 内存没有时回退查 SQLite(CLI 可能在别的进程里建了用户);两处都没有返回
     /// `UserNotFound`。无锁时也写审计 `login_unlocked`(不含密码内容)。
     pub async fn unlock_user(
         &self,
@@ -581,8 +582,15 @@ impl AuthService {
         target_user_id: &str,
         ctx: &LoginContext,
     ) -> Result<UnlockOutcome> {
-        let user = self.get_user_by_id(target_user_id)?;
-        let keys = [login_user_key(&user.username), pwchg_key(target_user_id)];
+        let username = match self.get_user_by_id(target_user_id) {
+            Ok(user) => user.username,
+            Err(_) => self
+                .storage
+                .get_username(target_user_id)
+                .await?
+                .ok_or_else(|| DataChainError::UserNotFound(target_user_id.to_string()))?,
+        };
+        let keys = [login_user_key(&username), pwchg_key(target_user_id)];
         let outcome = self.storage.clear_login_keys(&keys).await?;
 
         let mut event = AuditEvent::new("login_unlocked", "success")
