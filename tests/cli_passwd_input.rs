@@ -35,7 +35,12 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let dsn = dir.path().join("passwd-input.db").to_str().unwrap().to_string();
+    let dsn = dir
+        .path()
+        .join("passwd-input.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (state, _storage) = build_state(&dsn).await;
     seed_user(&state, "alice", OLD_PASSWORD, Role::User).await;
     let router = api::create_router(state.clone());
@@ -142,7 +147,11 @@ async fn cli_passwd_rejects_1500_bytes_without_newline_as_too_long() {
     assert!(!out.status.success(), "{}", describe(&out));
     assert_not_clap_usage_error(&out);
     let all = combined(&out);
-    assert!(all.contains("password too long"), "应指出密码过长: {}", describe(&out));
+    assert!(
+        all.contains("password too long"),
+        "应指出密码过长: {}",
+        describe(&out)
+    );
     assert!(!all.contains(&long), "输出不得含密码本体");
 
     assert_eq!(f.login_status(OLD_PASSWORD).await, StatusCode::OK);

@@ -46,7 +46,12 @@ struct Resp {
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let dsn = dir.path().join("unlock-db-only.db").to_str().unwrap().to_string();
+    let dsn = dir
+        .path()
+        .join("unlock-db-only.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let (mut state, storage) = build_state(&dsn).await;
     let pinned = (chrono::Utc::now().timestamp() / WINDOW) * WINDOW + 10;
     storage.set_clock(Arc::new(move || pinned));

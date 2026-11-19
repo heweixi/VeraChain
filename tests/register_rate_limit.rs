@@ -177,7 +177,11 @@ fn assert_rate_limited(r: &Resp) {
         .expect("429 必须带 Retry-After")
         .parse()
         .unwrap();
-    assert!((1..=900).contains(&secs), "Retry-After 应在 1..=900: {}", secs);
+    assert!(
+        (1..=900).contains(&secs),
+        "Retry-After 应在 1..=900: {}",
+        secs
+    );
     assert_eq!(r.body["success"], false);
     assert_eq!(r.body["error"], "too many attempts");
 }
@@ -223,7 +227,12 @@ async fn different_ips_have_independent_register_buckets() {
     assert_rate_limited(&f.register(IP_A, "dave", GOOD_PW).await);
 
     let r = f.register(IP_B, "erin", GOOD_PW).await;
-    assert_eq!(r.status, StatusCode::CREATED, "IP-B 不应受 IP-A 影响: {}", r.body);
+    assert_eq!(
+        r.status,
+        StatusCode::CREATED,
+        "IP-B 不应受 IP-A 影响: {}",
+        r.body
+    );
     assert_eq!(f.count_users_named("erin").await, 1);
 }
 
@@ -238,7 +247,12 @@ async fn register_limit_does_not_affect_login_for_same_ip() {
     assert_rate_limited(&f.register(IP_A, "dave", GOOD_PW).await);
 
     let r = f.login(IP_A, "alice", "alicepass123").await;
-    assert_eq!(r.status, StatusCode::OK, "登录不应被注册限速影响: {}", r.body);
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "登录不应被注册限速影响: {}",
+        r.body
+    );
 }
 
 /// 5. 审计:被拒写 `register_rate_limited`。

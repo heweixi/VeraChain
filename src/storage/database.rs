@@ -896,11 +896,10 @@ impl Storage {
 
     /// 读取用户的存储用户名;用户行不存在返回 `None`。
     pub async fn get_username(&self, user_id: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT username FROM users WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT username FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|(username,)| username))
     }
 
