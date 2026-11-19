@@ -74,9 +74,36 @@ pub async fn health_check() -> Json<HealthResponse> {
 
 // ==================== 认证处理器 ====================
 
+/// `POST /api/v1/auth/register`:先按客户端 IP 限速(成败都计数),通过后进入注册流程。
+/// 超限 429 + `Retry-After`;限速检查自身的存储故障 500。
 pub async fn register(
     State(state): State<AppState>,
+    client_ip: Option<Extension<ClientIp>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
+) -> axum::response::Response {
+    let ctx = client_context(client_ip, &headers);
+    match state.auth_service.check_register_rate(&ctx).await {
+        Ok(()) => {}
+        Err(crate::error::DataChainError::TooManyAttempts { retry_after_secs }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after_secs.to_string())],
+                Json(ApiResponse::error("too many attempts")),
+            )
+                .into_response();
+        }
+        Err(e) => return internal_error("注册限速检查失败", e),
+    }
+    match register_after_rate_check(state, req).await {
+        Ok(resp) => resp.into_response(),
+        Err(resp) => resp.into_response(),
+    }
+}
+
+async fn register_after_rate_check(
+    state: AppState,
+    req: RegisterRequest,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match state
         .auth_service

@@ -111,6 +111,11 @@ fn pwchg_key(user_id: &str) -> String {
     format!("pwchg:{}", user_id)
 }
 
+/// 注册限速的 IP 维度 key;与登录/改密的 `ip:` key 分开计数。
+fn register_ip_key(ip_hash: &str) -> String {
+    format!("reg:{}", ip_hash)
+}
+
 /// 限速门拒绝信息:建议的 Retry-After(秒)与审计 reason。
 struct RateDenial {
     retry_after_secs: u64,
@@ -415,6 +420,32 @@ impl AuthService {
         self.storage
             .decr_login_counter(ip_key, now, window_secs)
             .await?;
+        Ok(())
+    }
+
+    /// 注册限速(仅 HTTP 注册使用,CLI 创建不经过):按客户端 IP 的固定窗口计数,
+    /// 成败都计数、不归还名额。超限写审计 `register_rate_limited` 并返回
+    /// `TooManyAttempts`;不做用户名维度退避锁定。
+    pub async fn check_register_rate(&self, ctx: &LoginContext) -> Result<()> {
+        let limits = self.login_limits;
+        let now = self.storage.now_secs();
+        let ip_hash = self.hash_client_ip(ctx.client_ip.as_deref().unwrap_or(UNKNOWN_CLIENT_IP));
+        let ip_key = register_ip_key(&ip_hash);
+        let (count, window_start) = self
+            .storage
+            .incr_login_counter(&ip_key, now, limits.window_secs)
+            .await?;
+        if count > limits.ip_max_attempts {
+            self.audit(
+                AuditEvent::new("register_rate_limited", "denied")
+                    .client(self.ctx_ip_hash(ctx).as_deref(), ctx.user_agent.as_deref())
+                    .reason("rate limit exceeded"),
+            )
+            .await;
+            return Err(DataChainError::TooManyAttempts {
+                retry_after_secs: (window_start + limits.window_secs - now).max(1) as u64,
+            });
+        }
         Ok(())
     }
 
