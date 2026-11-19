@@ -1,6 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> ✅ **认证加固第四批验证声明(以此为准)**:分支 `feat/auth-hardening-4`(基于 main `f0a8669`,代码 HEAD `0bf473e`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full0bf473e-20261119-174859):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 40 个测试目标共 **419 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `f0a8669` 持平,无新增;迁移仍为 001-013。基线 `f0a8669` 为 402 passed;新增 4 个测试目标 `cli_create_role` 4、`cli_passwd_input` 4、`unlock_db_only_user` 3、`register_rate_limit` 6,合计 +17,与 419-402 一致。本批能力与限制见 §2.10;设计见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch4-design.md`。下文第三批 402 passed 的声明是上一层历史数字。
+> ✅ **身份交易第五批验证声明(以此为准)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419,+10);clippy lib 22 条,与基线持平无新增;迁移仍为 001-013。能力与限制见 §2.11;设计见 `docs/superpowers/specs/2026-11-19-identity-tests-batch5-design.md`。下文第四批 419 passed 的声明是上一层历史数字。
+>
+> ✅ **认证加固第四批验证声明(上一层历史)**:分支 `feat/auth-hardening-4`(基于 main `f0a8669`,代码 HEAD `0bf473e`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full0bf473e-20261119-174859):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 40 个测试目标共 **419 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `f0a8669` 持平,无新增;迁移仍为 001-013。基线 `f0a8669` 为 402 passed;新增 4 个测试目标 `cli_create_role` 4、`cli_passwd_input` 4、`unlock_db_only_user` 3、`register_rate_limit` 6,合计 +17,与 419-402 一致。本批能力与限制见 §2.10;设计见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch4-design.md`。下文第三批 402 passed 的声明是上一层历史数字。
 >
 > ✅ **认证加固第三批验证声明(上一层历史)**:分支 `feat/auth-hardening-3`(基于 main `09fa049`,代码 HEAD `9837394`)。最后核实:2026-11-14。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full9837394-20261114-172325):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 36 个测试目标共 **402 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `09fa049` 持平,无新增;迁移仍为 001-013(本批无迁移)。基线 `09fa049` 为 357 passed、36 个目标中新增 6 个(`bcrypt_async` 3、`login_sqlite_hash` 3、`password_policy_registration` 9、`cli_passwd` 7、`last_admin` 6、`unlock` 17,合计 +45,与 402-357 一致)。⚠️ 本文档未逐目标列出 402 的分项计数。本批能力、契约与已知限制见 §2.9;设计与决策见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch3-design.md`。下文第二批 357 passed 的声明是上一层历史数字。
 >
@@ -130,7 +132,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 - ⚠️ (a) **服务运行时不要用 CLI `chain mine` 对同一数据库挖矿**:CLI 进程与服务进程各有内存队列且不共享 `identity_tx_gate`,可能使内存队列与账本漂移,导致服务后续挖矿持续失败,直到重启服务重新加载账本。
 - ⚠️ (b) `legacy_unverified` **没有内置恢复命令**,只能人工处置(见上)。
-- ⚠️ (c) `Idempotency-Key` **无长度上限**。请求指纹为 `SHA256(signing_payload)`,仅覆盖 `tx_type|target_key|role|label|signed_by` 5 个字段,**不含 `reason`、`timestamp`、`signature`**:同键下仅这三项不同的请求会被视为同一请求并返回原事务。
+- ✅ (第五批 B17 已解决长度上限,见 §2.11:trim 后按 UTF-8 字节计,>255 返回 400 `idempotency key too long`;指纹覆盖范围的评估结论维持现状,见 §2.11)原 ⚠️ (c) `Idempotency-Key` **无长度上限**。请求指纹为 `SHA256(signing_payload)`,仅覆盖 `tx_type|target_key|role|label|signed_by` 5 个字段,**不含 `reason`、`timestamp`、`signature`**:同键下仅这三项不同的请求会被视为同一请求并返回原事务。
 - ⚠️ (d) 同步导入区块(P2P/sync)**不会清理**本地内容相同的 pending(既有行为,本次未改变)。
 - ⚠️ (e) **旧版 pending 分支开发库的升级风险**(✅ **已实测,与此前读代码推导一致**:`tests/migration_upgrade_from_legacy_pending.rs`(1),本次提交 + 192.168.3.7 docker `rust:latest` cargo test 251 passed。测试经独立 sqlx 连接手工构造旧库——001-006 + 当年的 identity 两个迁移登记为 7/8,并写入 1 条区块与 1 条 pending 身份交易。实测:`Storage::new` 报 `no such table: sessions`;迁移事务回滚,blocks 与 identity_transactions 数据不受损,`schema_migrations` 仍为 8,未留下半成品 `sessions` 表,pending 行仍为 `legacy_unverified`;手工 `DELETE FROM schema_migrations WHERE version IN (7,8)` 后再升级,007-010 依次提交,011 报 `duplicate column name` 回滚,此时 `MAX(version)` 变为 10,数据仍完整。**处置建议本身未实跑**)。曾运行过**旧版 pending 分支**迁移(identity 迁移占用版本 7/8)的开发库,升级到合并后版本时 `MAX(version)=8`,会跳过 main 的 007/008(`sessions`、`login_rate_counters_and_audit`);009(`ALTER TABLE sessions ADD COLUMN ip_hint`)因 `sessions` 表不存在而失败,迁移事务回滚、启动失败,**不损坏数据**。直观的手工修复 `DELETE FROM schema_migrations WHERE version IN (7,8)` 会在 011(`ALTER TABLE ... ADD COLUMN recovery_state`)因列已存在报 `duplicate column name`。建议:这类开发库直接重建;或先完整备份,手工创建 main 的 007/008 表并把 `schema_migrations` 调整为 10,同时保留 `recovery_state` 列。main 现网库(`MAX=9`)升级只会执行 010/011,新行显式 `verified`,不会误触发 legacy fail-closed。
 - ⚠️ (f) **「已接受即承诺」**:幂等键按提交用户(JWT `sub`)隔离;提交者之后被禁用或会话被撤销,其 token 立即失效、不能再提交,但**此前已接受并落账本的 pending 身份交易仍会被后续挖矿打包**(挖矿不重新检查提交者状态)。现状不修复,仅登记。
@@ -412,7 +414,25 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 - ⚠️ 占位 `unknown` 注册桶与代理共享桶(见 B13);无对端地址时审计无法区分是占位桶触发。
 - ⚠️ 第三批其余限制与推迟项不变(见 §2.9)。
 
+### 2.11 身份交易第五批(B17-B19,分支 `feat/identity-tests-5`,代码 HEAD `599f4d1`)
+
+最后核实:2026-11-19。设计:`docs/superpowers/specs/2026-11-19-identity-tests-batch5-design.md`。证据:本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个目标 **429 passed、0 failed**(基线 419);clippy lib 22 条无新增;迁移仍 001-013(**无迁移**)。
+
+| 编号 | 内容 | 状态 | 测试 | 要点 |
+|---|---|---|---|---|
+| B17 | `Idempotency-Key` 长度上限 | ✅ | `tests/identity_idempotency_key_limit.rs`(5) | trim 后按 UTF-8 **字节**计,恰好 255 合法,超过返回 400 `idempotency key too long`;检查在取 `identity_tx_gate`、写账本之前,超长请求不落账本也不入队。🔺 键解析由 `to_str()` 改为按 UTF-8 解码:合法 UTF-8 的非 ASCII 键现在是有效键(此前被当作未提供);空白与非 UTF-8 仍视为未提供。超长且签名无效的请求现在先报键过长 |
+| B18 | 直接测试:`transaction_id` 不进入区块 | ✅ 特征测试(现有行为,未改 src) | `tests/identity_transaction_id_not_in_block.rs`(3) | 区块 JSON(HTTP 与持久化)不含 `transaction_id` 字段与值;`signing_payload()`/`leaf_hash()` 只由 5 个签名字段决定;`merkle_root` 与是否带键、`transaction_id`、服务端盖章的 `timestamp` 无关;链校验通过。原"无直接断言测试"的 ⚠️ 取消 |
+| B19 | 直接测试:CLI `chain mine` 拒绝 `legacy_unverified` | ✅ 特征测试(现有行为,未改 src) | `tests/cli_mine_legacy_pending.rs`(2) | 退出码 1(StorageError,非数据损坏的 3),stderr 含 `refusing to recover` 与 `unverifiable legacy pending identity transaction`;区块数与账本行不变;对照:改为 `verified` 后 `mine` 成功且交易变 committed。原"CLI 路径无专门测试"的 ⚠️ 取消 |
+
+#### 评估结论与推迟项
+- 请求指纹**维持现状**(只覆盖进入签名的 5 个字段):`timestamp` 由服务端盖章,`signature` 对同一 payload 唯一,把它们纳入指纹会让合法重试被误判为冲突。
+- ⏳ 仍无直接测试:`identity_tx_gate` 串行化(无确定性公开 seam,并发统计易偶发)。
+- ⏳ 仍未做:`legacy_unverified` 的内置恢复命令(需单独设计);`signing_payload` 的 `|` 分隔碰撞(协议 v2 变更)。
+
 ## 三、测试与验证状态
+
+- ✅ **身份交易第五批验证总览(权威,`599f4d1`,`feat/identity-tests-5`)**:本次提交 + 192.168.3.7 docker `rust:latest`(作业 full599f4d1-20261119-182055),`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标 **429 passed、0 failed**(基线 419,新增 10:`identity_idempotency_key_limit` 5、`identity_transaction_id_not_in_block` 3、`cli_mine_legacy_pending` 2);clippy lib 22 条无新增;迁移 001-013。⚠️ 429 的分项计数本文未逐项列出。
+- **以下为上一层历史数字(419 passed,第四批)**:
 
 - ✅ **认证加固第四批验证总览(权威,`0bf473e`,`feat/auth-hardening-4`)**:本次提交 + 192.168.3.7 docker `rust:latest`(作业 full0bf473e-20261119-174859),`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 40 个测试目标 **419 passed、0 failed**(基线 402);clippy lib 22 条无新增;迁移 001-013。新增测试目标:`tests/cli_create_role.rs`、`tests/cli_passwd_input.rs`、`tests/unlock_db_only_user.rs`、`tests/register_rate_limit.rs`。⚠️ 419 的分项计数本文未逐项列出。
 - **以下为上一层历史数字(402 passed,第三批)**:
