@@ -84,7 +84,13 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
             email,
             role,
         } => {
-            let role: Role = role.parse().unwrap_or(Role::User);
+            // 非法角色直接报错,不再静默降级为 user;错误文本只含角色名,不含密码。
+            let role: Role = role.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "无效角色: {}(合法取值: admin, user, auditor, guest)",
+                    role.escape_debug()
+                )
+            })?;
 
             let req = RegisterRequest {
                 username: username.clone(),
