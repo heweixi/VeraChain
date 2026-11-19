@@ -178,16 +178,28 @@ pub async fn run_user(config: &AppConfig, action: UserAction) -> anyhow::Result<
                 .get_user(&username)
                 .map_err(|_| anyhow::anyhow!("用户不存在: {}", username.escape_debug()))?;
 
-            // 只读一行,最多 1 KiB;超长无换行的输入会被截成 1 KiB,随后被策略按 too long 拒绝。
-            let mut line = String::new();
-            std::io::stdin().lock().take(1024).read_line(&mut line)?;
-            let password = line
-                .strip_suffix('\n')
-                .map(|s| s.strip_suffix('\r').unwrap_or(s))
-                .unwrap_or(&line);
-            if password.is_empty() {
+            // 按字节读一行,最多 1025 字节:读满 1025 字节仍无换行即视为超长,
+            // 不会在多字节字符中间截断后再误报 UTF-8 错误。
+            let mut buf: Vec<u8> = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(1025)
+                .read_until(b'\n', &mut buf)?;
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            } else if buf.len() > 1024 {
+                return Err(anyhow::anyhow!("password too long"));
+            }
+            if buf.is_empty() {
                 return Err(anyhow::anyhow!("未从 stdin 读取到新密码"));
             }
+            // 错误文本不含输入内容。
+            let password = String::from_utf8(buf)
+                .map_err(|_| anyhow::anyhow!("未从 stdin 读取到有效的 UTF-8 密码"))?;
+            let password = password.as_str();
 
             // 策略拒绝(password too short 等)直接传播;错误文本不含密码。
             let revoked = auth_service
