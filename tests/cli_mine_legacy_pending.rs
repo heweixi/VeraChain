@@ -152,11 +152,13 @@ async fn chain_mine_succeeds_once_row_is_marked_verified() {
 
     // 对照:同一库,仅把 recovery_state 改为 verified。
     let pool = connect(dsn_str).await;
-    sqlx::query("UPDATE identity_transactions SET recovery_state = 'verified' WHERE transaction_id = ?")
-        .bind(TX_ID)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE identity_transactions SET recovery_state = 'verified' WHERE transaction_id = ?",
+    )
+    .bind(TX_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let output = run_cli(&config_path, &["chain", "mine"]);
     assert_eq!(

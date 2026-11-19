@@ -231,7 +231,10 @@ async fn assert_chain_valid(router: &axum::Router, token: &str) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["data"]["valid"], true, "链校验(含 merkle_root)必须通过");
+    assert_eq!(
+        body["data"]["valid"], true,
+        "链校验(含 merkle_root)必须通过"
+    );
 }
 
 #[tokio::test]
@@ -294,7 +297,11 @@ async fn signing_payload_depends_only_on_five_signed_fields_with_or_without_key(
     assert_eq!(block.key_transactions.len(), 2);
 
     // 按提交顺序入块:[0] 带键,[1] 不带键。
-    for (entry, body) in block.key_transactions.iter().zip([&keyed_body, &plain_body]) {
+    for (entry, body) in block
+        .key_transactions
+        .iter()
+        .zip([&keyed_body, &plain_body])
+    {
         let probe = probe_from_body(body);
         assert_eq!(
             entry.signing_payload(),

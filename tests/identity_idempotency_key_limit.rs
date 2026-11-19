@@ -163,7 +163,11 @@ async fn setup(name: &str) -> (axum::Router, Arc<datachain::storage::Storage>, S
 }
 
 async fn pending_count(storage: &datachain::storage::Storage) -> usize {
-    storage.get_pending_identity_transactions().await.unwrap().len()
+    storage
+        .get_pending_identity_transactions()
+        .await
+        .unwrap()
+        .len()
 }
 
 #[tokio::test]
@@ -178,7 +182,11 @@ async fn key_of_exactly_255_bytes_is_accepted_and_replays_same_transaction() {
         .oneshot(keyed_request(&token, &body, key.as_bytes()))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::ACCEPTED, "恰好 255 字节必须合法");
+    assert_eq!(
+        first.status(),
+        StatusCode::ACCEPTED,
+        "恰好 255 字节必须合法"
+    );
     let transaction_id = body_json(first).await["data"]["transaction_id"]
         .as_str()
         .expect("首次响应必须包含 transaction_id")
@@ -290,7 +298,11 @@ async fn length_is_measured_after_trim() {
         body_json(rejected).await["error"],
         "idempotency key too long"
     );
-    assert_eq!(pending_count(&storage).await, 1, "被拒绝请求不得新增 pending");
+    assert_eq!(
+        pending_count(&storage).await,
+        1,
+        "被拒绝请求不得新增 pending"
+    );
 }
 
 #[tokio::test]
@@ -307,7 +319,12 @@ async fn blank_and_non_utf8_keys_are_still_treated_as_missing() {
             .oneshot(keyed_request(&token, &body, key))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{:?} 应视为未提供", key);
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "{:?} 应视为未提供",
+            key
+        );
         ids.push(body_json(resp).await["data"]["transaction_id"].clone());
     }
     assert_ne!(ids[0], ids[1]);
