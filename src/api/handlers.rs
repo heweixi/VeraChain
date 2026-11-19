@@ -1408,6 +1408,9 @@ pub async fn get_node_identity(
 
 // ==================== 链上身份处理器 (backlog L1) ====================
 
+/// `Idempotency-Key` trim 后允许的最大字节数(恰好等于该值合法)。
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 255;
+
 /// 提交一条密钥交易(register/revoke)。带 `Idempotency-Key` 的请求跨重试返回同一账本交易。
 pub async fn submit_key_transaction(
     State(state): State<AppState>,
@@ -1416,13 +1419,21 @@ pub async fn submit_key_transaction(
     Json(req): Json<crate::identity::KeyTransactionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let idempotency_key = headers.get("idempotency-key").and_then(|value| {
-        value
-            .to_str()
+        std::str::from_utf8(value.as_bytes())
             .ok()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     });
+    if idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.len() > IDEMPOTENCY_KEY_MAX_BYTES)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("idempotency key too long")),
+        ));
+    }
     let now = chrono::Utc::now().timestamp();
     let entry = crate::identity::build_verified_key_transaction(&req, now).map_err(|e| {
         (
