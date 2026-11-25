@@ -1,6 +1,6 @@
 # DataChain Rust 实现状态与未完成需求
 
-> ⚠️ **WebSocket 连接定时复核第六批验证声明(以此为准)**:分支 `feat/ws-revalidate-6`(基于 main `a6f7e61`,代码 HEAD `b63061e`)。最后核实:2026-11-19。**验证范围分两段**:`b1fbbaa` 经本次提交 + 验证机 `deploy@100.78.135.127`(原 `192.168.3.7`,经 Tailscale)docker `rust:latest`(作业 full6-20261125-162322)全量验证:`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 45 个测试目标共 **446 passed、0 failed**(第五批基线 429,+17);clippy lib 22 条,与基线持平无新增;迁移仍 001-013(**无迁移**)。⚠️ 之后的 `b63061e`(复核加 5 秒超时、`MissedTickBehavior::Delay`、日志区分失败与超时)**未做 fmt 检查也未重跑全量测试**:验证机链路经 DERP 中继,快照上传多次超时,经用户同意先跳过。该提交的 fmt/测试/clippy 结果为 ⏳ 待验证,不得沿用 446 passed 作为 `b63061e` 的证据。新增测试目标 2 个:`ws_revalidate_config`(12)、`ws_revalidate`(5)。能力与限制见 §2.12;设计见 `docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。下文第五批 429 passed 的声明是上一层历史数字。
+> ✅ **WebSocket 连接定时复核第六批验证声明(以此为准)**:分支 `feat/ws-revalidate-6`(基于 main `a6f7e61`,代码 HEAD `b63061e`)。最后核实:2026-11-19。**验证范围**:代码 HEAD `b63061e`(快照 `fu-999fe79`,其与 `b63061e` 的差异仅为文档)经本次提交 + 验证机 `deploy@100.78.135.127`(原 `192.168.3.7`,经 Tailscale)docker `rust:latest`(作业 full6b-20261125-173016)全量验证:`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 45 个测试目标共 **446 passed、0 failed**(第五批基线 429,+17);clippy lib 22 条,与基线持平无新增;迁移仍 001-013(**无迁移**)。此前 `b1fbbaa` 的作业 full6-20261125-162322 结果相同。新增测试目标 2 个:`ws_revalidate_config`(12)、`ws_revalidate`(5)。能力与限制见 §2.12;设计见 `docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。下文第五批 429 passed 的声明是上一层历史数字。
 >
 > ✅ **身份交易第五批验证声明(上一层历史)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419,+10);clippy lib 22 条,与基线持平无新增;迁移仍为 001-013。能力与限制见 §2.11;设计见 `docs/superpowers/specs/2026-11-19-identity-tests-batch5-design.md`。下文第四批 419 passed 的声明是上一层历史数字。
 >
@@ -432,11 +432,11 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 - ⏳ 仍未做:`legacy_unverified` 的内置恢复命令(需单独设计);`signing_payload` 的 `|` 分隔碰撞(协议 v2 变更)。
 
 ### 2.12 WebSocket 连接定时复核(第六批 B20-B21,分支 `feat/ws-revalidate-6`,代码 HEAD `b63061e`)
-最后核实:2026-11-19。设计:`docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。证据:`b1fbbaa` 经验证机 docker `rust:latest`(作业 full6-20261125-162322)446 passed、0 failed、fmt rc=0、clippy lib 22 无新增。⚠️ `b63061e`(5 秒复核超时等)**尚未重跑 fmt 与全量测试**(⏳)。迁移仍 001-013(**无迁移**,无新依赖)。
+最后核实:2026-11-19。设计:`docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。证据:`b63061e` 经验证机 docker `rust:latest`(作业 full6b-20261125-173016)446 passed、0 failed、fmt rc=0、clippy lib 22 无新增。迁移仍 001-013(**无迁移**,无新依赖)。
 | 编号 | 内容 | 状态 | 测试 | 要点 |
 |---|---|---|---|---|
-| B20 | 复核方法与配置 | ✅(`b1fbbaa` 已验证) | `tests/ws_revalidate_config.rs`(12) | `AuthService::revalidate_claims` 与 `authenticate_access_token` 共用 `check_claims`:令牌未过期、会话存在/属于该用户/未撤销/未过期、用户 `is_active`(直接查库,不走缓存)、内存用户存在且角色一致。任一步失败或查库出错均 fail-closed。新增配置 `auth.ws_revalidate_secs`(环境变量 `DATACHAIN_AUTH_WS_REVALIDATE_SECS`,默认 30,范围 1..=3600,不允许 0);`WsHub::set_revalidate_interval` 为测试 seam |
-| B21 | 连接内定时复核 | ✅(`b1fbbaa` 已验证);⏳ `b63061e` 的超时改动未验证 | `tests/ws_revalidate.rs`(5) | 四个 WS handler 取 `Extension<Claims>`,连接循环按间隔复核;失败发送 Close 1008(reason `session no longer valid`)并 `remove_client`。覆盖:登出、管理员停用、改密撤销其他会话(当前会话连接保持)、令牌过期、健康连接保持并仍收事件。`b63061e` 加每次复核 5 秒超时与 `MissedTickBehavior::Delay`;超时按失败处理(关闭连接),日志区分"失败"与"超时" |
+| B20 | 复核方法与配置 | ✅(`b63061e` 已验证) | `tests/ws_revalidate_config.rs`(12) | `AuthService::revalidate_claims` 与 `authenticate_access_token` 共用 `check_claims`:令牌未过期、会话存在/属于该用户/未撤销/未过期、用户 `is_active`(直接查库,不走缓存)、内存用户存在且角色一致。任一步失败或查库出错均 fail-closed。新增配置 `auth.ws_revalidate_secs`(环境变量 `DATACHAIN_AUTH_WS_REVALIDATE_SECS`,默认 30,范围 1..=3600,不允许 0);`WsHub::set_revalidate_interval` 为测试 seam |
+| B21 | 连接内定时复核 | ✅(`b63061e` 已验证) | `tests/ws_revalidate.rs`(5) | 四个 WS handler 取 `Extension<Claims>`,连接循环按间隔复核;失败发送 Close 1008(reason `session no longer valid`)并 `remove_client`。覆盖:登出、管理员停用、改密撤销其他会话(当前会话连接保持)、令牌过期、健康连接保持并仍收事件。`b63061e` 加每次复核 5 秒超时与 `MissedTickBehavior::Delay`;超时按失败处理(关闭连接),日志区分"失败"与"超时" |
 #### 兼容性
 - 🔺 已建立的 WS 连接现在会在最多一个复核间隔(默认 30 秒)内因会话撤销、用户停用、角色变化或**access 令牌过期**而被关闭(Close 1008)。长连接客户端需在令牌过期前后 refresh 并重连。
 - 复核查库失败或超过 5 秒按失效处理并关闭连接(fail-closed);数据库持续异常时所有连接会被关闭。
