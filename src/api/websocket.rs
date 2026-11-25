@@ -11,7 +11,11 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 use tokio::sync::broadcast;
 
@@ -65,6 +69,8 @@ impl WsMessage {
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 /// 单进程最大 WebSocket 连接数,防止无界连接耗尽资源。
 const MAX_WS_CLIENTS: usize = 256;
+/// 默认连接复核间隔(毫秒),与 `auth.ws_revalidate_secs` 默认 30 秒一致。
+const DEFAULT_REVALIDATE_MS: u64 = 30_000;
 
 fn channel_accepts_message(channel: &str, msg_type: &MessageType) -> bool {
     matches!(
@@ -85,6 +91,8 @@ pub struct WsHub {
     channels: RwLock<HashMap<String, HashSet<String>>>,
     /// 客户端数量
     client_count: RwLock<usize>,
+    /// 连接定时复核间隔(毫秒)
+    revalidate_ms: AtomicU64,
 }
 
 impl WsHub {
@@ -94,6 +102,7 @@ impl WsHub {
             tx,
             channels: RwLock::new(HashMap::new()),
             client_count: RwLock::new(0),
+            revalidate_ms: AtomicU64::new(DEFAULT_REVALIDATE_MS),
         })
     }
 
@@ -162,6 +171,18 @@ impl WsHub {
     pub fn get_client_count(&self) -> usize {
         *self.client_count.read()
     }
+
+    /// 连接定时复核间隔。
+    pub fn revalidate_interval(&self) -> Duration {
+        Duration::from_millis(self.revalidate_ms.load(Ordering::Relaxed))
+    }
+
+    /// 设置连接定时复核间隔(server 启动按配置设置;亦作测试 seam)。
+    /// 毫秒数按 u64 饱和截断,且至少 1ms,避免 `tokio::time::interval` 对 0 间隔 panic。
+    pub fn set_revalidate_interval(&self, d: Duration) {
+        let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.revalidate_ms.store(ms, Ordering::Relaxed);
+    }
 }
 
 impl Default for WsHub {
@@ -171,6 +192,7 @@ impl Default for WsHub {
             tx,
             channels: RwLock::new(HashMap::new()),
             client_count: RwLock::new(0),
+            revalidate_ms: AtomicU64::new(DEFAULT_REVALIDATE_MS),
         }
     }
 }

@@ -36,6 +36,8 @@ pub struct AuthConfig {
     /// is_active 缓存 TTL(秒);0 表示禁用缓存。
     pub active_cache_ttl_secs: u64,
     pub password_min_length: usize,
+    /// WebSocket 连接定时复核间隔(秒),范围 1..=3600,不允许 0。
+    pub ws_revalidate_secs: u64,
     /// 可信代理(IP 或 CIDR)。默认为空:不信任任何代理。
     pub trusted_proxies: Vec<String>,
 }
@@ -52,6 +54,7 @@ impl Default for AuthConfig {
             audit_retention_days: 90,
             active_cache_ttl_secs: 5,
             password_min_length: 8,
+            ws_revalidate_secs: 30,
             trusted_proxies: Vec::new(),
         }
     }
@@ -371,6 +374,7 @@ impl AppConfig {
         env_number!("DATACHAIN_AUTH_AUDIT_RETENTION_DAYS" => self.auth.audit_retention_days);
         env_number!("DATACHAIN_AUTH_ACTIVE_CACHE_TTL_SECS" => self.auth.active_cache_ttl_secs);
         env_number!("DATACHAIN_AUTH_PASSWORD_MIN_LENGTH" => self.auth.password_min_length);
+        env_number!("DATACHAIN_AUTH_WS_REVALIDATE_SECS" => self.auth.ws_revalidate_secs);
 
         if let Some(raw) = env("DATACHAIN_AUTH_TRUSTED_PROXIES") {
             let items: Vec<String> = if raw.trim().is_empty() {
@@ -469,6 +473,10 @@ impl AppConfig {
             4,
             72,
         )?;
+        // 该键的越界错误不回显取值(与 check_range 不同,仅此键)。
+        if a.ws_revalidate_secs < 1 || a.ws_revalidate_secs > 3600 {
+            anyhow::bail!("auth.ws_revalidate_secs must be between 1 and 3600");
+        }
         TrustedProxies::parse(&a.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("auth.trusted_proxies is invalid: {}", e))?;
         Ok(())

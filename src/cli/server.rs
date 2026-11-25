@@ -291,6 +291,13 @@ pub async fn run_server(config: AppConfig, port: u16) -> anyhow::Result<()> {
 
     // 创建 WebSocket Hub、通知服务和事件总线
     let ws_hub = api::WsHub::new();
+    ws_hub.set_revalidate_interval(std::time::Duration::from_secs(
+        config.auth.ws_revalidate_secs,
+    ));
+    info!(
+        ws_revalidate_secs = config.auth.ws_revalidate_secs,
+        "WebSocket 复核间隔已设置"
+    );
     let notification = Arc::new(NotificationService::new(ws_hub.clone()));
     let event_bus = Arc::new(EventBus::new(notification));
 
