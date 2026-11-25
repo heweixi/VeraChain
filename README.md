@@ -4,7 +4,9 @@ DataChain Rust 是一个面向数据追溯与可验证记录的 Rust 项目：�
 
 > **最后核实：2026-11-14**
 >
-> ✅ **身份交易第五批验证声明(以此为准)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419);`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条,与基线持平,无新增;迁移仍为 001-013。新增测试目标 3 个:`identity_idempotency_key_limit`(5)、`identity_transaction_id_not_in_block`(3)、`cli_mine_legacy_pending`(2)。详见 [IMPLEMENTATION_STATUS.md §2.11](IMPLEMENTATION_STATUS.md)。下方第四批声明是上一层历史数字。
+> ⚠️ **WebSocket 连接定时复核第六批验证声明(以此为准)**:分支 `feat/ws-revalidate-6`(基于 main `a6f7e61`,代码 HEAD `b63061e`)。最后核实:2026-11-19。**验证范围分两段**:`b1fbbaa` 经本次提交 + 验证机 `deploy@100.78.135.127`(原 `192.168.3.7`,经 Tailscale)docker `rust:latest`(作业 full6-20261125-162322)全量验证:`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 45 个测试目标共 **446 passed、0 failed**(第五批基线 429,+17);clippy lib 22 条,与基线持平无新增;迁移仍 001-013(**无迁移**)。⚠️ 之后的 `b63061e`(复核加 5 秒超时、`MissedTickBehavior::Delay`、日志区分失败与超时)**未做 fmt 检查也未重跑全量测试**:验证机链路经 DERP 中继,快照上传多次超时,经用户同意先跳过。该提交的 fmt/测试/clippy 结果为 ⏳ 待验证,不得沿用 446 passed 作为 `b63061e` 的证据。新增测试目标 2 个:`ws_revalidate_config`(12)、`ws_revalidate`(5)。能力与限制见 [IMPLEMENTATION_STATUS.md §2.12](IMPLEMENTATION_STATUS.md);设计见 `docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。下文第五批 429 passed 的声明是上一层历史数字。
+>
+> ✅ **身份交易第五批验证声明(上一层历史)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419);`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条,与基线持平,无新增;迁移仍为 001-013。新增测试目标 3 个:`identity_idempotency_key_limit`(5)、`identity_transaction_id_not_in_block`(3)、`cli_mine_legacy_pending`(2)。详见 [IMPLEMENTATION_STATUS.md §2.11](IMPLEMENTATION_STATUS.md)。下方第四批声明是上一层历史数字。
 >
 > ✅ **认证加固第四批验证声明(上一层历史)**:分支 `feat/auth-hardening-4`(基于 main `f0a8669`,代码 HEAD `0bf473e`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full0bf473e-20261119-174859):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 40 个测试目标共 **419 passed、0 failed**(第三批基线 402);`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线持平,无新增;迁移仍为 001-013(本批无迁移)。新增测试目标 4 个:`cli_create_role`(4)、`cli_passwd_input`(4)、`unlock_db_only_user`(3)、`register_rate_limit`(6)。能力与限制见 [IMPLEMENTATION_STATUS.md §2.10](IMPLEMENTATION_STATUS.md) 与设计文档 [认证加固第四批](docs/superpowers/specs/2026-11-14-auth-hardening-batch4-design.md)。下方第三批声明是上一层历史数字。
 >
@@ -127,13 +129,13 @@ Docker Compose 路径、请求示例和端口说明见新手指南。
 
 - 启动方式：`cargo run -- serve --port 8080`，或 `docker compose up --build`。
 - 健康检查：`GET /health`。
-- Rust 测试：`cargo test --no-fail-fast`（本地无 Rust 工具链，验证在验证机 `deploy@192.168.3.7` 的 docker `rust:latest` 中执行；247 为备用）。
+- Rust 测试：`cargo test --no-fail-fast`（本地无 Rust 工具链，验证在验证机 `deploy@100.78.135.127`(原局域网地址 192.168.3.7,现经 Tailscale)的 docker `rust:latest` 中执行；247 为备用）。
 - ✅ 本分支验证（`b3b458b`，`feat/followups-hardening`）：本次提交 + 192.168.3.7 docker `rust:latest`（作业 fullb3b458b-20261114-024913）`cargo test --no-fail-fast`，**251 passed、0 failed**（23 个测试目标，分项见顶部验证声明）；`cargo fmt --check` rc=0；`cargo clippy --all-targets`（无 `-D warnings`）无 error，lib 22 条警告与 main 基线持平，本分支无新增（`tests/common/corrupt.rs` 的 `dead_code` 告警为共享 helper，未处理）。
 - ✅ 本分支验证（`95a68b8`，`feat/auth-hardening-2`）：本次提交 + 192.168.3.7 docker `rust:latest`（作业 full95a68b8-20261114-052129）`cargo test --no-fail-fast`，**357 passed、0 failed**（30 个测试目标，较基线 `3336e83` 的 251 passed 增加 7 个目标：`admin_api`、`audit_scan_stream`、`auth_config`、`change_password`、`login_lockout`、`refresh_failure_audit`、`trusted_proxies`）；`cargo fmt --check` rc=0；`cargo clippy --all-targets`（无 `-D warnings`）lib 22 条警告，与基线持平，无新增；迁移 001-013。
 - 历史数字（不适用于当前）：`b3b458b` 后续加固分支 251 passed；`65c7c4c` 合并 main 后 234 passed（作业 pimergeo）；main 侧合并后 210 passed（`ecae5e0`）；合并前各分支单独：数据损坏 139、认证加固 168、本分支 120（`734f1a2`）；旧基线 `96d08e8`（247，107 passed）、97 passed 等仅作历史参考。
 - ✅ 原「已知测试时序问题」已修复：`tests/login_rate_limit.rs` 曾与固定窗口按 epoch 对齐（`window_start = now - now % 900`），跨 :00/:15/:30/:45 边界运行时偶发失败；现经 `Storage::set_clock` 注入可控时钟，测试不再依赖墙钟，见上文与 IMPLEMENTATION_STATUS §四。
 - 停用/启用用户（CLI，状态以 SQLite 为权威）：`datachain user deactivate <username>` / `datachain user activate <username>`；停用同事务撤销该用户全部会话与 refresh family，激活不恢复旧会话。
-- 验证机：主验证机为 `deploy@192.168.3.7`，247 因磁盘满降为备用。
+- 验证机：主验证机为 `deploy@100.78.135.127`(原 `192.168.3.7`,现经 Tailscale),247 因磁盘满降为备用。
 - 历史（pending identity 分支合并 main 前的单独验证，120 passed 为历史数字，不适用于合并后；合并后以上方 234 passed 为准）：身份交易幂等改动（提交 `734f1a2`，验证机 192.168.3.7 docker `rust:latest`，target 卷 `dc-rust-target-pi`）：`cargo fmt --check` rc=0；`cargo test --no-fail-fast` rc=0，120 passed、0 failed（lib 91、bin 0、api_integration 20、websocket_integration 9、doctest 0）；`cargo clippy --all-targets`（未加 `-D warnings`）rc=0 无 error，落在本分支改动文件的 5 处告警（`src/api/state.rs:36`、`src/storage/database.rs:581/672/808/887`）经 git blame 均来自 main 既有提交，本分支无新增。首次真实运行（`5b2ad61`）曾因 `KeyTransactionEntry` 未派生 `PartialEq` 导致 lib 测试编译失败（E0369），已在 `734f1a2` 修复（见 IMPLEMENTATION_STATUS.md §2.3.1）。reviewer 复审（读代码）无 Important。
 
 ## 文档导航

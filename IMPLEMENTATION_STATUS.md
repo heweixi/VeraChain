@@ -1,6 +1,8 @@
 # DataChain Rust 实现状态与未完成需求
 
-> ✅ **身份交易第五批验证声明(以此为准)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419,+10);clippy lib 22 条,与基线持平无新增;迁移仍为 001-013。能力与限制见 §2.11;设计见 `docs/superpowers/specs/2026-11-19-identity-tests-batch5-design.md`。下文第四批 419 passed 的声明是上一层历史数字。
+> ⚠️ **WebSocket 连接定时复核第六批验证声明(以此为准)**:分支 `feat/ws-revalidate-6`(基于 main `a6f7e61`,代码 HEAD `b63061e`)。最后核实:2026-11-19。**验证范围分两段**:`b1fbbaa` 经本次提交 + 验证机 `deploy@100.78.135.127`(原 `192.168.3.7`,经 Tailscale)docker `rust:latest`(作业 full6-20261125-162322)全量验证:`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 45 个测试目标共 **446 passed、0 failed**(第五批基线 429,+17);clippy lib 22 条,与基线持平无新增;迁移仍 001-013(**无迁移**)。⚠️ 之后的 `b63061e`(复核加 5 秒超时、`MissedTickBehavior::Delay`、日志区分失败与超时)**未做 fmt 检查也未重跑全量测试**:验证机链路经 DERP 中继,快照上传多次超时,经用户同意先跳过。该提交的 fmt/测试/clippy 结果为 ⏳ 待验证,不得沿用 446 passed 作为 `b63061e` 的证据。新增测试目标 2 个:`ws_revalidate_config`(12)、`ws_revalidate`(5)。能力与限制见 §2.12;设计见 `docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。下文第五批 429 passed 的声明是上一层历史数字。
+>
+> ✅ **身份交易第五批验证声明(上一层历史)**:分支 `feat/identity-tests-5`(基于 main `8b5f4ac`,代码 HEAD `599f4d1`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full599f4d1-20261119-182055):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标共 **429 passed、0 failed**(第四批基线 419,+10);clippy lib 22 条,与基线持平无新增;迁移仍为 001-013。能力与限制见 §2.11;设计见 `docs/superpowers/specs/2026-11-19-identity-tests-batch5-design.md`。下文第四批 419 passed 的声明是上一层历史数字。
 >
 > ✅ **认证加固第四批验证声明(上一层历史)**:分支 `feat/auth-hardening-4`(基于 main `f0a8669`,代码 HEAD `0bf473e`)。最后核实:2026-11-19。本次提交 + 验证机 `deploy@192.168.3.7` docker `rust:latest`(作业 full0bf473e-20261119-174859):`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 40 个测试目标共 **419 passed、0 failed**;`cargo clippy --all-targets`(无 `-D warnings`)lib 22 条警告,与基线 `f0a8669` 持平,无新增;迁移仍为 001-013。基线 `f0a8669` 为 402 passed;新增 4 个测试目标 `cli_create_role` 4、`cli_passwd_input` 4、`unlock_db_only_user` 3、`register_rate_limit` 6,合计 +17,与 419-402 一致。本批能力与限制见 §2.10;设计见 `docs/superpowers/specs/2026-11-14-auth-hardening-batch4-design.md`。下文第三批 402 passed 的声明是上一层历史数字。
 >
@@ -73,7 +75,7 @@ R0-R7 推荐顺序已全部实现并验证。当前能力与关键残留差异�
 
 | 需求/设计 | 状态 | 证据与差异 |
 |---|---|---|
-| JWT access/refresh | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(234 passed:auth_claims 5、auth_middleware_session 12、storage_sessions 4);refresh 轮换/复用检测基线 `1124baa`/247(历史) | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。**本次**:原"仍缺:设备会话管理、access token 即时吊销"已实现(access 携带 `sid`,受保护路由经 `authenticate_access_token` 统一校验:JWT → 会话存在/属于该用户/未撤销/未过期 → SQLite `is_active`(进程内缓存 TTL 默认 5s,写路径清缓存)→ 内存用户存在且 role 与 claims 一致;查库失败 fail-closed 返回 401;WS 握手共用同一校验;`optional_auth_middleware` 对被撤销 token 按匿名)。🔺 `generate_access_token`/`generate_token_pair` 新增 `sid` 参数(库 API 变更)。⚠️ 残余限制:无 `sid` 的旧 token 仅查 `is_active`、不受登出影响,最长到自然过期(默认 24h 未改);跨进程停用/撤销最长滞后缓存 TTL(5s,TTL 目前仅代码 API `set_active_cache_ttl` 可调,无配置项);已建立的 WS 连接不会因撤销/禁用被主动断开(仅新握手被拒);refresh 与 access 仍共用同一 JWT 密钥(既有债务) |
+| JWT access/refresh | ✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(234 passed:auth_claims 5、auth_middleware_session 12、storage_sessions 4);refresh 轮换/复用检测基线 `1124baa`/247(历史) | `src/auth/jwt.rs` 生成/验证含 issuer/audience 校验;refresh 轮换 + 持久化撤销(`revoked_refresh_tokens` 表)+ token-family 复用检测;JwtHandler 退为纯编解码,撤销状态由 `AuthService`+`Storage` 管理。**本次**:原"仍缺:设备会话管理、access token 即时吊销"已实现(access 携带 `sid`,受保护路由经 `authenticate_access_token` 统一校验:JWT → 会话存在/属于该用户/未撤销/未过期 → SQLite `is_active`(进程内缓存 TTL 默认 5s,写路径清缓存)→ 内存用户存在且 role 与 claims 一致;查库失败 fail-closed 返回 401;WS 握手共用同一校验;`optional_auth_middleware` 对被撤销 token 按匿名)。🔺 `generate_access_token`/`generate_token_pair` 新增 `sid` 参数(库 API 变更)。⚠️ 残余限制:无 `sid` 的旧 token 仅查 `is_active`、不受登出影响,最长到自然过期(默认 24h 未改);跨进程停用/撤销最长滞后缓存 TTL(5s,TTL 目前仅代码 API `set_active_cache_ttl` 可调,无配置项);已建立的 WS 连接最多滞后一个复核间隔(默认 30 秒,`auth.ws_revalidate_secs`)后被关闭,见 §2.12;refresh 与 access 仍共用同一 JWT 密钥(既有债务) |
 | 用户持久化 | ⚠️ | 注册时若 `save_user` 失败，服务会回滚已写入内存的用户并返回 500；启动可从 SQLite 加载用户。**本次**:启用/禁用状态以 SQLite 为权威(✅ 本次提交 + 192.168.3.7 docker `rust:latest` cargo test(234 passed:cli_user_status 3、auth_middleware_session 12)):CLI `user deactivate\|activate <username>`;停用在同事务内撤销该用户全部会话与 refresh family,激活**不**恢复旧会话;登录/refresh/鉴权均以 SQLite `is_active` 为准;运行时 `deactivate_user`/`activate_user` 落库并清缓存、同步内存副本。🔺 `AuthService::deactivate_user`/`activate_user` 改 async(返回类型变化)。**(第二批更新)** 改密 API(F9)与管理员会话/用户启停接口(F8)已实现,见 §2.8 B3/B4;仍缺运行时资料管理、CLI 改密命令与解锁入口(⏳,第三批候选)。 |
 | 公开注册 | ✅代码已修复/待验证 | `AuthService::register` 现在固定 `Role::User`；CLI 使用受信的 `register_with_role` 创建指定角色 |
 | RBAC | ✅基础代码已接入/待验证 | `auth_middleware` 现在按 HTTP 方法/路径映射 `Permission` 并校验 claims 角色；用户管理/更细资源级授权仍未覆盖 |
@@ -429,6 +431,19 @@ up-only,无自动 down。与 pending identity 分支的编号冲突已解决(pen
 - ⏳ 仍无直接测试:`identity_tx_gate` 串行化(无确定性公开 seam,并发统计易偶发)。
 - ⏳ 仍未做:`legacy_unverified` 的内置恢复命令(需单独设计);`signing_payload` 的 `|` 分隔碰撞(协议 v2 变更)。
 
+### 2.12 WebSocket 连接定时复核(第六批 B20-B21,分支 `feat/ws-revalidate-6`,代码 HEAD `b63061e`)
+最后核实:2026-11-19。设计:`docs/superpowers/specs/2026-11-19-ws-revalidate-batch6-design.md`。证据:`b1fbbaa` 经验证机 docker `rust:latest`(作业 full6-20261125-162322)446 passed、0 failed、fmt rc=0、clippy lib 22 无新增。⚠️ `b63061e`(5 秒复核超时等)**尚未重跑 fmt 与全量测试**(⏳)。迁移仍 001-013(**无迁移**,无新依赖)。
+| 编号 | 内容 | 状态 | 测试 | 要点 |
+|---|---|---|---|---|
+| B20 | 复核方法与配置 | ✅(`b1fbbaa` 已验证) | `tests/ws_revalidate_config.rs`(12) | `AuthService::revalidate_claims` 与 `authenticate_access_token` 共用 `check_claims`:令牌未过期、会话存在/属于该用户/未撤销/未过期、用户 `is_active`(直接查库,不走缓存)、内存用户存在且角色一致。任一步失败或查库出错均 fail-closed。新增配置 `auth.ws_revalidate_secs`(环境变量 `DATACHAIN_AUTH_WS_REVALIDATE_SECS`,默认 30,范围 1..=3600,不允许 0);`WsHub::set_revalidate_interval` 为测试 seam |
+| B21 | 连接内定时复核 | ✅(`b1fbbaa` 已验证);⏳ `b63061e` 的超时改动未验证 | `tests/ws_revalidate.rs`(5) | 四个 WS handler 取 `Extension<Claims>`,连接循环按间隔复核;失败发送 Close 1008(reason `session no longer valid`)并 `remove_client`。覆盖:登出、管理员停用、改密撤销其他会话(当前会话连接保持)、令牌过期、健康连接保持并仍收事件。`b63061e` 加每次复核 5 秒超时与 `MissedTickBehavior::Delay`;超时按失败处理(关闭连接),日志区分"失败"与"超时" |
+#### 兼容性
+- 🔺 已建立的 WS 连接现在会在最多一个复核间隔(默认 30 秒)内因会话撤销、用户停用、角色变化或**access 令牌过期**而被关闭(Close 1008)。长连接客户端需在令牌过期前后 refresh 并重连。
+- 复核查库失败或超过 5 秒按失效处理并关闭连接(fail-closed);数据库持续异常时所有连接会被关闭。
+#### 已知限制
+- 最长滞后一个复核间隔;每连接每间隔一次主键查询。
+- 广播仍对所有已认证连接转发,不按用户过滤。
+- ⏳ 未做按撤销事件的即时断开(CLI 跨进程撤销无法感知,可与定时复核叠加);⏳ refresh/access 分密钥已决定放弃(现有 `token_type`/`iss`/`aud` 校验已隔离两类令牌)。
 ## 三、测试与验证状态
 
 - ✅ **身份交易第五批验证总览(权威,`599f4d1`,`feat/identity-tests-5`)**:本次提交 + 192.168.3.7 docker `rust:latest`(作业 full599f4d1-20261119-182055),`cargo fmt --check` rc=0;`cargo test --no-fail-fast` 43 个测试目标 **429 passed、0 failed**(基线 419,新增 10:`identity_idempotency_key_limit` 5、`identity_transaction_id_not_in_block` 3、`cli_mine_legacy_pending` 2);clippy lib 22 条无新增;迁移 001-013。⚠️ 429 的分项计数本文未逐项列出。
