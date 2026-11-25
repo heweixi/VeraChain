@@ -73,6 +73,8 @@ const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_WS_CLIENTS: usize = 256;
 /// 默认连接复核间隔(毫秒),与 `auth.ws_revalidate_secs` 默认 30 秒一致。
 const DEFAULT_REVALIDATE_MS: u64 = 30_000;
+/// 单次连接复核的超时时间;超时按复核失败处理,避免复核挂起使连接长期不被清理。
+const REVALIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn channel_accepts_message(channel: &str, msg_type: &MessageType) -> bool {
     matches!(
@@ -321,6 +323,7 @@ async fn handle_socket(
     let (mut sender, mut receiver) = socket.split();
     let mut events = hub.subscribe();
     let mut tick = tokio::time::interval(hub.revalidate_interval());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
     tracing::info!("WebSocket 客户端连接: {}", client_id);
@@ -373,10 +376,19 @@ async fn handle_socket(
                 }
             }
             _ = tick.tick() => {
-                if let Err(e) = auth.revalidate_claims(&claims).await {
-                    tracing::info!("WebSocket 复核失败,关闭连接 {}: {}", client_id, e);
-                    let _ = sender.send(revalidate_close_frame()).await;
-                    break;
+                let result = tokio::time::timeout(REVALIDATE_TIMEOUT, auth.revalidate_claims(&claims)).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::info!("WebSocket 复核失败,关闭连接 {}: {}", client_id, e);
+                        let _ = sender.send(revalidate_close_frame()).await;
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("WebSocket 复核超时,关闭连接 {}", client_id);
+                        let _ = sender.send(revalidate_close_frame()).await;
+                        break;
+                    }
                 }
             }
             event = events.recv() => {
@@ -411,6 +423,7 @@ async fn handle_channel_socket(
     let (mut sender, mut receiver) = socket.split();
     let mut events = hub.subscribe();
     let mut tick = tokio::time::interval(hub.revalidate_interval());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
 
     tracing::info!("WebSocket 客户端连接到频道 {}: {}", channel, client_id);
@@ -448,10 +461,19 @@ async fn handle_channel_socket(
                 }
             }
             _ = tick.tick() => {
-                if let Err(e) = auth.revalidate_claims(&claims).await {
-                    tracing::info!("WebSocket 复核失败,关闭频道连接 {}: {}", client_id, e);
-                    let _ = sender.send(revalidate_close_frame()).await;
-                    break;
+                let result = tokio::time::timeout(REVALIDATE_TIMEOUT, auth.revalidate_claims(&claims)).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::info!("WebSocket 复核失败,关闭频道连接 {}: {}", client_id, e);
+                        let _ = sender.send(revalidate_close_frame()).await;
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("WebSocket 复核超时,关闭频道连接 {}", client_id);
+                        let _ = sender.send(revalidate_close_frame()).await;
+                        break;
+                    }
                 }
             }
             event = events.recv() => {
