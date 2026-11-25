@@ -138,7 +138,12 @@ fn out_of_range_toml_values_fail_with_key_name_without_echoing_value() {
             text
         );
         if let Some(s) = secret {
-            assert!(!text.contains(s), "[{}] 错误不应回显取值,实际: {}", name, text);
+            assert!(
+                !text.contains(s),
+                "[{}] 错误不应回显取值,实际: {}",
+                name,
+                text
+            );
         }
     }
 }
@@ -169,7 +174,12 @@ fn invalid_environment_values_fail_with_variable_name_without_echoing_value() {
             text
         );
         if let Some(s) = secret {
-            assert!(!text.contains(s), "[{}] 错误不应回显取值,实际: {}", name, text);
+            assert!(
+                !text.contains(s),
+                "[{}] 错误不应回显取值,实际: {}",
+                name,
+                text
+            );
         }
     }
 }

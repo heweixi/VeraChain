@@ -91,8 +91,10 @@ async fn connect_ws(
     let mut req = format!("ws://{}/ws", server.addr)
         .into_client_request()
         .unwrap();
-    req.headers_mut()
-        .insert("authorization", format!("Bearer {}", token).parse().unwrap());
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
     let (mut ws, _) = connect_async(req).await.expect("WS 握手应成功");
     let welcome = next_text(&mut ws).await.expect("应收到 welcome");
     assert_eq!(welcome["type"], "pong");
@@ -202,7 +204,12 @@ async fn ws_closed_after_admin_deactivates_user() {
     let admin_token = login_token(&server, "wsadmin", ADMIN_PW).await;
     let mut ws = connect_ws(&server, &user_token).await;
 
-    let user_id = server.state.auth_service.get_user("wsuser").unwrap().user_id;
+    let user_id = server
+        .state
+        .auth_service
+        .get_user("wsuser")
+        .unwrap()
+        .user_id;
     let status = http_post(
         &server,
         &format!("/api/v1/admin/users/{}/deactivate", user_id),

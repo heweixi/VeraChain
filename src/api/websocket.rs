@@ -3,9 +3,9 @@ use axum::{
         ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    Extension,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Extension,
 };
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
