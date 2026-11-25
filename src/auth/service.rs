@@ -854,7 +854,23 @@ impl AuthService {
     /// 任一步失败(含查库失败)都返回 `Err`,调用方一律按 401 处理(fail-closed)。
     pub async fn authenticate_access_token(&self, token: &str) -> Result<super::Claims> {
         let claims = self.validate_token(token)?;
+        self.check_claims(&claims, true).await?;
+        Ok(claims)
+    }
 
+    /// 对已解码的 claims 重新复核(WebSocket 连接定时复核用,fail-closed)。
+    ///
+    /// 令牌 `exp` 用真实时钟判断;`is_active` 直接查库,不走缓存。
+    pub async fn revalidate_claims(&self, claims: &super::Claims) -> Result<()> {
+        if claims.exp <= chrono::Utc::now().timestamp() {
+            return Err(DataChainError::TokenExpired);
+        }
+        self.check_claims(claims, false).await
+    }
+
+    /// 解码之后的检查:会话 → is_active → 内存用户与角色。
+    /// `cached=true` 时 is_active 走短 TTL 缓存,否则直接查库。
+    async fn check_claims(&self, claims: &super::Claims, cached: bool) -> Result<()> {
         if let Some(sid) = claims.sid.as_deref() {
             let now = chrono::Utc::now().timestamp();
             match self.storage.get_session(sid).await? {
@@ -864,7 +880,12 @@ impl AuthService {
             }
         }
 
-        if !self.storage.is_user_active_cached(&claims.sub).await? {
+        let active = if cached {
+            self.storage.is_user_active_cached(&claims.sub).await?
+        } else {
+            self.storage.is_user_active(&claims.sub).await?
+        };
+        if !active {
             return Err(DataChainError::InvalidToken);
         }
 
@@ -876,7 +897,7 @@ impl AuthService {
         if user.role.to_string() != claims.role {
             return Err(DataChainError::InvalidToken);
         }
-        Ok(claims)
+        Ok(())
     }
 
     /// 刷新令牌。

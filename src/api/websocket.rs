@@ -1,8 +1,9 @@
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
+    Extension,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -20,6 +21,7 @@ use std::{
 use tokio::sync::broadcast;
 
 use super::AppState;
+use crate::auth::{AuthService, Claims};
 
 /// WebSocket 消息类型
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +209,7 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
+    Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
 ) -> Response {
     if !state.ws_hub.try_add_client() {
@@ -220,46 +223,16 @@ pub async fn ws_handler(
         .client_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let hub = state.ws_hub.clone();
+    let auth = state.auth_service.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, client_id, hub))
+    ws.on_upgrade(move |socket| handle_socket(socket, client_id, hub, auth, claims))
         .into_response()
 }
 
 /// 区块链 WebSocket 处理器
-pub async fn chain_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    if !state.ws_hub.try_add_client() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "websocket connection limit reached",
-        )
-            .into_response();
-    }
-    let client_id = uuid::Uuid::new_v4().to_string();
-    let hub = state.ws_hub.clone();
-    ws.on_upgrade(move |socket| handle_channel_socket(socket, client_id, "chain".to_string(), hub))
-        .into_response()
-}
-
-/// 元数据 WebSocket 处理器
-pub async fn metadata_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    if !state.ws_hub.try_add_client() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "websocket connection limit reached",
-        )
-            .into_response();
-    }
-    let client_id = uuid::Uuid::new_v4().to_string();
-    let hub = state.ws_hub.clone();
-    ws.on_upgrade(move |socket| {
-        handle_channel_socket(socket, client_id, "metadata".to_string(), hub)
-    })
-    .into_response()
-}
-
-/// 汇总 WebSocket 处理器
-pub async fn aggregation_ws_handler(
+pub async fn chain_ws_handler(
     ws: WebSocketUpgrade,
+    Extension(claims): Extension<Claims>,
     State(state): State<AppState>,
 ) -> Response {
     if !state.ws_hub.try_add_client() {
@@ -271,16 +244,84 @@ pub async fn aggregation_ws_handler(
     }
     let client_id = uuid::Uuid::new_v4().to_string();
     let hub = state.ws_hub.clone();
+    let auth = state.auth_service.clone();
     ws.on_upgrade(move |socket| {
-        handle_channel_socket(socket, client_id, "aggregation".to_string(), hub)
+        handle_channel_socket(socket, client_id, "chain".to_string(), hub, auth, claims)
     })
     .into_response()
 }
 
+/// 元数据 WebSocket 处理器
+pub async fn metadata_ws_handler(
+    ws: WebSocketUpgrade,
+    Extension(claims): Extension<Claims>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
+    }
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let hub = state.ws_hub.clone();
+    let auth = state.auth_service.clone();
+    ws.on_upgrade(move |socket| {
+        handle_channel_socket(socket, client_id, "metadata".to_string(), hub, auth, claims)
+    })
+    .into_response()
+}
+
+/// 汇总 WebSocket 处理器
+pub async fn aggregation_ws_handler(
+    ws: WebSocketUpgrade,
+    Extension(claims): Extension<Claims>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.ws_hub.try_add_client() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
+    }
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let hub = state.ws_hub.clone();
+    let auth = state.auth_service.clone();
+    ws.on_upgrade(move |socket| {
+        handle_channel_socket(
+            socket,
+            client_id,
+            "aggregation".to_string(),
+            hub,
+            auth,
+            claims,
+        )
+    })
+    .into_response()
+}
+
+/// 复核失败时发送的 Close 帧(1008 policy violation)。
+fn revalidate_close_frame() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: close_code::POLICY,
+        reason: "session no longer valid".into(),
+    }))
+}
+
 /// 处理 WebSocket 连接
-async fn handle_socket(socket: WebSocket, client_id: String, hub: Arc<WsHub>) {
+async fn handle_socket(
+    socket: WebSocket,
+    client_id: String,
+    hub: Arc<WsHub>,
+    auth: Arc<AuthService>,
+    claims: Claims,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut events = hub.subscribe();
+    let mut tick = tokio::time::interval(hub.revalidate_interval());
+    tick.tick().await;
 
     tracing::info!("WebSocket 客户端连接: {}", client_id);
 
@@ -331,6 +372,13 @@ async fn handle_socket(socket: WebSocket, client_id: String, hub: Arc<WsHub>) {
                     _ => {}
                 }
             }
+            _ = tick.tick() => {
+                if let Err(e) = auth.revalidate_claims(&claims).await {
+                    tracing::info!("WebSocket 复核失败,关闭连接 {}: {}", client_id, e);
+                    let _ = sender.send(revalidate_close_frame()).await;
+                    break;
+                }
+            }
             event = events.recv() => {
                 match event {
                     Ok(event) => {
@@ -357,9 +405,13 @@ async fn handle_channel_socket(
     client_id: String,
     channel: String,
     hub: Arc<WsHub>,
+    auth: Arc<AuthService>,
+    claims: Claims,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let mut events = hub.subscribe();
+    let mut tick = tokio::time::interval(hub.revalidate_interval());
+    tick.tick().await;
 
     tracing::info!("WebSocket 客户端连接到频道 {}: {}", channel, client_id);
 
@@ -393,6 +445,13 @@ async fn handle_channel_socket(
                         break;
                     }
                     _ => {}
+                }
+            }
+            _ = tick.tick() => {
+                if let Err(e) = auth.revalidate_claims(&claims).await {
+                    tracing::info!("WebSocket 复核失败,关闭频道连接 {}: {}", client_id, e);
+                    let _ = sender.send(revalidate_close_frame()).await;
+                    break;
                 }
             }
             event = events.recv() => {
